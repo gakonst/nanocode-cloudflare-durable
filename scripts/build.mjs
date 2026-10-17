@@ -27,14 +27,15 @@ digest.update(compiler.stdout);
 digest.update(JSON.stringify(Object.fromEntries(Object.entries(process.env).filter(([key]) => key.startsWith("CARGO_") || key.startsWith("RUST")))));
 const fingerprint = digest.digest("hex");
 const artifact = "target/wasm32-unknown-unknown/wasm/nanocode_worker.wasm";
-let previousFingerprint;
-try { previousFingerprint = readFileSync("output/wasm-build-fingerprint", "utf8"); } catch (error) { if (error.code !== "ENOENT") throw error; }
-if (previousFingerprint !== fingerprint || !existsSync(artifact)) {
+let previousBuild;
+try { previousBuild = JSON.parse(readFileSync("output/wasm-build-fingerprint", "utf8")); } catch (error) { if (error.code !== "ENOENT" && !(error instanceof SyntaxError)) throw error; }
+const artifactDigest = () => createHash("sha256").update(readFileSync(artifact)).digest("hex");
+if (previousBuild?.inputs !== fingerprint || !existsSync(artifact) || previousBuild.artifact !== artifactDigest()) {
   const result = spawnSync("cargo", ["build", "--locked", "--lib", "--target", "wasm32-unknown-unknown", "--profile", "wasm"], { stdio: "inherit" });
   if (result.error) throw result.error;
   if (result.status !== 0) process.exit(result.status ?? 1);
   mkdirSync("output", { recursive: true });
-  writeFileSync("output/wasm-build-fingerprint", fingerprint);
+  writeFileSync("output/wasm-build-fingerprint", JSON.stringify({ inputs: fingerprint, artifact: artifactDigest() }));
 }
 mkdirSync("dist", { recursive: true });
 const bytes = readFileSync(artifact);

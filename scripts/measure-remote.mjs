@@ -30,7 +30,7 @@ let runnerFailure;
 const stopRunners = () => {
   supervising = false;
   for (const group of groups) {
-    try { process.kill(-group, "SIGKILL"); } catch (error) { if (error.code !== "ESRCH") throw error; }
+    try { process.kill(-group, "SIGKILL"); } catch (error) { if (!["ESRCH", "EPERM"].includes(error.code)) throw error; }
   }
   groups.clear();
 };
@@ -137,10 +137,10 @@ text(slow);`,
     },
     () => `text(load("marker") + " " + load("after_wait"));`,
   ],
-  "remote-detached": [
+  "remote-turn-cleanup": [
     () => `// @exec: {"yield_time_ms": 100}
 yield_control();
-text(await tools.exec_command({ cmd: "printf started > notes/detached-started.txt; sleep 3; printf done > notes/detached-finished.txt", yield_time_ms: 10000 }));`,
+text(await tools.exec_command({ cmd: "printf started > notes/cleanup-started.txt; sleep 3; printf done > notes/cleanup-finished.txt", yield_time_ms: 10000 }));`,
   ],
   "remote-cancel": [
     () => `// @exec: {"yield_time_ms": 20000}
@@ -167,7 +167,10 @@ async function model(input) {
   const { scenario, step, last } = turn(input);
   if (scenario === "remote-latency" && step > 0) gaps.push(performance.now() - lastResponseAt);
   const steps = scripts[scenario];
-  if (step >= steps.length) return reply(input, `${scenario}-done`);
+  if (step >= steps.length) {
+    if (scenario === "remote-turn-cleanup") await until(() => read("notes/cleanup-started.txt") !== null, "Yielded command did not start");
+    return reply(input, `${scenario}-done`);
+  }
   const next = steps[step](last);
   return Array.isArray(next) ? call(input, ...next) : exec(input, next);
 }
@@ -278,15 +281,14 @@ try {
   measurements.push({ id: "workspace-replay", milliseconds: performance.now() - replayStart });
   if (modelCalls !== callsBeforeReplay || runnerConnections !== connectionsBeforeReplay) throw new Error("Receipt replay dispatched model or runner work");
 
-  const detachedTurn = await run("detached", "remote-detached");
-  if (!observed["remote-detached"][0]?.text.includes("Script running with cell ID")) throw new Error("Detached cell did not yield");
-  await started("notes/detached-started.txt", "detached");
-  const detachedStorage = await storage();
-  const markerCount = async () => Number((await detachedStorage.exec("SELECT COUNT(*) AS count FROM metadata WHERE key LIKE 'background:%'"))[0].count);
-  if (read("notes/detached-finished.txt") !== null || await markerCount() !== 1) throw new Error("Background alarm cleared before detached work completed");
-  await until(() => read("notes/detached-finished.txt") === "done", "Detached workspace command did not finish");
-  await until(async () => await markerCount() === 0, "Detached work never became quiescent");
-  const detached = { status: detachedTurn.status, marker_retained_until_completion: true, marker_cleared_after_completion: true };
+  const cleanupTurn = await run("turn-cleanup", "remote-turn-cleanup");
+  if (!observed["remote-turn-cleanup"][0]?.text.includes("Script running with cell ID")) throw new Error("Turn cleanup cell did not yield");
+  await new Promise(resolve => setTimeout(resolve, 3500));
+  if (read("notes/cleanup-finished.txt") !== null) throw new Error("Successful turn left an unfinished cell running");
+  const cleanupStorage = await storage();
+  const markerCount = async () => Number((await cleanupStorage.exec("SELECT COUNT(*) AS count FROM metadata WHERE key LIKE 'background:%'"))[0].count);
+  await until(async () => await markerCount() === 0, "Settled turn retained its recovery marker");
+  const turnCleanup = { status: cleanupTurn.status, unfinished_cell_cancelled: true, marker_cleared_after_cleanup: true };
 
   const cancelStart = performance.now();
   await submit("cancel", "remote-cancel");
@@ -348,7 +350,7 @@ try {
     runner_build_ms: runnerBuildMs,
     workspace_turn: { status: workspaceTurn.status, files, tool_results: workspaceResults.map(result => ({ error: result.error, bytes: result.text.length })) },
     latency: { exec_steps: latencySteps, turn_ms: latencyMs, model_to_model_gap_ms: { median: sorted[Math.floor(sorted.length / 2)], min: sorted[0], max: sorted.at(-1) } },
-    detached,
+    turn_cleanup: turnCleanup,
     cancellation,
     disconnect,
     reconnect,
@@ -368,6 +370,9 @@ try {
   if (runnerFailure) throw runnerFailure;
   writeFileSync("output/remote-measurement.json", JSON.stringify(report, null, 2));
   console.log(JSON.stringify(report, null, 2));
+} catch (error) {
+  console.error(error);
+  throw error;
 } finally {
   supervising = false;
   await mf.dispose();
