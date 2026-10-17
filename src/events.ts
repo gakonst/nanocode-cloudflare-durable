@@ -9,6 +9,14 @@ export class EventHub {
     for (const resolve of [...this.listeners]) resolve();
   }
 
+  async wait(milliseconds: number): Promise<void> {
+    let finish!: () => void;
+    const ready = new Promise<void>(resolve => { finish = resolve; });
+    const timer = setTimeout(finish, milliseconds);
+    this.listeners.add(finish);
+    try { await ready; } finally { clearTimeout(timer); this.listeners.delete(finish); }
+  }
+
   stream(after: number, interval: number, read: (after: number) => Page, allowed: () => boolean): Response {
     let cursor = after;
     let closed = false;

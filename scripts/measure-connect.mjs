@@ -66,7 +66,7 @@ try {
   const client = (await accepted(await request("/connect/clients", "POST", { app_id: "measurement", origins: [origin], redirect_uris: [`${origin}/callback`] }), 201)).client;
   const verifier = randomBytes(32).toString("base64url");
   const query = new URLSearchParams({ response_type: "code", client_id: client.client_id, redirect_uri: `${origin}/callback`, code_challenge: createHash("sha256").update(verifier).digest("base64url"), code_challenge_method: "S256", scope: "agent:write agent:read", state: "measurement-state" });
-  const consent = await accepted(await request(`/oauth/authorize?${query}`, "POST", { principal: "owner", connections: ["demo"] }));
+  const consent = await accepted(await request(`/oauth/authorize?${query}`, "POST", { principal: "owner", origin, connections: ["demo"] }));
   const code = new URL(consent.redirect_to).searchParams.get("code");
   const tokens = await accepted(await request("/oauth/token", "POST", { grant_type: "authorization_code", code, code_verifier: verifier, client_id: client.client_id, redirect_uri: `${origin}/callback` }, { origin, "content-type": "application/json" }));
   check(tokens.access_token.startsWith("nc1.default."), "PKCE exchange issues account-routed opaque access token");

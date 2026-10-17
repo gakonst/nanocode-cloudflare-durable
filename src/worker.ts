@@ -5,7 +5,7 @@ import { EventHub } from "./events";
 import { RemoteExecutor } from "./remote/host";
 import { handleConnect } from "./connect/index";
 export { SubscriptionAuth } from "./auth";
-import { json, type AgentResult, type PrivateBinding, type SessionDescriptor } from "./contracts";
+import { headerJson, json, type AgentResult, type PrivateBinding, type SessionDescriptor } from "./contracts";
 
 export interface Env {
   SESSIONS: DurableObjectNamespace<AgentSession>;
@@ -65,7 +65,7 @@ export default {
     else if (match[3]) path += `/${match[3]}`;
     const headers = new Headers(request.headers);
     headers.delete("authorization");
-    headers.set("x-nanocode-descriptor", JSON.stringify(descriptor));
+    headers.set("x-nanocode-descriptor", headerJson(descriptor));
     const target = new URL(request.url);
     target.pathname = path;
     return env.SESSIONS.get(env.SESSIONS.idFromName(sessionName)).fetch(new Request(target, { method: request.method, headers, body: request.body, redirect: "manual" }));
@@ -87,7 +87,6 @@ export class AgentSession extends DurableObject<Env> {
   private readonly runtimes = new Map<string, Promise<AgentRuntime>>();
   private running?: Running;
   private pumping = false;
-  private eventSync?: Promise<void>;
   private readonly eventHub = new EventHub();
   private readonly counts = { runtime_initializations: 0, model_dispatches: 0, events_written: 0, alarms: 0, recoveries: 0 };
 
@@ -134,6 +133,7 @@ export class AgentSession extends DurableObject<Env> {
       let input: any;
       try { input = await request.json(); } catch { return json({ error: "invalid JSON" }, 400); }
       if (typeof input?.request_id !== "string" || !input.request_id.trim() || typeof input.prompt !== "string" || !input.prompt.trim()) return json({ error: "request_id and prompt must be nonempty strings" }, 400);
+      if (input.request_id.startsWith("subagent-completion:")) return json({ error: "request_id prefix is reserved" }, 400);
       const existing = this.job(input.request_id);
       if (existing && (existing.prompt !== input.prompt || existing.scope !== scope)) return json({ error: "request_id already belongs to different input or authority" }, 409);
       if (!existing) {
@@ -161,44 +161,77 @@ export class AgentSession extends DurableObject<Env> {
     this.counts.alarms++;
     const delay = policy(this.env.RECOVERY_DELAY_MS, "RECOVERY_DELAY_MS");
     if (this.pumping) { await this.ctx.storage.setAlarm(Date.now() + delay); return; }
-    const job = this.ctx.storage.sql.exec<Job>("SELECT * FROM jobs WHERE status IN ('queued', 'running') ORDER BY rowid LIMIT 1").toArray()[0];
-    if (!job) { await this.ctx.storage.deleteAlarm(); return; }
     this.pumping = true;
-    let completed = false;
+    let scope: string | undefined;
     let runtime: AgentRuntime | undefined;
+    let immediate = false;
+    let waiting = false;
+    let activeJob: Job | undefined;
     try {
-      const descriptor = this.descriptor(job);
-      if (job.cancel_requested || this.isFenced(descriptor)) {
-        this.finish(job, { cancelled: true, error: "request cancelled" });
-        completed = true;
-        return;
-      }
-      if (job.status === "running") this.counts.recoveries++;
-      const sessionId = this.sessionId(job.scope, descriptor.session_id);
-      this.ctx.storage.sql.exec("UPDATE jobs SET status = 'running', result = NULL WHERE request_id = ?", job.request_id);
       await this.ctx.storage.setAlarm(Date.now() + delay);
       await this.ctx.storage.sync();
-      runtime = await this.runtime(job.scope, sessionId, descriptor);
-      this.running = { job, runtime };
-      const latest = this.job(job.request_id)!;
-      if (latest.cancel_requested || this.isFenced(descriptor)) {
-        this.finish(job, { cancelled: true, error: "request cancelled" });
-        completed = true;
-        return;
+      const job = this.ctx.storage.sql.exec<Job>("SELECT * FROM jobs WHERE status IN ('queued', 'running') ORDER BY rowid LIMIT 1").toArray()[0];
+      const background = this.store.row("SELECT key, value FROM metadata WHERE key LIKE 'background:%' ORDER BY key LIMIT 1");
+      if (!job && !background) return;
+      scope = job?.scope ?? String(background!.key).slice("background:".length);
+      const descriptor: SessionDescriptor = job ? this.descriptor(job) : JSON.parse(String(background!.value));
+      let sessionId!: string;
+      this.ctx.storage.transactionSync(() => {
+        this.ctx.storage.sql.exec("INSERT INTO metadata VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", `background:${scope}`, JSON.stringify(descriptor));
+        sessionId = this.sessionId(scope!, descriptor.session_id);
+        if (job) {
+          activeJob = job;
+          if (job.status === "running") this.counts.recoveries++;
+          this.ctx.storage.sql.exec("UPDATE jobs SET status = 'running', result = NULL WHERE request_id = ?", job.request_id);
+        }
+      });
+      await this.ctx.storage.sync();
+      runtime = await this.runtime(scope, sessionId, descriptor);
+      if (this.isFenced(descriptor)) {
+        await runtime.revoke();
+        for (const cancelled of this.ctx.storage.sql.exec<Job>("SELECT * FROM jobs WHERE scope = ? AND status IN ('queued', 'running') ORDER BY rowid", scope).toArray()) {
+          const result = await runtime.cancel(cancelled.request_id);
+          if (result.retry) throw new Error("runtime recovery required");
+          waiting ||= !!result.waiting;
+          if (!result.waiting) this.finish(cancelled, result);
+        }
+      } else {
+        const state = await runtime.pending();
+        const first = state.pending[0];
+        const pendingJob = first ? this.job(first) : undefined;
+        activeJob = pendingJob?.scope === scope && ["queued", "running"].includes(pendingJob.status) ? pendingJob : !first ? job : undefined;
+        if (activeJob) {
+          this.ctx.storage.sql.exec("UPDATE jobs SET status = 'running', result = NULL WHERE request_id = ?", activeJob.request_id);
+          await this.ctx.storage.sync();
+          this.running = { job: activeJob, runtime };
+          await this.appendEvent(scope, activeJob.request_id, { type: "running", request_id: activeJob.request_id });
+          const latest = this.job(activeJob.request_id)!;
+          const result = latest.cancel_requested ? await runtime.cancel(activeJob.request_id) : await runtime.run({ request_id: activeJob.request_id, prompt: activeJob.prompt });
+          if (result.retry) throw new Error("runtime recovery required");
+          waiting = !!result.waiting;
+          if (!result.waiting) this.finish(activeJob, result);
+        } else if (first) {
+          const result = await runtime.resume(first);
+          if (result.retry) throw new Error("runtime recovery required");
+          waiting = !!result.waiting;
+        }
       }
-      await this.appendEvent(job.scope, job.request_id, { type: "running", request_id: job.request_id });
-      const result = await runtime.run({ request_id: job.request_id, prompt: job.prompt });
-      if (result.retry) throw new Error("runtime recovery required");
-      this.finish(job, result);
-      completed = true;
+      this.running = undefined;
+      if (await runtime.settle()) this.ctx.storage.sql.exec("DELETE FROM metadata WHERE key = ?", `background:${scope}`);
+      else if (waiting || !this.store.row("SELECT request_id FROM jobs WHERE status IN ('queued', 'running') LIMIT 1")) {
+        await this.eventHub.wait(delay);
+      }
+      immediate = !!this.store.row("SELECT request_id FROM jobs WHERE status IN ('queued', 'running') LIMIT 1");
     } catch {
-      this.ctx.storage.sql.exec("UPDATE jobs SET result = ? WHERE request_id = ? AND status = 'running'", JSON.stringify({ error: "Agent execution interrupted; recovery scheduled" }), job.request_id);
-      this.runtimes.delete(job.scope);
+      if (activeJob) this.ctx.storage.sql.exec("UPDATE jobs SET result = ? WHERE request_id = ? AND status = 'running'", JSON.stringify({ error: "Agent execution interrupted; recovery scheduled" }), activeJob.request_id);
+      if (scope) this.runtimes.delete(scope);
       if (runtime) await runtime.dispose().catch(() => {});
     } finally {
       this.running = undefined;
       this.pumping = false;
-      if (this.store.row("SELECT request_id FROM jobs WHERE status IN ('queued', 'running') LIMIT 1")) await this.ctx.storage.setAlarm(Date.now() + (completed ? 0 : delay));
+      const unfinished = this.store.row("SELECT request_id FROM jobs WHERE status IN ('queued', 'running') LIMIT 1");
+      const background = this.store.row("SELECT key FROM metadata WHERE key LIKE 'background:%' LIMIT 1");
+      if (unfinished || background) await this.ctx.storage.setAlarm(Date.now() + (immediate ? 0 : delay));
       else await this.ctx.storage.deleteAlarm();
       await this.ctx.storage.sync();
     }
@@ -215,7 +248,7 @@ export class AgentSession extends DurableObject<Env> {
     const key = scope === "owner" ? "session_id" : `session_id:${scope}`;
     let session = this.store.row("SELECT value FROM metadata WHERE key = ?", key)?.value as string | undefined;
     if (!session) {
-      session = scope === "owner" && suggested ? suggested : crypto.randomUUID();
+      session = suggested || crypto.randomUUID();
       this.ctx.storage.sql.exec("INSERT INTO metadata VALUES (?, ?)", key, session);
     }
     return session;
@@ -226,23 +259,35 @@ export class AgentSession extends DurableObject<Env> {
     if (!resident) {
       this.counts.runtime_initializations++;
       resident = (async () => {
-        const authority = { ...descriptor, session_id: sessionId };
+        const authority = { account_id: descriptor.account_id, session_id: sessionId, grant_id: descriptor.grant_id, grant_revision: descriptor.grant_revision, connections: descriptor.connections, catalog_digest: descriptor.catalog_digest, grant_expires_at: descriptor.grant_expires_at };
         const remote = this.env.RUNNER_ENABLED === "true" && (!descriptor.grant_id || descriptor.connections?.includes("runner"))
           ? await RemoteExecutor.create(this.env.REMOTE, authority, { max_frame_bytes: policy(this.env.REMOTE_MAX_FRAME_BYTES, "REMOTE_MAX_FRAME_BYTES"), timeout_ms: policy(this.env.REMOTE_TIMEOUT_MS, "REMOTE_TIMEOUT_MS") })
           : undefined;
         try {
           return await AgentRuntime.create({ session_id: sessionId, subscription: descriptor.subscription, endpoint: `https://api.anthropic.com/v1/messages${descriptor.subscription ? "?beta=true" : ""}`, remote: !!remote }, this.store, {
-        remote,
+        remote: remote ? {
+          execute: (request: any, id: number) => {
+            if (request.op === "remote_send" && this.dispatchBlocked(scope, descriptor)) {
+              const forbidden = request.frames.some((text: string) => {
+                const frame = JSON.parse(text);
+                return frame.type === "request" && !["Cancel", "CancelTurn", "Preempt", "DetachTurn", "SettlePreempt"].includes(Object.keys(frame.operation)[0]);
+              });
+              if (forbidden) throw new Error("grant revoked");
+            }
+            return remote.execute(request, id);
+          },
+          cancel: id => remote.cancel(id),
+          dispose: () => remote.dispose(),
+        } : undefined,
         dispatch: async (request, signal) => {
-          if (this.isFenced(descriptor)) throw new Error("grant revoked");
-          if (this.running?.job.scope === scope && this.job(this.running.job.request_id)?.cancel_requested) throw new Error("request cancelled");
+          if (this.dispatchBlocked(scope, descriptor)) throw new Error("request authority stopped");
           this.counts.model_dispatches++;
           return this.env.EGRESS.fetch(new Request("https://egress.internal/model", { method: "POST", signal, headers: { "content-type": "application/json" }, body: JSON.stringify({ ...request, authority, subscription: descriptor.subscription }) }));
         },
-        event: event => this.appendEvent(scope, this.running?.job.scope === scope ? this.running.job.request_id : null, event),
-        events: events => this.appendEvents(scope, this.running?.job.scope === scope ? this.running.job.request_id : null, events),
+        event: event => this.appendEvent(scope, null, event),
+        events: events => this.appendEvents(scope, null, events),
         connection: async request => {
-          if (this.isFenced(descriptor)) throw new Error("grant revoked");
+          if (this.dispatchBlocked(scope, descriptor)) throw new Error("request authority stopped");
           const catalog = request.op === "connection_catalog";
           const response = await this.env.EGRESS.fetch(new Request(`https://egress.internal/${catalog ? "connections" : "connector"}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ ...(request.input && typeof request.input === "object" ? request.input : {}), authority, kind: request.kind }) }));
           return response.json();
@@ -270,7 +315,10 @@ export class AgentSession extends DurableObject<Env> {
     if (!["queued", "running"].includes(job.status)) return json(this.publicJob(job));
     this.ctx.storage.sql.exec("UPDATE jobs SET cancel_requested = 1 WHERE request_id = ?", id);
     if (job.status === "queued") this.finish(job, { cancelled: true, error: "request cancelled" });
-    else if (this.running?.job.request_id === id) this.ctx.waitUntil(this.running.runtime.cancel());
+    else {
+      const resident = this.runtimes.get(scope);
+      if (resident) this.ctx.waitUntil(resident.then(runtime => runtime.cancel(id)).then(() => {}).catch(() => {}));
+    }
     if (!this.pumping) await this.ctx.storage.setAlarm(Date.now());
     await this.ctx.storage.sync();
     return json(this.publicJob(this.job(id)!), job.status === "running" ? 202 : 200);
@@ -284,6 +332,11 @@ export class AgentSession extends DurableObject<Env> {
       if (identity.account_id !== input.account_id || identity.session_name !== input.session_name) return json({ error: "fence authority mismatch" }, 403);
     }
     if (typeof input.grant_id !== "string" || !Number.isSafeInteger(input.revision) || input.revision < 1) return json({ error: "invalid fence" }, 400);
+    const previous = this.store.row("SELECT revision FROM grant_fences WHERE grant_id = ?", input.grant_id);
+    if (previous && Number(previous.revision) >= input.revision) {
+      await this.ctx.storage.sync();
+      return json({ ok: true, revision: Number(previous.revision) });
+    }
     this.ctx.storage.transactionSync(() => {
       this.ctx.storage.sql.exec("INSERT INTO grant_fences VALUES (?, ?) ON CONFLICT(grant_id) DO UPDATE SET revision = MAX(revision, excluded.revision)", input.grant_id, input.revision);
       this.ctx.storage.sql.exec("UPDATE jobs SET cancel_requested = 1 WHERE scope = ? AND status IN ('queued', 'running')", input.grant_id);
@@ -291,14 +344,21 @@ export class AgentSession extends DurableObject<Env> {
       for (const job of queued) this.finish(job, { cancelled: true, error: "grant revoked" });
       this.insertEvent(input.grant_id, null, { type: "grant_revoked", revision: input.revision });
     });
-    if (this.running?.job.scope === input.grant_id) this.ctx.waitUntil(this.running.runtime.cancel());
-    if (!this.pumping && this.store.row("SELECT request_id FROM jobs WHERE status IN ('queued', 'running') LIMIT 1")) await this.ctx.storage.setAlarm(Date.now());
+    const last = this.ctx.storage.sql.exec<Job>("SELECT * FROM jobs WHERE scope = ? ORDER BY rowid DESC LIMIT 1", input.grant_id).toArray()[0];
+    if (last) this.ctx.storage.sql.exec("INSERT INTO metadata VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", `background:${input.grant_id}`, JSON.stringify(this.descriptor(last)));
+    const resident = this.runtimes.get(input.grant_id);
+    if (resident) this.ctx.waitUntil(resident.then(runtime => runtime.revoke()).catch(() => {}));
+    if (!this.pumping && last) await this.ctx.storage.setAlarm(Date.now());
     await this.ctx.storage.sync();
     return json({ ok: true, revision: input.revision });
   }
 
+  private dispatchBlocked(scope: string, descriptor: SessionDescriptor): boolean {
+    return this.isFenced(descriptor) || !!this.store.row("SELECT request_id FROM jobs WHERE scope = ? AND status = 'running' AND cancel_requested = 1 LIMIT 1", scope);
+  }
+
   private isFenced(descriptor: SessionDescriptor): boolean {
-    return !!descriptor.grant_id && !!this.store.row("SELECT revision FROM grant_fences WHERE grant_id = ?", descriptor.grant_id);
+    return (descriptor.grant_expires_at !== undefined && descriptor.grant_expires_at <= Date.now()) || (!!descriptor.grant_id && !!this.store.row("SELECT revision FROM grant_fences WHERE grant_id = ?", descriptor.grant_id));
   }
 
   private events(scope: string, url: URL, streaming = false, descriptor?: SessionDescriptor): Response {
@@ -315,6 +375,9 @@ export class AgentSession extends DurableObject<Env> {
   }
 
   private insertEvent(scope: string, requestId: string | null, event: unknown): void {
+    const value = event as any;
+    const sdkId = value?.source === "agent" ? value.event?.request_id : value?.source === "subagent" ? value.update?.event?.request_id : undefined;
+    if (typeof sdkId === "string") requestId = sdkId;
     this.ctx.storage.sql.exec("INSERT INTO events (scope, request_id, body, created_at) VALUES (?, ?, ?, ?)", scope, requestId, JSON.stringify(event), Date.now());
     this.counts.events_written++;
     this.eventHub.notify();
@@ -326,8 +389,7 @@ export class AgentSession extends DurableObject<Env> {
 
   private async appendEvents(scope: string, requestId: string | null, events: unknown[]): Promise<void> {
     this.ctx.storage.transactionSync(() => { for (const event of events) this.insertEvent(scope, requestId, event); });
-    if (!this.eventSync) this.eventSync = Promise.resolve().then(() => this.ctx.storage.sync()).finally(() => { this.eventSync = undefined; });
-    await this.eventSync;
+    await this.ctx.storage.sync();
   }
 
   private job(id: string): Job | undefined {

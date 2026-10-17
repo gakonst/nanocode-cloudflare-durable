@@ -8,6 +8,7 @@ export type SessionAuthority = {
   principal?: string;
   connections?: string[];
   catalog_digest?: string;
+  grant_expires_at?: number;
 };
 
 export type SessionDescriptor = SessionAuthority & {
@@ -56,6 +57,7 @@ export type AgentResult = {
   error?: string;
   cancelled?: boolean;
   retry?: boolean;
+  waiting?: boolean;
 };
 
 export type RuntimeOptions = {
@@ -75,6 +77,10 @@ export function json(value: unknown, status = 200, headers?: HeadersInit): Respo
   result.set("content-type", "application/json");
   result.set("cache-control", "no-store");
   return new Response(JSON.stringify(value), { status, headers: result });
+}
+
+export function headerJson(value: unknown): string {
+  return JSON.stringify(value).replace(/[\u007f-\uffff]/g, character => `\\u${character.charCodeAt(0).toString(16).padStart(4, "0")}`);
 }
 
 export async function authorityCall(binding: PrivateBinding, command: AuthorityCommand): Promise<AuthorityResult> {

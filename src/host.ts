@@ -13,6 +13,10 @@ type Exports = {
 
 type Pending = { resolve(value: unknown): void; reject(reason: unknown): void };
 
+export type TurnOutcome = AgentResult & { waiting?: boolean };
+
+export type RuntimeActivity = { pending: string[]; quiescent: boolean; activity: unknown };
+
 export type RuntimeMetrics = {
   initializations: number;
   runs: number;
@@ -20,6 +24,8 @@ export type RuntimeMetrics = {
   failed: number;
   cancelled: number;
   retries: number;
+  waits: number;
+  resumes: number;
   rejected_runs: number;
   cancellations: number;
   host_calls: number;
@@ -42,8 +48,9 @@ export class AgentRuntime {
   private readonly inflight = new Map<number, () => void>();
   private readonly bodies = new Map<number, ReadableStreamDefaultReader<Uint8Array>>();
   private readonly commands = new Map<number, Pending>();
+  private readonly watchers = new Set<() => void>();
   private readonly counters: RuntimeMetrics = {
-    initializations: 0, runs: 0, completed: 0, failed: 0, cancelled: 0, retries: 0, rejected_runs: 0, cancellations: 0,
+    initializations: 0, runs: 0, completed: 0, failed: 0, cancelled: 0, retries: 0, waits: 0, resumes: 0, rejected_runs: 0, cancellations: 0,
     host_calls: 0, store_calls: 0, model_requests: 0, body_reads: 0, event_batches: 0, events: 0,
     host_cancellations: 0, dropped_replies: 0, disposals: 0,
   };
@@ -54,6 +61,7 @@ export class AgentRuntime {
   private running = false;
   private failure?: Error;
   private disposal?: Promise<void>;
+  private pendingAtOpen: string[] = [];
 
   private constructor(private readonly store: CheckpointStore, private readonly options: RuntimeOptions) {}
 
@@ -62,7 +70,8 @@ export class AgentRuntime {
     const instance = await WebAssembly.instantiate(module, { host: runtime.imports() });
     runtime.wasm = instance.exports as unknown as Exports;
     try {
-      await runtime.command({ op: "init", config: { session_id: config.session_id, subscription: config.subscription, endpoint: config.endpoint, remote: config.remote ?? false } });
+      const opened = await runtime.command({ op: "init", config: { session_id: config.session_id, subscription: config.subscription, endpoint: config.endpoint, remote: config.remote ?? false } }) as { pending: string[] };
+      runtime.pendingAtOpen = opened.pending;
     } catch (error) {
       runtime.terminate(error);
       throw error;
@@ -79,34 +88,78 @@ export class AgentRuntime {
     return this.stopped || this.disposal !== undefined;
   }
 
-  async run(input: AgentInput): Promise<AgentResult> {
+  get opened(): readonly string[] {
+    return this.pendingAtOpen;
+  }
+
+  run(input: AgentInput): Promise<TurnOutcome> {
+    this.counters.runs++;
+    return this.turn({ op: "run", input: { request_id: input.request_id, prompt: input.prompt } });
+  }
+
+  resume(request_id: string): Promise<TurnOutcome> {
+    this.counters.resumes++;
+    return this.turn({ op: "resume", request_id });
+  }
+
+  async cancel(request_id?: string): Promise<TurnOutcome> {
+    if (this.closed) return { retry: true };
+    this.counters.cancellations++;
+    return this.record(await this.command({ op: "cancel", request_id }) as TurnOutcome);
+  }
+
+  async pending(): Promise<RuntimeActivity> {
+    return await this.command({ op: "pending" }) as RuntimeActivity;
+  }
+
+  async settle(): Promise<boolean> {
+    return await this.command({ op: "settle" }) === true;
+  }
+
+  async revoke(): Promise<void> {
+    await this.command({ op: "revoke" });
+  }
+
+  changed(signal?: AbortSignal): Promise<void> {
+    if (this.stopped || signal?.aborted) return Promise.resolve();
+    return new Promise(resolve => {
+      const done = () => {
+        this.watchers.delete(done);
+        signal?.removeEventListener("abort", done);
+        resolve();
+      };
+      this.watchers.add(done);
+      signal?.addEventListener("abort", done, { once: true });
+    });
+  }
+
+  private async turn(command: unknown): Promise<TurnOutcome> {
     if (this.closed) throw this.failure ?? new Error("agent runtime is closed");
     if (this.running) {
       this.counters.rejected_runs++;
-      throw new Error("a root turn is already running");
+      this.counters.waits++;
+      return { waiting: true };
     }
     this.running = true;
-    this.counters.runs++;
-    let result: AgentResult;
+    let result: TurnOutcome;
     try {
-      result = await this.command({ op: "run", input: { request_id: input.request_id, prompt: input.prompt } }) as AgentResult;
+      result = await this.command(command) as TurnOutcome;
     } catch {
       result = { retry: true };
     } finally {
       this.running = false;
     }
+    return this.record(result);
+  }
+
+  private async record(result: TurnOutcome): Promise<TurnOutcome> {
     if (result.ok) this.counters.completed++;
     else if (result.cancelled) this.counters.cancelled++;
     else if (result.retry) this.counters.retries++;
-    else this.counters.failed++;
+    else if (result.waiting) this.counters.waits++;
+    else if (result.error !== undefined) this.counters.failed++;
     if (result.retry) await this.dispose().catch(() => undefined);
     return result;
-  }
-
-  async cancel(): Promise<void> {
-    if (this.closed) return;
-    this.counters.cancellations++;
-    await this.command({ op: "cancel" });
   }
 
   dispose(): Promise<void> {
@@ -152,6 +205,7 @@ export class AgentRuntime {
         this.commands.delete(id);
         if ("error" in reply) pending.reject(new Error(String(reply.error)));
         else pending.resolve(reply.ok);
+        this.notify();
       },
       panicked: (pointer: number, length: number) => { this.fail(new Error(this.read(pointer, length))); },
     };
@@ -225,13 +279,14 @@ export class AgentRuntime {
         if (this.options.events) {
           await this.options.events(request.events);
           this.counters.events += request.events.length;
-          return null;
+        } else {
+          for (const value of request.events) {
+            if (this.stopped) throw new Error("agent runtime disposed");
+            await this.options.event(value);
+            this.counters.events++;
+          }
         }
-        for (const value of request.events) {
-          if (this.stopped) throw new Error("agent runtime disposed");
-          await this.options.event(value);
-          this.counters.events++;
-        }
+        this.notify();
         return null;
       }
       case "connection_catalog":
@@ -245,6 +300,10 @@ export class AgentRuntime {
         return this.store.execute(request);
       }
     }
+  }
+
+  private notify() {
+    for (const watcher of [...this.watchers]) watcher();
   }
 
   private complete(id: number, reply: { ok: unknown } | { error: unknown }) {
@@ -302,6 +361,7 @@ export class AgentRuntime {
     const commands = [...this.commands.values()];
     this.commands.clear();
     for (const pending of commands) pending.reject(reason);
+    this.notify();
   }
 
   private read(pointer: number, length: number) {

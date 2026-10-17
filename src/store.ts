@@ -33,7 +33,11 @@ export class CheckpointStore {
       case "peek": return this.peek(id);
       case "read_record": return this.row("SELECT value FROM records WHERE state_id = ? AND key = ?", id, request.key)?.value ?? null;
       case "read_records": return this.storage.sql.exec("SELECT records.value FROM json_each(?) AS keys LEFT JOIN records ON records.state_id = ? AND records.key = keys.value ORDER BY keys.key", JSON.stringify(request.keys), id).toArray().map(row => row.value);
-      case "list_states": return this.storage.sql.exec("SELECT id FROM states ORDER BY rowid DESC LIMIT ?", request.limit).toArray().map(row => row.id);
+      case "list_states": {
+        if (typeof request.limit !== "number" || request.limit < 0 || !Number.isFinite(request.limit)) throw new Error("invalid state listing limit");
+        const limit = Number.isSafeInteger(request.limit) ? request.limit : -1;
+        return this.storage.sql.exec("SELECT id FROM states ORDER BY rowid DESC LIMIT ?", limit).toArray().map(row => row.id);
+      }
       case "acquire": {
         const value = this.storage.transactionSync(() => {
           const prior = this.row("SELECT fence FROM owners WHERE id = ?", id);
