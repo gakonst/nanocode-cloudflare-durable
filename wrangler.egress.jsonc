@@ -1,0 +1,22 @@
+{
+  "name": "nanocode-egress",
+  "main": "src/egress/index.ts",
+  "compatibility_date": "2026-10-16",
+  "workers_dev": false,
+  "preview_urls": false,
+  "durable_objects": {
+    "bindings": [{ "name": "ACCOUNTS", "class_name": "AccountAuthority" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["AccountAuthority"] }],
+  "services": [{ "binding": "SESSION_FENCES", "service": "nanocode-worker", "entrypoint": "SessionControl" }],
+  "vars": {
+    "ACCOUNT_ID": "default",
+    "CREDENTIAL_CACHE_TTL_MS": "600000",
+    "REFRESH_MARGIN_MS": "60000",
+    "CONNECT_TOKEN_TTL_MS": "3600000",
+    "CONNECT_REFRESH_TTL_MS": "2592000000",
+    "CONNECT_CODE_TTL_MS": "300000",
+    "RECOVERY_DELAY_MS": "30000"
+  },
+  "observability": { "enabled": true }
+}

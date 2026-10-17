@@ -1,0 +1,30 @@
+{
+  "name": "nanocode-worker",
+  "main": "src/worker.ts",
+  "compatibility_date": "2026-10-16",
+  "build": {
+    "command": "npm run build",
+    "watch_dir": ["src", "Cargo.toml", "Cargo.lock", "scripts/build.mjs", "../nanocodex/crates", "../nanocodex/Cargo.toml", "../nanocodex/Cargo.lock"]
+  },
+  "durable_objects": {
+    "bindings": [
+      { "name": "SESSIONS", "class_name": "AgentSession" }
+    ]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["AgentSession", "SubscriptionAuth"] }
+  ],
+  "services": [
+    { "binding": "EGRESS", "service": "nanocode-egress", "entrypoint": "SessionEgress" },
+    { "binding": "AUTHORITY", "service": "nanocode-egress", "entrypoint": "ConnectAuthority" },
+    { "binding": "SERVICE_EGRESS", "service": "nanocode-egress", "entrypoint": "ConnectServiceEgress" }
+  ],
+  "vars": {
+    "ACCOUNT_ID": "default",
+    "MODEL_AUTH": "subscription",
+    "RECOVERY_DELAY_MS": "30000",
+    "CONNECT_STREAM_REVALIDATE_MS": "5000",
+    "EVENT_PAGE_SIZE": "128"
+  },
+  "observability": { "enabled": true }
+}
