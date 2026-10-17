@@ -25,6 +25,7 @@ const provider = async request => {
   if (url.hostname !== "provider.invalid") throw new Error("Unexpected upstream destination");
   observed.model++;
   const input = await request.json();
+  if (JSON.stringify(input.messages).includes("Fresh grant hello") && JSON.stringify(input.messages).includes("Say hello")) throw new Error("Fresh grant inherited a prior transcript");
   const events = [
     ["message_start", { type: "message_start", message: { id: `connect-${observed.model}`, type: "message", role: "assistant", model: input.model, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 8, output_tokens: 0 } } }],
     ["content_block_start", { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } }],
@@ -100,6 +101,14 @@ try {
   check(isolated.status === 404, "Fresh grant cannot read an older grant's saved turn");
   const empty = await accepted(await request(`${base}/events`, "GET", undefined, delegated(fresh.access_token)));
   check(empty.events.length === 0, "Fresh grant cannot replay an older grant's events");
+  await accepted(await request(`${base}/turns`, "POST", { request_id: "fresh-turn", prompt: "Fresh grant hello" }, delegated(fresh.access_token)), 202);
+  let freshResult;
+  await until(async () => {
+    freshResult = await accepted(await request(`${base}/turns/fresh-turn`, "GET", undefined, delegated(fresh.access_token)));
+    if (freshResult.status === "failed") throw new Error("Fresh grant inference failed");
+    return freshResult.status === "completed";
+  }, "Fresh grant turn did not complete");
+  check(freshResult.ok.session_id !== result.ok.session_id, "Fresh grant uses a separate SDK identity in the same thread object");
   const rotated = await accepted(await request("/oauth/token", "POST", { grant_type: "refresh_token", refresh_token: fresh.refresh_token }, { origin, "content-type": "application/json" }));
   const reused = await request("/oauth/token", "POST", { grant_type: "refresh_token", refresh_token: fresh.refresh_token }, { origin, "content-type": "application/json" });
   check(reused.status === 400, "Consumed refresh token reuse is rejected");

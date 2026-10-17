@@ -1,4 +1,4 @@
-import { readdirSync, mkdirSync, mkdtempSync } from "node:fs";
+import { readFileSync, readdirSync, mkdirSync, mkdtempSync } from "node:fs";
 import { resolve } from "node:path";
 import { credentials } from "./credentials.mjs";
 
@@ -6,7 +6,10 @@ function modules(directory) {
   const files = readdirSync(directory);
   const scripts = files.filter(file => file.endsWith(".js"));
   if (scripts.length !== 1) throw new Error(`Expected one compiled Worker in ${directory}; run npm run dry-run`);
-  return [{ type: "ESModule", path: `${directory}/${scripts[0]}` }, ...files.filter(file => file.endsWith(".wasm")).map(file => ({ type: "CompiledWasm", path: `${directory}/${file}` }))];
+  const path = `${directory}/${scripts[0]}`;
+  const contents = readFileSync(path, "utf8");
+  const imports = [...contents.matchAll(/from\s+["']\.\/([^"']+\.wasm)["']/g)].map(match => match[1]);
+  return [{ type: "ESModule", path, contents }, ...[...new Set(imports)].map(file => ({ type: "CompiledWasm", path: `${directory}/${file}`, contents: readFileSync(`${directory}/${file}`) }))];
 }
 
 export function localOptions({ provider, live = false, agent = {}, egress = {}, persistence } = {}) {

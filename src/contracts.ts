@@ -66,6 +66,7 @@ export type RuntimeOptions = {
   events?(values: unknown[]): Promise<void>;
   connection?(request: { kind?: string; input?: unknown; op: string }): Promise<unknown>;
   remote?: {
+    failed?(): boolean;
     execute(request: unknown, id: number): Promise<unknown>;
     cancel(id: number): void;
     dispose(): Promise<void>;

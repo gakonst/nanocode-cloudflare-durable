@@ -4,12 +4,17 @@ type Page = { events: { seq: number; [key: string]: unknown }[]; next_cursor: nu
 
 export class EventHub {
   private readonly listeners = new Set<() => void>();
+  private revision = 0;
+
+  get version(): number { return this.revision; }
 
   notify(): void {
+    this.revision++;
     for (const resolve of [...this.listeners]) resolve();
   }
 
-  async wait(milliseconds: number): Promise<void> {
+  async wait(milliseconds: number, version = this.revision): Promise<void> {
+    if (version !== this.revision) return;
     let finish!: () => void;
     const ready = new Promise<void>(resolve => { finish = resolve; });
     const timer = setTimeout(finish, milliseconds);

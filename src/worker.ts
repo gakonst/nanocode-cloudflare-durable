@@ -217,9 +217,16 @@ export class AgentSession extends DurableObject<Env> {
         }
       }
       this.running = undefined;
-      if (await runtime.settle()) this.ctx.storage.sql.exec("DELETE FROM metadata WHERE key = ?", `background:${scope}`);
+      const version = this.eventHub.version;
+      if (await runtime.settle()) {
+        this.ctx.storage.sql.exec("DELETE FROM metadata WHERE key = ?", `background:${scope}`);
+        if (this.isFenced(descriptor)) {
+          this.runtimes.delete(scope);
+          await runtime.dispose();
+        }
+      }
       else if (waiting || !this.store.row("SELECT request_id FROM jobs WHERE status IN ('queued', 'running') LIMIT 1")) {
-        await this.eventHub.wait(delay);
+        await this.eventHub.wait(delay, version);
       }
       immediate = !!this.store.row("SELECT request_id FROM jobs WHERE status IN ('queued', 'running') LIMIT 1");
     } catch {
@@ -256,6 +263,12 @@ export class AgentSession extends DurableObject<Env> {
 
   private runtime(scope: string, sessionId: string, descriptor: SessionDescriptor): Promise<AgentRuntime> {
     let resident = this.runtimes.get(scope);
+    if (resident) return resident.then(async runtime => {
+      if (runtime.reusable) return runtime;
+      if (this.runtimes.get(scope) === resident) this.runtimes.delete(scope);
+      await runtime.dispose().catch(() => {});
+      return this.runtime(scope, sessionId, descriptor);
+    });
     if (!resident) {
       this.counts.runtime_initializations++;
       resident = (async () => {
@@ -266,13 +279,17 @@ export class AgentSession extends DurableObject<Env> {
         try {
           return await AgentRuntime.create({ session_id: sessionId, subscription: descriptor.subscription, endpoint: `https://api.anthropic.com/v1/messages${descriptor.subscription ? "?beta=true" : ""}`, remote: !!remote }, this.store, {
         remote: remote ? {
-          execute: (request: any, id: number) => {
+          failed: () => remote.failure !== undefined,
+          execute: async (request: any, id: number) => {
             if (request.op === "remote_send" && this.dispatchBlocked(scope, descriptor)) {
               const forbidden = request.frames.some((text: string) => {
                 const frame = JSON.parse(text);
-                return frame.type === "request" && !["Cancel", "CancelTurn", "Preempt", "DetachTurn", "SettlePreempt"].includes(Object.keys(frame.operation)[0]);
+                return frame.type === "request" && ["Execute", "Wait"].includes(Object.keys(frame.operation)[0]);
               });
-              if (forbidden) throw new Error("grant revoked");
+              if (forbidden) {
+                await remote.dispose();
+                throw new Error("request authority stopped");
+              }
             }
             return remote.execute(request, id);
           },

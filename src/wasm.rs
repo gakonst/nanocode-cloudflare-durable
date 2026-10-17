@@ -261,14 +261,10 @@ impl Session {
         prompt: Prompt,
         cancel: bool,
     ) -> Result<Value, String> {
-        if self
-            .live
-            .borrow_mut()
-            .insert(request_id.to_owned(), None)
-            .is_some()
-        {
+        if self.live.borrow().contains_key(request_id) {
             return Ok(waiting());
         }
+        self.live.borrow_mut().insert(request_id.to_owned(), None);
         let _live = Live(self, request_id);
         let outcome = self.prompt(request_id, prompt, cancel).await;
         if self.events.drained().await.is_err() {

@@ -88,6 +88,10 @@ export class AgentRuntime {
     return this.stopped || this.disposal !== undefined;
   }
 
+  get reusable(): boolean {
+    return !this.closed && !this.options.remote?.failed?.();
+  }
+
   get opened(): readonly string[] {
     return this.pendingAtOpen;
   }

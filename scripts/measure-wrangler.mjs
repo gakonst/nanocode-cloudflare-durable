@@ -3,7 +3,7 @@ import { createServer } from "node:http";
 import { createServer as createSocketServer } from "node:net";
 import { once } from "node:events";
 import { mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { relative, resolve } from "node:path";
 import { performance } from "node:perf_hooks";
 
 mkdirSync("output", { recursive: true });
@@ -38,7 +38,7 @@ await new Promise(resolve => listener.close(resolve));
 const publicConfig = JSON.parse(readFileSync("wrangler.jsonc", "utf8"));
 publicConfig.main = resolve(publicConfig.main);
 publicConfig.build.cwd = process.cwd();
-publicConfig.build.watch_dir = publicConfig.build.watch_dir.map(path => resolve(path));
+publicConfig.build.watch_dir = publicConfig.build.watch_dir.map(path => relative(resolve("output"), resolve(path)));
 publicConfig.vars = { ...publicConfig.vars, WORKER_TOKEN: "local-measurement", MODEL_AUTH: "api_key", RECOVERY_DELAY_MS: "1000" };
 publicConfig.observability = { enabled: false };
 const egressConfig = JSON.parse(readFileSync("wrangler.egress.jsonc", "utf8"));
@@ -95,7 +95,7 @@ const complete = async id => {
 try {
   const startup = performance.now();
   await start();
-  measurements.push({ id: "cached-startup", milliseconds: performance.now() - startup });
+  measurements.push({ id: "startup", milliseconds: performance.now() - startup, compiled_wasm: /Compiling /.test(logs) });
   await submit("cold");
   const initial = await complete("cold");
   const unchangedWasm = statSync("dist/nanocode_worker.wasm").mtimeMs;
