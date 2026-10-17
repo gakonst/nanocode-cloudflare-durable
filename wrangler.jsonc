@@ -17,14 +17,18 @@
   "services": [
     { "binding": "EGRESS", "service": "nanocode-egress", "entrypoint": "SessionEgress" },
     { "binding": "AUTHORITY", "service": "nanocode-egress", "entrypoint": "ConnectAuthority" },
-    { "binding": "SERVICE_EGRESS", "service": "nanocode-egress", "entrypoint": "ConnectServiceEgress" }
+    { "binding": "SERVICE_EGRESS", "service": "nanocode-egress", "entrypoint": "ConnectServiceEgress" },
+    { "binding": "REMOTE", "service": "nanocode-egress", "entrypoint": "RemoteExecutorEgress" }
   ],
   "vars": {
     "ACCOUNT_ID": "default",
     "MODEL_AUTH": "subscription",
     "RECOVERY_DELAY_MS": "30000",
     "CONNECT_STREAM_REVALIDATE_MS": "5000",
-    "EVENT_PAGE_SIZE": "128"
+    "EVENT_PAGE_SIZE": "128",
+    "RUNNER_ENABLED": "false",
+    "REMOTE_MAX_FRAME_BYTES": "1048576",
+    "REMOTE_TIMEOUT_MS": "30000"
   },
   "observability": { "enabled": true }
 }

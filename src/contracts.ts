@@ -46,6 +46,7 @@ export type AgentConfiguration = {
   session_id: string;
   subscription: boolean;
   endpoint: string;
+  remote?: boolean;
 };
 
 export type AgentInput = { request_id: string; prompt: string };
@@ -58,8 +59,15 @@ export type AgentResult = {
 };
 
 export type RuntimeOptions = {
-  dispatch(request: { endpoint: string; headers: [string, string][]; body: string }): Promise<Response>;
+  dispatch(request: { endpoint: string; headers: [string, string][]; body: string }, signal?: AbortSignal): Promise<Response>;
   event(value: unknown): Promise<void>;
+  events?(values: unknown[]): Promise<void>;
+  connection?(request: { kind?: string; input?: unknown; op: string }): Promise<unknown>;
+  remote?: {
+    execute(request: unknown, id: number): Promise<unknown>;
+    cancel(id: number): void;
+    dispose(): Promise<void>;
+  };
 };
 
 export function json(value: unknown, status = 200, headers?: HeadersInit): Response {

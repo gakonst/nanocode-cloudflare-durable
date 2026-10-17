@@ -6,7 +6,7 @@
     "build": "node scripts/build.mjs",
     "check": "tsc --noEmit",
     "dev": "wrangler dev -c wrangler.jsonc -c wrangler.egress.jsonc",
-    "deploy": "wrangler deploy -c wrangler.egress.jsonc && wrangler deploy -c wrangler.jsonc",
+    "deploy": "node scripts/deploy.mjs",
     "dry-run": "wrangler deploy -c wrangler.egress.jsonc --dry-run --outdir output/egress && wrangler deploy -c wrangler.jsonc --dry-run --outdir output/deploy",
     "measure": "node scripts/measure-local.mjs"
   },

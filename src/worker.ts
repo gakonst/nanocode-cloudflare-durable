@@ -1,6 +1,8 @@
 import { DurableObject, WorkerEntrypoint } from "cloudflare:workers";
 import { AgentRuntime } from "./host";
 import { CheckpointStore } from "./store";
+import { EventHub } from "./events";
+import { RemoteExecutor } from "./remote/host";
 import { handleConnect } from "./connect/index";
 export { SubscriptionAuth } from "./auth";
 import { json, type AgentResult, type PrivateBinding, type SessionDescriptor } from "./contracts";
@@ -10,12 +12,16 @@ export interface Env {
   EGRESS: PrivateBinding;
   AUTHORITY: PrivateBinding;
   SERVICE_EGRESS: PrivateBinding;
+  REMOTE: PrivateBinding;
   WORKER_TOKEN: string;
   ACCOUNT_ID: string;
   MODEL_AUTH: string;
   RECOVERY_DELAY_MS: string;
   CONNECT_STREAM_REVALIDATE_MS: string;
   EVENT_PAGE_SIZE: string;
+  RUNNER_ENABLED: string;
+  REMOTE_MAX_FRAME_BYTES: string;
+  REMOTE_TIMEOUT_MS: string;
   PUBLIC_ORIGIN?: string;
 }
 
@@ -52,7 +58,7 @@ export default {
     let name: string;
     try { name = decodeURIComponent(match[1]); } catch { return json({ error: "invalid session encoding" }, 400); }
     if (!name || name.includes("\0")) return json({ error: "invalid session name" }, 400);
-    const sessionName = `owner:${env.ACCOUNT_ID}:${name}`;
+    const sessionName = name;
     const descriptor: SessionDescriptor = { account_id: env.ACCOUNT_ID, session_id: "", session_name: sessionName, subscription: env.MODEL_AUTH === "subscription" };
     let path = `/internal/${match[2] ?? "metrics"}`;
     if (match[4]) path = `/internal/cancel/${match[3]}`;
@@ -82,6 +88,7 @@ export class AgentSession extends DurableObject<Env> {
   private running?: Running;
   private pumping = false;
   private eventSync?: Promise<void>;
+  private readonly eventHub = new EventHub();
   private readonly counts = { runtime_initializations: 0, model_dispatches: 0, events_written: 0, alarms: 0, recoveries: 0 };
 
   constructor(ctx: DurableObjectState, env: Env) {
@@ -114,8 +121,8 @@ export class AgentSession extends DurableObject<Env> {
       if (this.isFenced(descriptor)) return json({ error: "grant revoked" }, 403);
       const scope = descriptor.grant_id ?? "owner";
       const parts = url.pathname.split("/");
-      if (request.method === "GET" && parts[2] === "metrics") return json({ ...this.counts, resident_runtimes: this.runtimes.size, runtime: this.running?.runtime.metrics, persisted: this.store.row("SELECT (SELECT COUNT(*) FROM states) AS states, (SELECT COUNT(*) FROM records) AS records, (SELECT COUNT(*) FROM jobs WHERE scope = ? AND status IN ('queued', 'running')) AS unfinished", scope) });
-      if (request.method === "GET" && parts[2] === "events") return this.events(scope, url);
+      if (request.method === "GET" && parts[2] === "metrics") return json({ ...this.counts, checkpoints: this.store.metrics, resident_runtimes: this.runtimes.size, runtime: this.running?.runtime.metrics, persisted: this.store.row("SELECT (SELECT COUNT(*) FROM states) AS states, (SELECT COUNT(*) FROM records) AS records, (SELECT COUNT(*) FROM jobs WHERE scope = ? AND status IN ('queued', 'running')) AS unfinished", scope) });
+      if (request.method === "GET" && parts[2] === "events") return this.events(scope, url, request.headers.get("accept")?.includes("text/event-stream"), descriptor);
       if (parts[2] === "socket") return json({ error: "use the authenticated event stream" }, 405);
       if (parts[2] === "cancel" && parts.length === 4 && request.method === "POST") return await this.cancel(decodeURIComponent(parts[3]), scope);
       if (parts[2] !== "turns") return json({ error: "route not found" }, 404);
@@ -132,7 +139,9 @@ export class AgentSession extends DurableObject<Env> {
       if (!existing) {
         policy(this.env.RECOVERY_DELAY_MS, "RECOVERY_DELAY_MS");
         this.ctx.storage.transactionSync(() => {
-          if (!binding) this.ctx.storage.sql.exec("INSERT INTO metadata VALUES ('authority', ?)", identity);
+          const current = this.store.row("SELECT value FROM metadata WHERE key = 'authority'")?.value;
+          if (current && current !== identity) throw new Error("session authority mismatch");
+          if (!current) this.ctx.storage.sql.exec("INSERT INTO metadata VALUES ('authority', ?)", identity);
           this.sessionId(scope, descriptor.session_id);
           this.ctx.storage.sql.exec("INSERT INTO jobs (request_id, prompt, status, result, scope, descriptor, cancel_requested) VALUES (?, ?, 'queued', NULL, ?, ?, 0)", input.request_id, input.prompt, scope, JSON.stringify(descriptor));
           this.insertEvent(scope, input.request_id, { type: "queued", request_id: input.request_id });
@@ -216,14 +225,31 @@ export class AgentSession extends DurableObject<Env> {
     let resident = this.runtimes.get(scope);
     if (!resident) {
       this.counts.runtime_initializations++;
-      resident = AgentRuntime.create({ session_id: sessionId, subscription: descriptor.subscription, endpoint: `https://api.anthropic.com/v1/messages${descriptor.subscription ? "?beta=true" : ""}` }, this.store, {
-        dispatch: async request => {
+      resident = (async () => {
+        const authority = { ...descriptor, session_id: sessionId };
+        const remote = this.env.RUNNER_ENABLED === "true" && (!descriptor.grant_id || descriptor.connections?.includes("runner"))
+          ? await RemoteExecutor.create(this.env.REMOTE, authority, { max_frame_bytes: policy(this.env.REMOTE_MAX_FRAME_BYTES, "REMOTE_MAX_FRAME_BYTES"), timeout_ms: policy(this.env.REMOTE_TIMEOUT_MS, "REMOTE_TIMEOUT_MS") })
+          : undefined;
+        try {
+          return await AgentRuntime.create({ session_id: sessionId, subscription: descriptor.subscription, endpoint: `https://api.anthropic.com/v1/messages${descriptor.subscription ? "?beta=true" : ""}`, remote: !!remote }, this.store, {
+        remote,
+        dispatch: async (request, signal) => {
           if (this.isFenced(descriptor)) throw new Error("grant revoked");
+          if (this.running?.job.scope === scope && this.job(this.running.job.request_id)?.cancel_requested) throw new Error("request cancelled");
           this.counts.model_dispatches++;
-          return this.env.EGRESS.fetch(new Request("https://egress.internal/model", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ ...request, authority: { ...descriptor, session_id: sessionId }, subscription: descriptor.subscription }) }));
+          return this.env.EGRESS.fetch(new Request("https://egress.internal/model", { method: "POST", signal, headers: { "content-type": "application/json" }, body: JSON.stringify({ ...request, authority, subscription: descriptor.subscription }) }));
         },
         event: event => this.appendEvent(scope, this.running?.job.scope === scope ? this.running.job.request_id : null, event),
+        events: events => this.appendEvents(scope, this.running?.job.scope === scope ? this.running.job.request_id : null, events),
+        connection: async request => {
+          if (this.isFenced(descriptor)) throw new Error("grant revoked");
+          const catalog = request.op === "connection_catalog";
+          const response = await this.env.EGRESS.fetch(new Request(`https://egress.internal/${catalog ? "connections" : "connector"}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ ...(request.input && typeof request.input === "object" ? request.input : {}), authority, kind: request.kind }) }));
+          return response.json();
+        },
       });
+        } catch (error) { await remote?.dispose(); throw error; }
+      })();
       this.runtimes.set(scope, resident);
       void resident.catch(() => { if (this.runtimes.get(scope) === resident) this.runtimes.delete(scope); });
     }
@@ -275,22 +301,31 @@ export class AgentSession extends DurableObject<Env> {
     return !!descriptor.grant_id && !!this.store.row("SELECT revision FROM grant_fences WHERE grant_id = ?", descriptor.grant_id);
   }
 
-  private events(scope: string, url: URL): Response {
+  private events(scope: string, url: URL, streaming = false, descriptor?: SessionDescriptor): Response {
     const after = Number(url.searchParams.get("after") ?? "0");
     const limit = Number(url.searchParams.get("limit") ?? this.env.EVENT_PAGE_SIZE);
     const maximum = policy(this.env.EVENT_PAGE_SIZE, "EVENT_PAGE_SIZE");
     if (!Number.isSafeInteger(after) || after < 0 || !Number.isSafeInteger(limit) || limit < 1 || limit > maximum) return json({ error: `after must be a nonnegative integer and limit must be between 1 and ${maximum}` }, 400);
-    const events = this.ctx.storage.sql.exec<{ seq: number; request_id: string | null; body: string; created_at: number }>("SELECT seq, request_id, body, created_at FROM events WHERE scope = ? AND seq > ? ORDER BY seq LIMIT ?", scope, after, limit).toArray().map(row => ({ seq: row.seq, request_id: row.request_id, created_at: row.created_at, event: JSON.parse(row.body) }));
-    return json({ events, next_cursor: events.at(-1)?.seq ?? after, has_more: events.length === limit });
+    const read = (cursor: number) => {
+      const events = this.ctx.storage.sql.exec<{ seq: number; request_id: string | null; body: string; created_at: number }>("SELECT seq, request_id, body, created_at FROM events WHERE scope = ? AND seq > ? ORDER BY seq LIMIT ?", scope, cursor, limit).toArray().map(row => ({ seq: row.seq, request_id: row.request_id, created_at: row.created_at, event: JSON.parse(row.body) }));
+      return { events, next_cursor: events.at(-1)?.seq ?? cursor, has_more: events.length === limit };
+    };
+    if (streaming) return this.eventHub.stream(after, policy(this.env.CONNECT_STREAM_REVALIDATE_MS, "CONNECT_STREAM_REVALIDATE_MS"), read, () => !descriptor || !this.isFenced(descriptor));
+    return json(read(after));
   }
 
   private insertEvent(scope: string, requestId: string | null, event: unknown): void {
     this.ctx.storage.sql.exec("INSERT INTO events (scope, request_id, body, created_at) VALUES (?, ?, ?, ?)", scope, requestId, JSON.stringify(event), Date.now());
     this.counts.events_written++;
+    this.eventHub.notify();
   }
 
   private async appendEvent(scope: string, requestId: string | null, event: unknown): Promise<void> {
-    this.insertEvent(scope, requestId, event);
+    return this.appendEvents(scope, requestId, [event]);
+  }
+
+  private async appendEvents(scope: string, requestId: string | null, events: unknown[]): Promise<void> {
+    this.ctx.storage.transactionSync(() => { for (const event of events) this.insertEvent(scope, requestId, event); });
     if (!this.eventSync) this.eventSync = Promise.resolve().then(() => this.ctx.storage.sync()).finally(() => { this.eventSync = undefined; });
     await this.eventSync;
   }

@@ -7,6 +7,7 @@ export class StoreFailure extends Error {
 }
 
 export class CheckpointStore {
+  readonly metrics = { operations: {} as Record<string, number>, point_queries: 0 };
   constructor(readonly storage: DurableObjectStorage) {
     storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS states (id TEXT PRIMARY KEY, revision TEXT NOT NULL, payload TEXT NOT NULL);
@@ -16,6 +17,7 @@ export class CheckpointStore {
   }
 
   row(query: string, ...values: SqlStorageValue[]): Row | undefined {
+    this.metrics.point_queries++;
     return this.storage.sql.exec(query, ...values).toArray()[0];
   }
 
@@ -25,6 +27,7 @@ export class CheckpointStore {
   }
 
   async execute(request: any): Promise<unknown> {
+    this.metrics.operations[request.op] = (this.metrics.operations[request.op] ?? 0) + 1;
     const id = request.state_id;
     switch (request.op) {
       case "peek": return this.peek(id);

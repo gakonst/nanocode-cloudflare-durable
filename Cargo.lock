@@ -60,6 +60,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e149dc73cd30538307e7ffa2acd3d2221148eaeed4871f246657b1c3eaa1cbd2"
 
 [[package]]
+name = "arc-swap"
+version = "1.9.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c049c0be4daef0b145cb3555416b3b8ef5b7888a38aea1a3a155801fe7b0810b"
+dependencies = [
+ "rustversion",
+]
+
+[[package]]
 name = "async-compression"
 version = "0.4.50"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1300,6 +1309,7 @@ dependencies = [
 name = "nanocode-backend-codex-client"
 version = "0.6.7"
 dependencies = [
+ "arc-swap",
  "base64 0.22.1",
  "futures-util",
  "getrandom 0.4.3",
@@ -1558,6 +1568,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "tempfile",
+ "tokio",
  "tracing",
 ]
 
@@ -1714,6 +1725,7 @@ dependencies = [
  "futures-util",
  "http",
  "nanocode",
+ "nanocode-code-mode",
  "serde",
  "serde_json",
 ]

@@ -17,6 +17,7 @@ bench = false
 nanocode = { path = "../nanocodex/crates/nanocode" }
 
 [target.'cfg(target_family = "wasm")'.dependencies]
+nanocode-code-mode = { path = "../nanocodex/crates/runtime/code-mode" }
 futures-channel = "0.3.31"
 futures-executor = "0.3.31"
 futures-util = "0.3.31"

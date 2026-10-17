@@ -1,5 +1,6 @@
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
+    rc::Rc,
     collections::BTreeMap,
     future::Future,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -17,7 +18,7 @@ unsafe extern "C" {
     fn cancel(id: u32);
     fn clock(monotonic: u32) -> f64;
     fn random(pointer: *mut u8, length: usize);
-    fn finished(pointer: *const u8, length: usize);
+    fn reply(id: u32, pointer: *const u8, length: usize);
     fn panicked(pointer: *const u8, length: usize);
 }
 
@@ -26,6 +27,7 @@ thread_local! {
     static SPAWNER: LocalSpawner = POOL.with(|pool| pool.borrow().spawner());
     static PENDING: RefCell<BTreeMap<u32, oneshot::Sender<Reply>>> = const { RefCell::new(BTreeMap::new()) };
     static NEXT: RefCell<u32> = const { RefCell::new(0) };
+    static INSTALLED: Cell<bool> = const { Cell::new(false) };
 }
 
 pub fn spawn(future: impl Future<Output = ()> + 'static) {
@@ -86,16 +88,20 @@ pub async fn bytes(request: Value) -> Result<Option<Vec<u8>>, Value> {
     }
 }
 
-pub fn finish(value: Value) {
-    let bytes = serde_json::to_vec(&value).expect("encode worker result");
-    unsafe { finished(bytes.as_ptr(), bytes.len()) };
+pub fn respond(id: u32, value: &Value) {
+    let bytes = serde_json::to_vec(value).expect("encode command reply");
+    unsafe { reply(id, bytes.as_ptr(), bytes.len()) };
 }
 
-pub fn install_panic_hook() {
+pub fn install() {
+    if INSTALLED.replace(true) {
+        return;
+    }
     std::panic::set_hook(Box::new(|info| {
         let detail = info.to_string();
         unsafe { panicked(detail.as_ptr(), detail.len()) };
     }));
+    nanocode::platform::install(Rc::new(WorkerHost)).expect("install worker host");
 }
 
 pub struct WorkerHost;
