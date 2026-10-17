@@ -1,4 +1,5 @@
 use std::{
+    cell::RefCell,
     collections::HashMap,
     pin::pin,
     sync::{
@@ -58,6 +59,30 @@ fn host_error(value: Value) -> CodeModeHostError {
         Some(detail) => error(detail),
         None => error(value),
     }
+}
+
+thread_local! {
+    static CLIENT: RefCell<Weak<Client>> = const { RefCell::new(Weak::new()) };
+}
+
+pub fn busy() -> bool {
+    CLIENT.with_borrow(|slot| {
+        slot.upgrade().is_some_and(|client| {
+            !client.running.lock().unwrap().is_empty()
+                || client
+                    .callbacks
+                    .lock()
+                    .unwrap()
+                    .values()
+                    .any(|state| state.observer.is_some())
+        })
+    })
+}
+
+fn wake() {
+    spawn(async {
+        let _ = call(json!({"op": "wake"})).await;
+    });
 }
 
 impl Client {
@@ -150,6 +175,7 @@ impl Client {
             }
             if let Some(client) = client.upgrade() {
                 client.running.lock().unwrap().remove(&id);
+                wake();
             }
         });
     }
@@ -200,18 +226,15 @@ impl Client {
             } => self.callback(id, name, input, freeform, context),
             _ => return Err(error("unexpected runner frame")),
         }
+        wake();
         Ok(())
     }
 
-    fn terminate(&self, result: Result<(), CodeModeHostError>) {
+    fn terminate(&self, message: String) {
         for (_, (_, abort)) in self.running.lock().unwrap().drain() {
             abort.abort();
         }
         self.callbacks.lock().unwrap().clear();
-        let message = result.err().map_or_else(
-            || "remote connection closed".into(),
-            |issue| issue.to_string(),
-        );
         let uncertain = format!(
             "{message}; the dispatched operation has an unknown outcome and was not retried"
         );
@@ -274,9 +297,14 @@ async fn drive(
         Either::Right((Either::Left((result, _)), _))
         | Either::Right((Either::Right((result, _)), _)) => result,
     };
+    let message = result.err().map_or_else(
+        || "remote connection closed".into(),
+        |issue| issue.to_string(),
+    );
     if let Some(client) = client.upgrade() {
-        client.terminate(result);
+        client.terminate(message.clone());
     }
+    let _ = call(json!({"op": "remote_close", "reason": message})).await;
 }
 
 pub async fn host() -> Result<RemoteCodeModeHost, String> {
@@ -310,6 +338,7 @@ pub async fn host() -> Result<RemoteCodeModeHost, String> {
         timeout: Duration::from_millis(timeout_ms),
         failure: Mutex::new(None),
     });
+    CLIENT.with_borrow_mut(|slot| *slot = Arc::downgrade(&client));
     let (closed, closed_rx) = oneshot::channel();
     spawn(drive(
         Arc::downgrade(&client),

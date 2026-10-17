@@ -62,6 +62,7 @@ export type AgentResult = {
 
 export type RuntimeOptions = {
   dispatch(request: { endpoint: string; headers: [string, string][]; body: string }, signal?: AbortSignal): Promise<Response>;
+  wake?(): void;
   event(value: unknown): Promise<void>;
   events?(values: unknown[]): Promise<void>;
   connection?(request: { kind?: string; input?: unknown; op: string }): Promise<unknown>;

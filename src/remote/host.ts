@@ -1,4 +1,4 @@
-import type { PrivateBinding, SessionAuthority } from "../contracts";
+import { headerJson, type PrivateBinding, type SessionAuthority } from "../contracts";
 
 export type RemotePolicy = { max_frame_bytes: number; timeout_ms: number };
 
@@ -34,7 +34,7 @@ export class RemoteExecutor {
     }, policy.timeout_ms);
     let executor: RemoteExecutor | undefined;
     try {
-      const response = await Promise.race([binding.fetch(new Request("https://remote.internal/", { headers: { upgrade: "websocket", "x-nanocode-authority": JSON.stringify(authority) }, signal: controller.signal })), deadline]);
+      const response = await Promise.race([binding.fetch(new Request("https://remote.internal/", { headers: { upgrade: "websocket", "x-nanocode-authority": headerJson(authority) }, signal: controller.signal })), deadline]);
       const socket = response.webSocket;
       if (response.status !== 101 || !socket) {
         const detail = await response.json<{ error?: string }>().then(body => body.error, () => undefined);
@@ -69,6 +69,9 @@ export class RemoteExecutor {
         if (this.#failure !== undefined) return { closed: this.#failure };
         if (this.#waiter) throw new Error("remote_poll is already pending");
         return new Promise(resolve => { this.#waiter = { id, resolve }; });
+      case "remote_close":
+        this.#fail(String(request.reason), 1000);
+        return null;
       default:
         throw new Error(`unsupported remote operation ${request.op}`);
     }

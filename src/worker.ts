@@ -301,6 +301,7 @@ export class AgentSession extends DurableObject<Env> {
           this.counts.model_dispatches++;
           return this.env.EGRESS.fetch(new Request("https://egress.internal/model", { method: "POST", signal, headers: { "content-type": "application/json" }, body: JSON.stringify({ ...request, authority, subscription: descriptor.subscription }) }));
         },
+        wake: () => this.eventHub.notify(),
         event: event => this.appendEvent(scope, null, event),
         events: events => this.appendEvents(scope, null, events),
         connection: async request => {
@@ -393,7 +394,8 @@ export class AgentSession extends DurableObject<Env> {
 
   private insertEvent(scope: string, requestId: string | null, event: unknown): void {
     const value = event as any;
-    const sdkId = value?.source === "agent" ? value.event?.request_id : value?.source === "subagent" ? value.update?.event?.request_id : undefined;
+    const sdk = value?.source === "agent" ? value.event : value?.source === "subagent" ? value.update?.event : undefined;
+    const sdkId = sdk?.payload?.turn_id ?? sdk?.payload?.request_id;
     if (typeof sdkId === "string") requestId = sdkId;
     this.ctx.storage.sql.exec("INSERT INTO events (scope, request_id, body, created_at) VALUES (?, ?, ?, ?)", scope, requestId, JSON.stringify(event), Date.now());
     this.counts.events_written++;

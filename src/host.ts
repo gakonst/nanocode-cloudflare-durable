@@ -232,6 +232,10 @@ export class AgentRuntime {
       return this.options.remote.execute(request, id);
     }
     switch (request.op) {
+      case "wake":
+        this.notify();
+        this.options.wake?.();
+        return null;
       case "sleep": return new Promise(resolve => {
         const timer = setTimeout(() => resolve(null), request.milliseconds);
         this.onCancel(id, () => { clearTimeout(timer); resolve(null); });

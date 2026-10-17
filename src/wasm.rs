@@ -1,12 +1,12 @@
 mod auth;
 mod bridge;
-mod events;
-mod store;
-mod transport;
 #[path = "capabilities.rs"]
 mod capabilities;
+mod events;
 #[path = "remote/runtime.rs"]
 mod remote;
+mod store;
+mod transport;
 
 use std::{
     cell::{Cell, RefCell},
@@ -127,14 +127,20 @@ async fn open(config: Configuration) -> Result<Session, String> {
     let mut builder = Nanocodex::builder()
         .claude(client)
         .workspace("/")
-        .tools(Tools::builder().without_defaults()
-            .tool(capabilities::Connections)
-            .tool(capabilities::ConnectionRequest("connector"))
-            .tool(capabilities::ConnectionRequest("vault"))
-            .build().map_err(text)?)
+        .tools(
+            Tools::builder()
+                .without_defaults()
+                .tool(capabilities::Connections)
+                .tool(capabilities::ConnectionRequest("connector"))
+                .tool(capabilities::ConnectionRequest("vault"))
+                .build()
+                .map_err(text)?,
+        )
         .durability(store.clone());
     if config.remote {
-        builder = builder.code_mode_host(remote::host().await?).map_err(text)?;
+        builder = builder
+            .code_mode_host(remote::host().await?)
+            .map_err(text)?;
     }
     let runtime = builder
         .build()
@@ -376,17 +382,21 @@ impl Session {
     async fn pending(&self) -> Result<Value, String> {
         let pending = self.pending_ids().await?;
         let activity = self.activity().await;
-        let quiescent =
-            pending.is_empty() && activity.is_quiescent() && self.live.borrow().is_empty();
+        let quiescent = pending.is_empty()
+            && activity.is_quiescent()
+            && self.live.borrow().is_empty()
+            && !remote::busy();
         Ok(json!({
             "pending": pending,
             "quiescent": quiescent,
+            "remote_busy": remote::busy(),
             "activity": serde_json::to_value(&activity).map_err(text)?,
         }))
     }
 
     async fn idle(&self, activity: &SubagentActivity) -> Result<bool, String> {
         Ok(self.live.borrow().is_empty()
+            && !remote::busy()
             && activity.is_quiescent()
             && self.pending_ids().await?.is_empty())
     }

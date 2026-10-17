@@ -9,7 +9,7 @@ function modules(directory) {
   const path = `${directory}/${scripts[0]}`;
   const contents = readFileSync(path, "utf8");
   const imports = [...contents.matchAll(/from\s+["']\.\/([^"']+\.wasm)["']/g)].map(match => match[1]);
-  return [{ type: "ESModule", path, contents }, ...[...new Set(imports)].map(file => ({ type: "CompiledWasm", path: `${directory}/${file}`, contents: readFileSync(`${directory}/${file}`) }))];
+  return [{ type: "ESModule", path, contents }, ...[...new Set(imports)].map(file => ({ type: "CompiledWasm", path: `${directory}/${file}`, contents: readFileSync(process.env.NANOCODE_WASM_PATH ?? `${directory}/${file}`) }))];
 }
 
 export function localOptions({ provider, live = false, agent = {}, egress = {}, persistence } = {}) {
