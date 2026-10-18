@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { performance } from "node:perf_hooks";
 import { parseArgs } from "node:util";
@@ -14,12 +14,14 @@ const origin = new URL(values.origin);
 if (!levels.length || levels.some(level => !Number.isSafeInteger(level) || level < 1 || level > 64) || new Set(levels).size !== levels.length) throw new Error("Use distinct concurrency levels between 1 and 64");
 if (!providers.length || providers.some(provider => !["claude", "codex"].includes(provider)) || new Set(providers).size !== providers.length) throw new Error("Use claude,codex or one provider");
 if (!Number.isSafeInteger(rounds) || rounds < 1 || rounds > 5 || !Number.isSafeInteger(timeout) || timeout < 10 || timeout > 600) throw new Error("Use 1–5 rounds and a 10–600 second timeout");
-if (!["inference", "tools", "fanout", "queue"].includes(scenario)) throw new Error("Unknown scenario");
+if (!["inference", "tools", "fanout", "remote-fanout", "queue"].includes(scenario)) throw new Error("Unknown scenario");
+const fanout = ["fanout", "remote-fanout"].includes(scenario);
 if (origin.username || origin.password || origin.search || origin.hash || origin.pathname !== "/" || origin.protocol !== "https:") throw new Error("Use an HTTPS origin");
 const token = process.env.WORKER_TOKEN;
 if (!token || /[\r\n]/.test(token)) throw new Error("Provide WORKER_TOKEN through the environment");
 const run = randomUUID();
 const report = { measured_at: new Date().toISOString(), origin: origin.origin, run, scenario, providers, rounds, requested_levels: levels, levels: [], deployment: undefined, limitations: ["Concurrency levels are per provider; mixed-provider request concurrency is their sum. Fanout levels count requested children per provider in one session.", "curl TTFT includes process startup, DNS, fresh TLS, network, durable admission, inference, and delivery. HTTP headers and tool arguments do not count as answer text.", "This is closed-loop burst load with synchronized rounds, not sustained open-loop capacity or a global maximum.", "A new session is not proof of a cold isolate. Independent sessions use independent Durable Objects; queued roots in one session execute serially.", "Model concurrency is observed from client-received events and can undercount actual overlap when events are buffered.", "Local-clock spans overlap. Cumulative storage and event waits must not be added to model durations.", "Reported server enqueue time precedes platform output gating and network delivery. Production clock resolution can hide CPU work.", "Private diagnostics are capped at the last 64 dispatches per runtime. Provider account limits and the shared remote Linux host can bound observed capacity."] };
+report.harness_sha256 = createHash("sha256").update(readFileSync(new URL(import.meta.url))).digest("hex");
 try { report.deployment = JSON.parse(readFileSync("output/production-deployment.json", "utf8")); } catch {}
 mkdirSync("output", { recursive: true });
 const output = `output/concurrency-${scenario}-${Date.now()}.json`;
@@ -68,7 +70,7 @@ function curl(route, { body, event, seconds = timeout } = {}) {
 
 function prompt(session, index, level) {
   if (scenario === "tools") return `Use remote Code Mode for this synthetic benchmark. Do not delegate. In one exec, use tools.apply_patch to create ${session}-${index}.txt containing benchmark-ok; await Promise.all of three tools.exec_command calls running printf remote-tool-ok; call tools.list_agents({}); store("benchmark", "${session}"). In a separate exec, verify load("benchmark") equals "${session}" and read that file through tools.exec_command. Do not inspect secrets or unrelated files. Finish with exactly nanocode-worker-ok.`;
-  if (scenario === "fanout") return `Synthetic concurrency benchmark. Start exactly ${level} child agents using spawn_agent, without waiting between spawns. Give each child output_contract {"kind":"string"}, task "Do not delegate, use workspace tools, or browse. Immediately submit_result with output nanocode-child-ok.", and inherit this provider/model. Keep your root turn alive until every child is completed, using wait_agent with all IDs and list_agents(include_completed=true). Check each structured output equals nanocode-child-ok. Do not spawn extra children. After all children complete, reply exactly nanocode-worker-ok.`;
+  if (fanout) return `Synthetic concurrency benchmark. ${scenario === "remote-fanout" ? `Use one remote Code Mode exec to start exactly ${level} child agents with await Promise.all(Array.from({length:${level}}, () => tools.spawn_agent(childSpec))). Print their IDs. Do not wait for any child before starting the others.` : `Use direct spawn_agent calls to start exactly ${level} child agents, without waiting between spawns. No execution host is selected; do not use exec or wait.`} Give each child output_contract {"kind":"object","fields":[{"name":"value","required":true,"schema":{"kind":"string"}}]}, task 'Do not delegate or use workspace tools or browse. Immediately call submit_result with output {"value":"nanocode-child-ok"}. Pass the object directly, without stringifying it.', and inherit this provider/model. Keep your root turn alive until every child is completed, using wait_agent with all IDs and list_agents(include_completed=true). Check each structured output.value equals nanocode-child-ok. Do not spawn extra children. After all children complete, reply exactly nanocode-worker-ok.`;
   return "Reply exactly nanocode-worker-ok. Do not use tools or delegate.";
 }
 
@@ -113,16 +115,33 @@ async function turn(session, round, index, wave) {
   const measured = await curl(`/sessions/${session.name}/metrics`, { seconds: 30 });
   sample.metrics = measured.value;
   sample.metrics_http_status = measured.status;
+  if (fanout) {
+    let after = 0;
+    for (;;) {
+      const page = await curl(`/sessions/${session.name}/events?after=${after}&limit=128`, { seconds: 30 });
+      if (!Array.isArray(page.value?.events)) { sample.tree_history_complete = false; break; }
+      for (const envelope of page.value.events) {
+        const outer = envelope.event;
+        if (outer?.source !== "subagent") continue;
+        const child = outer.update;
+        if (["added", "status", "completion"].includes(child?.type)) sample.children.push({ type: child.type, id: child.id ?? child.agent?.id, status: child.status, observation: "paged-after-root" });
+        const sdk = child?.type === "event" ? child.event : undefined;
+        if (sdk) sample.events.push({ type: sdk.type, actor: `child:${child.id}`, server_at: envelope.created_at, server_seq: envelope.seq, seq: sdk.seq, request_id: sdk.request_id, call_index: sdk.payload?.model_call_index ?? sdk.payload?.call_index, observation: "paged-after-root" });
+      }
+      after = page.value.next_cursor;
+      if (!page.value.has_more) { sample.tree_history_complete = true; break; }
+    }
+  }
   if (scenario === "tools") {
     const count = name => sample.tools.filter(tool => tool.actor === "root" && tool.tool === name && tool.status === "completed").length;
     sample.workflow_valid = count("exec") >= 2 && count("exec_command") >= 4 && count("apply_patch") >= 1 && count("list_agents") >= 1;
   }
-  if (scenario === "fanout") {
+  if (fanout) {
     const added = new Set(sample.children.filter(child => child.type === "added").map(child => child.id));
-    const completed = new Set(sample.children.filter(child => child.status?.state === "completed" && child.status.output === "nanocode-child-ok").map(child => child.id));
+    const completed = new Set(sample.children.filter(child => child.status?.state === "completed" && child.status.output?.value === "nanocode-child-ok").map(child => child.id));
     sample.child_count = added.size;
     sample.completed_children = completed.size;
-    sample.workflow_valid = added.size === wave.level && completed.size === wave.level;
+    sample.workflow_valid = sample.tree_history_complete && added.size === wave.level && completed.size === wave.level && (scenario !== "remote-fanout" || sample.tools.some(tool => tool.tool === "exec" && tool.status === "completed"));
   }
   return sample;
 }
@@ -138,8 +157,8 @@ for (const level of levels) {
   const entry = { level, sessions: [], waves: [] };
   report.levels.push(entry);
   for (const provider of providers) {
-    const total = ["fanout", "queue"].includes(scenario) ? 1 : level;
-    for (let index = 0; index < total; index++) entry.sessions.push({ name: `load-${scenario}-${run}-${level}-${provider}-${index}`, provider, ...(scenario === "tools" ? { executor: index % 2 ? "paradigm-b" : "paradigm-a" } : {}) });
+    const total = fanout || scenario === "queue" ? 1 : level;
+    for (let index = 0; index < total; index++) entry.sessions.push({ name: `load-${scenario}-${run}-${level}-${provider}-${index}`, provider, ...(["tools", "remote-fanout"].includes(scenario) ? { executor: (scenario === "remote-fanout" ? providers.indexOf(provider) : index) % 2 ? "paradigm-b" : "paradigm-a" } : {}) });
   }
   for (let round = 0; round < rounds; round++) {
     const wave = { level, round, kind: round ? "warm-session" : "new-session", started: performance.now(), active: 0, peak_requests: 0, models: new Set(), peak_models: 0, samples: [] };
@@ -158,6 +177,19 @@ for (const level of levels) {
     session.metrics_http_status = result.status;
   }));
   const models = [...new Map(entry.waves.flatMap(wave => wave.samples.flatMap(sample => sample.metrics?.runtime?.timing?.models ?? [])).concat(entry.sessions.flatMap(session => session.metrics?.runtime?.timing?.models ?? [])).map(model => [`${model.runtime_id}:${model.dispatch_id}`, model])).values()];
+  entry.session_concurrency = entry.sessions.map(session => {
+    const events = [...new Map(entry.waves.flatMap(wave => wave.samples.filter(sample => sample.session === session.name).flatMap(sample => sample.events)).map(event => [event.server_seq, event])).values()].filter(event => Number.isSafeInteger(event.server_seq)).sort((a, b) => a.server_seq - b.server_seq);
+    const active = new Set();
+    let peak = 0, childPeak = 0;
+    for (const event of events) {
+      const key = `${event.actor}:${event.request_id}:${event.call_index}`;
+      if (event.type === "model.call.started") active.add(key);
+      if (["model.call.completed", "model.call.failed"].includes(event.type)) active.delete(key);
+      peak = Math.max(peak, active.size);
+      childPeak = Math.max(childPeak, [...active].filter(key => key.startsWith("child:")).length);
+    }
+    return { session: session.name, provider: session.provider, sdk_model_intervals_peak: peak, child_model_intervals_peak: childPeak };
+  });
   entry.dispatches = { count: models.length, status: Object.fromEntries([...new Set(models.map(model => model.status))].map(status => [status, models.filter(model => model.status === status).length])), credentials: Object.fromEntries([...new Set(models.map(model => model.diagnostic?.credential))].map(value => [value, models.filter(model => model.diagnostic?.credential === value).length])), auth_lookup_ms: stats(models.map(model => model.diagnostic?.auth_lookup_ms)), headers_ms: stats(models.map(model => model.headers_ms)), unfinished: entry.sessions.reduce((count, session) => count + Number(session.metrics?.persisted?.unfinished ?? 0), 0), recoveries: entry.sessions.reduce((count, session) => count + Number(session.metrics?.recoveries ?? 0), 0) };
   save();
   if (entry.waves.some(wave => wave.summaries[0].failed)) { report.stopped_after_failed_level = level; break; }
