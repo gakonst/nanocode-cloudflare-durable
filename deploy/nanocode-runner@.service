@@ -8,6 +8,7 @@ User=nanocode-%i
 Group=nanocode-%i
 WorkingDirectory=/var/lib/nanocode-worker/%i/workspace
 EnvironmentFile=/etc/nanocode-worker/runner-%i.env
+Environment=PATH=/opt/nanocode/toolchain/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 ExecStart=/usr/bin/python3 /usr/local/libexec/nanocode-runner-launcher.py --listen 127.0.0.1:${NANOCODE_RUNNER_PORT} --multi-session --workspace /var/lib/nanocode-worker/%i/workspace --max-frame-bytes 1048576 --timeout-ms 30000
 Restart=always
 RestartSec=30

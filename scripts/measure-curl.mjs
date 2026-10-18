@@ -82,7 +82,7 @@ for (let index = 0; index < count; index++) {
     sample.events.push({ type, received_ms: elapsed, server_at: envelope.created_at });
     if (["queued", "running", "model.call.started", "assistant.delta"].includes(type) && !stages.has(type)) stages.set(type, envelope.created_at);
     if (type === "model.call.started") sample.model_calls.push(elapsed);
-    if (type.includes("tool") && !type.includes("delta")) sample.tool_calls.push({ type, received_ms: elapsed, server_at: envelope.created_at });
+    if (type.includes("tool") && !type.includes("delta")) sample.tool_calls.push({ type, received_ms: elapsed, server_at: envelope.created_at, tool: sdk?.payload?.tool, call_id: sdk?.payload?.call_id, parent_call_id: sdk?.payload?.parent_call_id, status: sdk?.payload?.status, duration_ms: typeof sdk?.payload?.duration_ns === "number" ? sdk.payload.duration_ns / 1e6 : undefined });
     if (type === "assistant.delta" && sdk.payload?.text && sample.ttft_ms === undefined) sample.ttft_ms = elapsed;
     if (type === "result") {
       sample.status = outer.status;
@@ -105,6 +105,6 @@ for (let index = 0; index < count; index++) {
   console.log(JSON.stringify({ provider: values.provider, executor: values.executor, tools: values.tools, index, status: sample.status, ttft_ms: sample.ttft_ms, completion_ms: sample.completion_ms, server_setup_ms: sample.server_setup_ms, model_calls: sample.model_calls.length }));
 }
 report.metrics = (await curl(`/sessions/${session}/metrics`)).body;
-report.summary = { successes: report.samples.filter(sample => sample.status === "completed").length, ttft_ms: summarize(report.samples.filter(sample => sample.ttft_ms !== undefined).map(sample => sample.ttft_ms)), warm_ttft_ms: summarize(report.samples.slice(1).filter(sample => sample.ttft_ms !== undefined).map(sample => sample.ttft_ms)), setup_ms: summarize(report.samples.filter(sample => sample.server_setup_ms !== undefined).map(sample => sample.server_setup_ms)) };
+report.summary = { successes: report.samples.filter(sample => sample.status === "completed").length, failed_tool_results: report.samples.flatMap(sample => sample.tool_calls).filter(tool => tool.type === "tool.result" && tool.status === "failed").length, ttft_ms: summarize(report.samples.filter(sample => sample.ttft_ms !== undefined).map(sample => sample.ttft_ms)), warm_ttft_ms: summarize(report.samples.slice(1).filter(sample => sample.ttft_ms !== undefined).map(sample => sample.ttft_ms)), setup_ms: summarize(report.samples.filter(sample => sample.server_setup_ms !== undefined).map(sample => sample.server_setup_ms)) };
 save();
 console.log(JSON.stringify({ report: output, summary: report.summary }));

@@ -47,7 +47,7 @@ function buildRunner() {
 
 function startRunner() {
   runnerStarts++;
-  const child = spawn(runnerBinary, ["--listen", `127.0.0.1:${port}`, "--workspace", workspace, "--max-frame-bytes", String(policy.max_frame_bytes), "--timeout-ms", String(policy.timeout_ms)], { env: { ...process.env, NANOCODE_RUNNER_TOKEN: token }, stdio: ["ignore", "ignore", "pipe"], detached: true });
+  const child = spawn(runnerBinary, ["--listen", `127.0.0.1:${port}`, "--multi-session", "--workspace", workspace, "--max-frame-bytes", String(policy.max_frame_bytes), "--timeout-ms", String(policy.timeout_ms)], { env: { ...process.env, NANOCODE_RUNNER_TOKEN: token }, stdio: ["ignore", "ignore", "pipe"], detached: true });
   groups.add(child.pid);
   let stderr = "";
   const exited = new Promise(resolve => child.once("exit", (code, signal) => {
@@ -305,14 +305,14 @@ try {
   const restartAt = performance.now();
   const interrupted = runner;
   await mf.dispose();
-  await interrupted.exited;
   await runnerReady;
   mf = new Miniflare(convertV4MiniflareOptions(options));
   await mf.ready;
   const restarted = await complete("restart", restartAt, null);
   await new Promise(resolve => setTimeout(resolve, 2500));
-  const restart = { status: restarted.status, error: restarted.error, model_calls: modelCalls - restartCalls, dispatches: (read("notes/restart.log") ?? "").length, tool_results: [...(observed["remote-restart"] ?? [])] };
+  const restart = { status: restarted.status, error: restarted.error, model_calls: modelCalls - restartCalls, dispatches: (read("notes/restart.log") ?? "").length, runner_process_reused: runner.child === interrupted.child && interrupted.child.exitCode === null && interrupted.child.signalCode === null, tool_results: [...(observed["remote-restart"] ?? [])] };
   if (restart.dispatches !== 1) throw new Error(`Interrupted remote exec was replayed ${restart.dispatches} times`);
+  if (!restart.runner_process_reused) throw new Error("Multi-session runner exited during workerd replacement");
 
   const afterRestartStart = performance.now();
   await submit("after-restart", "remote-reconnect");
@@ -360,6 +360,7 @@ try {
     model_calls: modelCalls,
     runner_connections: runnerConnections,
     runner_starts: runnerStarts,
+    runner_mode: "multi-session",
     receipts,
     persisted,
   };

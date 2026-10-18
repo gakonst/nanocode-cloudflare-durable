@@ -175,6 +175,7 @@ async fn open(config: Configuration) -> Result<Session, String> {
         .durability(store.clone());
     if config.remote {
         builder = builder
+            .instructions("Shell, filesystem, and Code Mode tools execute on the selected remote host. Use paths relative to its configured workspace. Query pwd through the remote shell when an absolute remote path is needed.")
             .code_mode_host(remote::host().await?)
             .map_err(text)?;
     }
