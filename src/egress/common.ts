@@ -1,9 +1,10 @@
-import type { AuthorityResult, PrivateBinding } from "../contracts";
+import type { AuthorityResult, ModelProvider, PrivateBinding } from "../contracts";
 import type { AccountAuthority } from "./account";
 
 export interface EgressEnv {
   ACCOUNTS: DurableObjectNamespace<AccountAuthority>;
   OAUTH_JSON?: string;
+  CODEX_OAUTH_JSON?: string;
   ANTHROPIC_API_KEY?: string;
   ANTHROPIC_ENDPOINT?: string;
   ACCOUNT_ID?: string;
@@ -24,6 +25,13 @@ export const SUBSCRIPTION = {
   client_id: "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
   scopes: ["org:create_api_key", "user:profile", "user:inference", "user:sessions:claude_code", "user:mcp_servers", "user:file_upload", "user:plugins"],
   beta: "oauth-2025-04-20",
+};
+
+export const CODEX = {
+  endpoint: "https://chatgpt.com/backend-api/codex/responses",
+  token_url: "https://auth.openai.com/oauth/token",
+  client_id: "app_EMoamEEZ73f0CkXaXp7hrann",
+  claims: "https://api.openai.com/auth",
 };
 
 export const ACCOUNT_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
@@ -55,6 +63,23 @@ export function modelAccount(env: EgressEnv): string {
 
 export function mode(env: EgressEnv): "subscription" | "api_key" | "unconfigured" {
   return env.OAUTH_JSON ? "subscription" : env.ANTHROPIC_API_KEY ? "api_key" : "unconfigured";
+}
+
+export function modelProvider(value: unknown): ModelProvider {
+  if (value === undefined || value === null || value === "claude") return "claude";
+  if (value === "codex") return "codex";
+  throw new Failure(400, "unsupported_provider");
+}
+
+export function jwtClaims(token: string): Record<string, any> | null {
+  const parts = token.split(".");
+  if (parts.length !== 3 || !parts[1] || !/^[A-Za-z0-9_-]+$/.test(parts[1])) return null;
+  try {
+    const claims = JSON.parse(decoder.decode(unbase64url(parts[1])));
+    return claims && typeof claims === "object" && !Array.isArray(claims) ? claims : null;
+  } catch {
+    return null;
+  }
 }
 
 export function modelEndpoint(env: EgressEnv): string {

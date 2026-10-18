@@ -5,7 +5,7 @@ import { EventHub } from "./events";
 import { RemoteExecutor } from "./remote/host";
 import { handleConnect } from "./connect/index";
 export { SubscriptionAuth } from "./auth";
-import { headerJson, json, type AgentResult, type PrivateBinding, type SessionDescriptor } from "./contracts";
+import { headerJson, json, sessionUuid, type AgentResult, type PrivateBinding, type SessionDescriptor } from "./contracts";
 
 export interface Env {
   SESSIONS: DurableObjectNamespace<AgentSession>;
@@ -52,7 +52,7 @@ export default {
     if (!env.WORKER_TOKEN) return json({ error: "WORKER_TOKEN is not configured" }, 503);
     if (!authorized) return json({ error: "unauthorized" }, 401);
     const url = new URL(request.url);
-    if (url.pathname === "/health") return json({ ok: true, model: "claude-opus-5-5", auth: env.MODEL_AUTH, architecture: "session-local", credential_boundary: "private-egress" });
+    if (url.pathname === "/health") return json({ ok: true, model: "claude-opus-5-5", models: { claude: "claude-opus-5-5", codex: "gpt-6.1-sol" }, auth: env.MODEL_AUTH, architecture: "session-local", credential_boundary: "private-egress" });
     const match = /^\/sessions\/([^/]+)(?:\/(turns|events|metrics|socket)(?:\/([^/]+)(?:\/(cancel))?)?)?$/.exec(url.pathname);
     if (!match) return json({ error: "route not found" }, 404);
     let name: string;
@@ -100,6 +100,7 @@ export class AgentSession extends DurableObject<Env> {
       CREATE INDEX IF NOT EXISTS unfinished_jobs ON jobs(status);
       CREATE INDEX IF NOT EXISTS scoped_events ON events(scope, seq);
       CREATE TABLE IF NOT EXISTS grant_fences (grant_id TEXT PRIMARY KEY, revision INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS event_turns (scope TEXT NOT NULL, turn_id TEXT NOT NULL, request_id TEXT NOT NULL, PRIMARY KEY (scope, turn_id));
     `);
     const columns = new Set(ctx.storage.sql.exec("PRAGMA table_info(jobs)").toArray().map(row => row.name));
     if (!columns.has("scope")) ctx.storage.sql.exec("ALTER TABLE jobs ADD COLUMN scope TEXT NOT NULL DEFAULT 'owner'");
@@ -134,6 +135,14 @@ export class AgentSession extends DurableObject<Env> {
       try { input = await request.json(); } catch { return json({ error: "invalid JSON" }, 400); }
       if (typeof input?.request_id !== "string" || !input.request_id.trim() || typeof input.prompt !== "string" || !input.prompt.trim()) return json({ error: "request_id and prompt must be nonempty strings" }, 400);
       if (input.request_id.startsWith("subagent-completion:")) return json({ error: "request_id prefix is reserved" }, 400);
+      if (input.provider !== undefined && input.provider !== "claude" && input.provider !== "codex") return json({ error: "provider must be claude or codex" }, 400);
+      const providerKey = `model_provider:${scope}`;
+      const boundProvider = this.store.row("SELECT value FROM metadata WHERE key = ?", providerKey)?.value
+        ?? (this.store.row("SELECT value FROM metadata WHERE key = ?", scope === "owner" ? "session_id" : `session_id:${scope}`) ? "claude" : undefined);
+      if (boundProvider && input.provider !== undefined && input.provider !== boundProvider) return json({ error: "session provider is immutable; create a new session" }, 409);
+      descriptor.provider = input.provider ?? boundProvider ?? "claude";
+      if (descriptor.provider === "codex" && descriptor.session_id && descriptor.session_id[14] !== "7") return json({ error: "Codex requires a new thread with a UUIDv7 session" }, 409);
+      if (descriptor.provider === "codex") descriptor.subscription = true;
       const existing = this.job(input.request_id);
       if (existing && (existing.prompt !== input.prompt || existing.scope !== scope)) return json({ error: "request_id already belongs to different input or authority" }, 409);
       if (!existing) {
@@ -142,6 +151,7 @@ export class AgentSession extends DurableObject<Env> {
           const current = this.store.row("SELECT value FROM metadata WHERE key = 'authority'")?.value;
           if (current && current !== identity) throw new Error("session authority mismatch");
           if (!current) this.ctx.storage.sql.exec("INSERT INTO metadata VALUES ('authority', ?)", identity);
+          this.ctx.storage.sql.exec("INSERT INTO metadata VALUES (?, ?) ON CONFLICT(key) DO NOTHING", providerKey, descriptor.provider!);
           this.sessionId(scope, descriptor.session_id);
           this.ctx.storage.sql.exec("INSERT INTO jobs (request_id, prompt, status, result, scope, descriptor, cancel_requested) VALUES (?, ?, 'queued', NULL, ?, ?, 0)", input.request_id, input.prompt, scope, JSON.stringify(descriptor));
           this.insertEvent(scope, input.request_id, { type: "queued", request_id: input.request_id });
@@ -255,7 +265,7 @@ export class AgentSession extends DurableObject<Env> {
     const key = scope === "owner" ? "session_id" : `session_id:${scope}`;
     let session = this.store.row("SELECT value FROM metadata WHERE key = ?", key)?.value as string | undefined;
     if (!session) {
-      session = suggested || crypto.randomUUID();
+      session = suggested || sessionUuid();
       this.ctx.storage.sql.exec("INSERT INTO metadata VALUES (?, ?)", key, session);
     }
     return session;
@@ -277,7 +287,7 @@ export class AgentSession extends DurableObject<Env> {
           ? await RemoteExecutor.create(this.env.REMOTE, authority, { max_frame_bytes: policy(this.env.REMOTE_MAX_FRAME_BYTES, "REMOTE_MAX_FRAME_BYTES"), timeout_ms: policy(this.env.REMOTE_TIMEOUT_MS, "REMOTE_TIMEOUT_MS") })
           : undefined;
         try {
-          return await AgentRuntime.create({ session_id: sessionId, subscription: descriptor.subscription, endpoint: `https://api.anthropic.com/v1/messages${descriptor.subscription ? "?beta=true" : ""}`, remote: !!remote }, this.store, {
+          return await AgentRuntime.create({ session_id: sessionId, provider: descriptor.provider ?? "claude", subscription: descriptor.subscription, endpoint: descriptor.provider === "codex" ? "https://chatgpt.com/backend-api/codex" : `https://api.anthropic.com/v1/messages${descriptor.subscription ? "?beta=true" : ""}`, remote: !!remote }, this.store, {
         remote: remote ? {
           failed: () => remote.failure !== undefined,
           execute: async (request: any, id: number) => {
@@ -299,7 +309,7 @@ export class AgentSession extends DurableObject<Env> {
         dispatch: async (request, signal) => {
           if (this.dispatchBlocked(scope, descriptor)) throw new Error("request authority stopped");
           this.counts.model_dispatches++;
-          return this.env.EGRESS.fetch(new Request("https://egress.internal/model", { method: "POST", signal, headers: { "content-type": "application/json" }, body: JSON.stringify({ ...request, authority, subscription: descriptor.subscription }) }));
+          return this.env.EGRESS.fetch(new Request("https://egress.internal/model", { method: "POST", signal, headers: { "content-type": "application/json" }, body: JSON.stringify({ ...request, authority, provider: descriptor.provider ?? "claude", subscription: descriptor.subscription }) }));
         },
         wake: () => this.eventHub.notify(),
         event: event => this.appendEvent(scope, null, event),
@@ -395,8 +405,15 @@ export class AgentSession extends DurableObject<Env> {
   private insertEvent(scope: string, requestId: string | null, event: unknown): void {
     const value = event as any;
     const sdk = value?.source === "agent" ? value.event : value?.source === "subagent" ? value.update?.event : undefined;
-    const sdkId = sdk?.payload?.turn_id ?? sdk?.payload?.request_id;
-    if (typeof sdkId === "string") requestId = sdkId;
+    const turnId = sdk?.payload?.turn_id;
+    const acceptedId = sdk?.payload?.request_id;
+    if (value?.source === "agent" && typeof turnId === "string" && typeof acceptedId === "string" && this.job(acceptedId)?.scope === scope) {
+      this.ctx.storage.sql.exec("INSERT INTO event_turns VALUES (?, ?, ?) ON CONFLICT(scope, turn_id) DO NOTHING", scope, turnId, acceptedId);
+    }
+    if (typeof turnId === "string") requestId = value?.source === "agent"
+      ? String(this.store.row("SELECT request_id FROM event_turns WHERE scope = ? AND turn_id = ?", scope, turnId)?.request_id ?? turnId)
+      : turnId;
+    else if (typeof acceptedId === "string") requestId = acceptedId;
     this.ctx.storage.sql.exec("INSERT INTO events (scope, request_id, body, created_at) VALUES (?, ?, ?, ?)", scope, requestId, JSON.stringify(event), Date.now());
     this.counts.events_written++;
     this.eventHub.notify();

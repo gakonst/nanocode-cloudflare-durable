@@ -16,22 +16,42 @@ use std::{
 };
 
 use nanocode::{
-    Agent, ClaudeClient, ClaudeModel, ExecutionPolicyDisposition, ModelSelection, Nanocodex,
-    NanocodexError, PromptRequest, Tools, TurnControl,
+    Agent, ClaudeClient, ClaudeModel, ExecutionPolicyDisposition, Model, ModelSelection, Nanocodex,
+    NanocodexError, OpenAi, PromptRequest, Tools, TurnControl,
     backend::Prompt,
+    codex::{OpenAiAuth, transport::ResponsesTransport},
     durability::{SessionRecord, SessionStore, TurnStatus},
     subagents::SubagentActivity,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+#[derive(Clone, Copy, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum Provider {
+    #[default]
+    Claude,
+    Codex,
+}
+
 #[derive(Deserialize)]
 struct Configuration {
     session_id: String,
+    #[serde(default)]
+    provider: Provider,
     subscription: bool,
     endpoint: String,
     #[serde(default)]
     remote: bool,
+}
+
+impl Configuration {
+    fn model(&self) -> ModelSelection {
+        match self.provider {
+            Provider::Claude => ModelSelection::Claude(ClaudeModel::Opus55),
+            Provider::Codex => ModelSelection::Codex(Model::Sol),
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -112,20 +132,36 @@ async fn open(config: Configuration) -> Result<Session, String> {
         store
             .session(SessionRecord::root(
                 &config.session_id,
-                ModelSelection::Claude(ClaudeModel::Opus55),
+                config.model(),
                 None,
             ))
             .await
             .map_err(text)?;
     }
-    let http = nanocode::claude::transport::HttpClient::new(transport::WorkerTransport);
-    let mut client =
-        ClaudeClient::with_auth_provider(http, config.endpoint, Arc::new(auth::WorkerAuth));
-    if config.subscription {
-        client = client.subscription_compatibility();
-    }
-    let mut builder = Nanocodex::builder()
-        .claude(client)
+    let mut builder = Nanocodex::builder();
+    builder = match config.provider {
+        Provider::Claude => {
+            let http = nanocode::claude::transport::HttpClient::new(transport::WorkerTransport);
+            let mut client =
+                ClaudeClient::with_auth_provider(http, config.endpoint, Arc::new(auth::WorkerAuth));
+            if config.subscription {
+                client = client.subscription_compatibility();
+            }
+            builder.claude(client)
+        }
+        Provider::Codex => builder.openai(
+            OpenAi::builder(OpenAiAuth::managed_chatgpt(Arc::new(auth::WorkerAuth)))
+                .model(Model::Sol)
+                .transport(ResponsesTransport::Https)
+                .store(false)
+                .websocket_warmup(false)
+                .api_base_url(config.endpoint)
+                .host_transport(transport::WorkerTransport)
+                .build()
+                .map_err(text)?,
+        ),
+    };
+    builder = builder
         .workspace("/")
         .tools(
             Tools::builder()

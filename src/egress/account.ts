@@ -1,6 +1,6 @@
 import { DurableObject } from "cloudflare:workers";
-import type { AuthorityCommand, AuthorityResult, SessionAuthority, SessionDescriptor } from "../contracts";
-import { ACCOUNT_PATTERN, base64url, connections, exactOrigin, Failure, mode, modelAccount, open, placeCredential, random, readLimited, seal, SECRET_PATTERN, setting, sha256, sha256hex, SUBSCRIPTION, vaultConfigured, type Connection, type EgressEnv } from "./common";
+import { sessionUuid, type AuthorityCommand, type AuthorityResult, type ModelProvider, type SessionAuthority, type SessionDescriptor } from "../contracts";
+import { ACCOUNT_PATTERN, base64url, CODEX, connections, exactOrigin, Failure, jwtClaims, mode, modelAccount, modelProvider, open, placeCredential, random, readLimited, seal, SECRET_PATTERN, setting, sha256, sha256hex, SUBSCRIPTION, vaultConfigured, type Connection, type EgressEnv } from "./common";
 
 export type Access = { ok: true; generation: number; expires_at: number | null; headers: [string, string][] } | { ok: false; status: number; error: string };
 export type ServiceAccess = { ok: true; grant_id: string; generation: number; expires_at: number | null; refreshable: boolean; headers: [string, string][]; secrets: string[] } | { ok: false; status: number; error: string };
@@ -12,8 +12,10 @@ type Code = { digest: string; client_id: string; origin: string; redirect_uri: s
 type Thread = { thread_id: string; app_id: string; origin: string; principal: string; session_name: string; session_id: string; created_at: number };
 type Fence = { grant_id: string; session_name: string; revision: number; attempts: number; next_at: number };
 type CredentialRow = { name: string; seed: string; envelope: string; generation: number; state: string; forced: number; expires_at: number | null; updated_at: number };
-type StoredToken = { access: string; refresh: string; expires_at: number | null; scopes: string[]; refresh_expires_at: number | null };
+type StoredToken = { access: string; refresh: string; expires_at: number | null; scopes: string[]; refresh_expires_at: number | null; account_id?: string; fedramp?: boolean };
 type Pending = { access: string; refresh: string; access_digest: string; refresh_digest: string };
+type TokenPolicy = { rejected(status: number, body: string): string | undefined; accept(body: Record<string, unknown>, now: number): StoredToken | string | null };
+type Identity = { account_id?: string; fedramp?: boolean };
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -38,6 +40,9 @@ const CHALLENGE = /^[A-Za-z0-9_-]{43}$/;
 const VERIFIER = /^[A-Za-z0-9._~-]{43,128}$/;
 const TOKEN = /^(nc1|nr1|na1)\.([A-Za-z0-9_-]{1,64})\.([A-Za-z0-9_-]{43})$/;
 const FENCE_BACKOFF_CAP = 3_600_000;
+const CODEX_ACCOUNT = /^[A-Za-z0-9_.:-]{1,128}$/;
+const CODEX_CREDENTIAL = "model:codex";
+const CODEX_LOGIN_REQUIRED = new Set(["refresh_token_expired", "refresh_token_reused", "refresh_token_invalidated", "invalid_grant"]);
 
 function failure(error: unknown): { ok: false; status: number; error: string } {
   if (error instanceof Failure) return { ok: false, status: error.status, error: error.code };
@@ -118,6 +123,82 @@ function subscriptionSeed(source: string): StoredToken {
   return { access, refresh, expires_at: expires, scopes, refresh_expires_at: null };
 }
 
+function codexIdentity(jwt: string): Identity | null {
+  const claims = jwtClaims(jwt);
+  if (!claims) return null;
+  const auth = claims[CODEX.claims];
+  if (auth === undefined) return {};
+  if (!auth || typeof auth !== "object" || Array.isArray(auth)) return null;
+  const account = auth.chatgpt_account_id ?? undefined;
+  const fedramp = auth.chatgpt_account_is_fedramp ?? undefined;
+  if ((account !== undefined && (typeof account !== "string" || !CODEX_ACCOUNT.test(account))) || (fedramp !== undefined && typeof fedramp !== "boolean")) return null;
+  return { account_id: account, fedramp };
+}
+
+function codexExpiry(access: string): number | null {
+  const exp = jwtClaims(access)?.exp;
+  return Number.isSafeInteger(exp) && exp > 0 ? exp * 1000 : null;
+}
+
+function codexSeed(source: string): StoredToken {
+  const fail = (): never => { throw new Failure(500, "configuration_error"); };
+  let document: any;
+  try { document = JSON.parse(source); } catch { return fail(); }
+  if (!document || typeof document !== "object" || Array.isArray(document)) fail();
+  if (document.auth_mode !== undefined && document.auth_mode !== null && document.auth_mode !== "chatgpt") fail();
+  const entry = document.tokens ?? document;
+  if (!entry || typeof entry !== "object") fail();
+  const access = entry.access_token ?? entry.access;
+  const refresh = entry.refresh_token ?? entry.refresh;
+  const id = entry.id_token ?? undefined;
+  const explicit = entry.account_id ?? undefined;
+  if (typeof access !== "string" || !SECRET_PATTERN.test(access) || typeof refresh !== "string" || !SECRET_PATTERN.test(refresh)) fail();
+  if ((id !== undefined && typeof id !== "string") || (explicit !== undefined && (typeof explicit !== "string" || !CODEX_ACCOUNT.test(explicit)))) fail();
+  const accessIdentity = codexIdentity(access) ?? fail();
+  const idIdentity = id === undefined ? {} : codexIdentity(id) ?? fail();
+  const accounts = new Set([explicit, idIdentity.account_id, accessIdentity.account_id].filter((value): value is string => value !== undefined));
+  if (accounts.size !== 1) fail();
+  const stated = entry.expires ?? undefined;
+  if (stated !== undefined && !Number.isSafeInteger(stated)) fail();
+  const expires = codexExpiry(access) ?? stated ?? fail();
+  return { access, refresh, expires_at: expires, scopes: [], refresh_expires_at: null, account_id: [...accounts][0], fedramp: idIdentity.fedramp ?? accessIdentity.fedramp ?? false };
+}
+
+function codexPolicy(current: StoredToken, minimumLifetime: number): TokenPolicy {
+  return {
+    rejected(status, body) {
+      const value = oauthError(body) as Record<string, any>;
+      const code = typeof value.error === "string" ? value.error : typeof value.error?.code === "string" ? value.error.code : typeof value.code === "string" ? value.code : undefined;
+      return status === 401 || (code !== undefined && [400, 401, 403].includes(status) && CODEX_LOGIN_REQUIRED.has(code)) ? "login_required" : undefined;
+    },
+    accept(body, now) {
+      const access = body.access_token;
+      const refresh = body.refresh_token ?? undefined;
+      const id = body.id_token ?? undefined;
+      if (typeof access !== "string" || !SECRET_PATTERN.test(access)) return null;
+      if (refresh !== undefined && (typeof refresh !== "string" || !SECRET_PATTERN.test(refresh))) return null;
+      if (id !== undefined && typeof id !== "string") return null;
+      if (body.token_type !== undefined && (typeof body.token_type !== "string" || body.token_type.toLowerCase() !== "bearer")) return null;
+      const accessIdentity = codexIdentity(access);
+      const idIdentity = id === undefined ? {} : codexIdentity(id);
+      if (!accessIdentity || !idIdentity) return null;
+      if ([accessIdentity.account_id, idIdentity.account_id].some(account => account !== undefined && account !== current.account_id)) return "account_mismatch";
+      const expiresIn = body.expires_in;
+      const expires = codexExpiry(access) ?? (Number.isSafeInteger(expiresIn) && (expiresIn as number) > 0 ? now + (expiresIn as number) * 1000 : null);
+      if (expires === null || expires - now <= minimumLifetime) return null;
+      return {
+        access,
+        refresh: refresh ?? current.refresh,
+        expires_at: expires,
+        scopes: current.scopes,
+        refresh_expires_at: current.refresh_expires_at,
+        account_id: current.account_id,
+        fedramp: idIdentity.fedramp ?? accessIdentity.fedramp ?? current.fedramp ?? false,
+      };
+    },
+  };
+}
+
 export class AccountAuthority extends DurableObject<EgressEnv> {
   private account?: string;
   private gates = new Map<string, Promise<unknown>>();
@@ -149,13 +230,19 @@ export class AccountAuthority extends DurableObject<EgressEnv> {
     }
   }
 
-  async modelAccess(input: { account_id: string; authority: SessionAuthority; rejected_generation?: number }): Promise<Access> {
+  async modelAccess(input: { account_id: string; authority: SessionAuthority; rejected_generation?: number; provider?: ModelProvider }): Promise<Access> {
     try {
       const account = this.bind(input?.account_id);
+      const selected = modelProvider(input.provider);
       if (account !== modelAccount(this.env) || input.authority?.account_id !== account) throw new Failure(403, "forbidden");
       if (input.authority.grant_id !== undefined) this.sessionGrant(input.authority);
       const rejected = input.rejected_generation;
       if (rejected !== undefined && !Number.isSafeInteger(rejected)) throw new Failure(400, "invalid_request");
+      if (selected === "codex") {
+        if (!this.env.CODEX_OAUTH_JSON) throw new Failure(500, "configuration_error");
+        if (!vaultConfigured(this.env)) throw new Failure(503, "vault_key_required");
+        return await this.gate(CODEX_CREDENTIAL, () => this.codex(rejected));
+      }
       const current = mode(this.env);
       if (current === "unconfigured") throw new Failure(500, "configuration_error");
       if (current === "api_key") {
@@ -386,6 +473,12 @@ export class AccountAuthority extends DurableObject<EgressEnv> {
       const seed = await sha256hex(`model:${this.env.OAUTH_JSON}`);
       credential = !row || row.seed !== seed ? { state: "pending_seed", generation: row?.generation ?? 0, expires_at: null } : { state: row.state, generation: row.generation, expires_at: row.expires_at };
     }
+    let codex: { state: string; generation: number; expires_at: number | null } | null = null;
+    if (model && this.env.CODEX_OAUTH_JSON) {
+      const row = this.row<CredentialRow>("SELECT * FROM credentials WHERE name = ?", CODEX_CREDENTIAL);
+      const seed = await sha256hex(`${CODEX_CREDENTIAL}:${this.env.CODEX_OAUTH_JSON}`);
+      codex = !vaultConfigured(this.env) ? { state: "vault_key_required", generation: row?.generation ?? 0, expires_at: null } : !row || row.seed !== seed ? { state: "pending_seed", generation: row?.generation ?? 0, expires_at: null } : { state: row.state, generation: row.generation, expires_at: row.expires_at };
+    }
     const count = (query: string, ...bindings: unknown[]) => this.row<{ count: number }>(query, ...bindings)?.count ?? 0;
     return {
       ok: true,
@@ -396,6 +489,7 @@ export class AccountAuthority extends DurableObject<EgressEnv> {
       endpoint_override: !!this.env.ANTHROPIC_ENDPOINT,
       vault_encryption: vaultConfigured(this.env),
       credential,
+      codex,
       grants_active: count("SELECT COUNT(*) AS count FROM grants WHERE status = 'active'"),
       threads: count("SELECT COUNT(*) AS count FROM threads"),
       pending_fences: count("SELECT COUNT(*) AS count FROM fences"),
@@ -560,11 +654,11 @@ export class AccountAuthority extends DurableObject<EgressEnv> {
         if (!thread) throw new Failure(404, "not_found");
       } else {
         const thread_id = crypto.randomUUID();
-        thread = { thread_id, app_id: grant.app_id, origin: grant.origin, principal: grant.principal, session_name: `connect/${account}/${thread_id}`, session_id: crypto.randomUUID(), created_at: now };
+        thread = { thread_id, app_id: grant.app_id, origin: grant.origin, principal: grant.principal, session_name: `connect/${account}/${thread_id}`, session_id: sessionUuid(), created_at: now };
         this.run("INSERT INTO threads VALUES (?, ?, ?, ?, ?, ?, ?)", thread.thread_id, thread.app_id, thread.origin, thread.principal, thread.session_name, thread.session_id, thread.created_at);
         created = true;
       }
-      this.run("INSERT OR IGNORE INTO grant_sessions VALUES (?, ?, ?)", grant.grant_id, thread.session_name, crypto.randomUUID());
+      this.run("INSERT OR IGNORE INTO grant_sessions VALUES (?, ?, ?)", grant.grant_id, thread.session_name, sessionUuid());
       const membership = this.row<{ session_id: string }>("SELECT session_id FROM grant_sessions WHERE grant_id = ? AND session_name = ?", grant.grant_id, thread.session_name)!;
       const descriptor: SessionDescriptor = {
         account_id: account,
@@ -680,6 +774,29 @@ export class AccountAuthority extends DurableObject<EgressEnv> {
     return { ok: true, generation: row.generation, expires_at: token.expires_at, headers: [["authorization", `Bearer ${token.access}`]] };
   }
 
+  private async codex(rejected?: number): Promise<Access> {
+    const margin = setting(this.env, "REFRESH_MARGIN_MS");
+    const source = this.env.CODEX_OAUTH_JSON!;
+    let { row, token } = await this.load(CODEX_CREDENTIAL, source, () => codexSeed(source), true);
+    if (row.state !== "ready") throw new Failure(401, row.state === "exchanging" ? "refresh_uncertain" : row.state);
+    if (typeof token.account_id !== "string" || !CODEX_ACCOUNT.test(token.account_id)) throw new Failure(500, "configuration_error");
+    const force = rejected !== undefined && rejected === row.generation;
+    if (force && row.forced) throw new Failure(401, "credential_rejected");
+    if (force || token.expires_at === null || token.expires_at - Date.now() <= margin) {
+      const current = token;
+      ({ row, token } = await this.exchange(CODEX_CREDENTIAL, row, token, force, true, margin, () => fetch(CODEX.token_url, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ client_id: CODEX.client_id, grant_type: "refresh_token", refresh_token: current.refresh }),
+        redirect: "manual",
+        signal: AbortSignal.timeout(30_000),
+      }), undefined, undefined, codexPolicy(current, margin)));
+    }
+    const headers: [string, string][] = [["authorization", `Bearer ${token.access}`], ["chatgpt-account-id", token.account_id!]];
+    if (token.fedramp) headers.push(["x-openai-fedramp", "true"]);
+    return { ok: true, generation: row.generation, expires_at: token.expires_at, headers };
+  }
+
   private async connectionAccess(connection: Connection, rejected?: number): Promise<{ generation: number; access: string; expires_at: number | null }> {
     const credential = connection.credential;
     if (credential.type !== "oauth") throw new Failure(500, "internal_error");
@@ -701,7 +818,7 @@ export class AccountAuthority extends DurableObject<EgressEnv> {
     return { generation: row.generation, access: token.access, expires_at: token.expires_at };
   }
 
-  private async exchange(name: string, row: CredentialRow, token: StoredToken, forced: boolean, required: boolean, minimumLifetime: number, send: (scope?: string) => Promise<Response>, scope: string | undefined, fallback: string | undefined): Promise<{ row: CredentialRow; token: StoredToken }> {
+  private async exchange(name: string, row: CredentialRow, token: StoredToken, forced: boolean, required: boolean, minimumLifetime: number, send: (scope?: string) => Promise<Response>, scope: string | undefined, fallback: string | undefined, policy?: TokenPolicy): Promise<{ row: CredentialRow; token: StoredToken }> {
     const subscription = name === "model";
     if (token.refresh_expires_at !== null && Date.now() >= token.refresh_expires_at) {
       this.run("UPDATE credentials SET state = 'login_required', updated_at = ? WHERE name = ?", Date.now(), name);
@@ -727,7 +844,8 @@ export class AccountAuthority extends DurableObject<EgressEnv> {
       this.counters.refresh_failures++;
       const error = oauthError(response.body);
       let state: string | undefined;
-      if ([400, 401, 403].includes(response.status) && (error.error === "invalid_grant" || error.error === "access_denied") && error.error_description === "account_on_hold") state = "on_hold";
+      if (policy) state = policy.rejected(response.status, response.body);
+      else if ([400, 401, 403].includes(response.status) && (error.error === "invalid_grant" || error.error === "access_denied") && error.error_description === "account_on_hold") state = "on_hold";
       else if ([400, 401].includes(response.status) && error.error === "invalid_grant") state = "login_required";
       if (state) {
         this.run("UPDATE credentials SET state = ?, updated_at = ? WHERE name = ?", state, Date.now(), name);
@@ -738,6 +856,20 @@ export class AccountAuthority extends DurableObject<EgressEnv> {
     }
     const body = oauthError(response.body) as Record<string, unknown>;
     const now = Date.now();
+    if (policy) {
+      const accepted = policy.accept(body, now);
+      if (typeof accepted === "string") {
+        this.counters.refresh_failures++;
+        this.run("UPDATE credentials SET state = ?, updated_at = ? WHERE name = ?", accepted, Date.now(), name);
+        await this.ctx.storage.sync();
+        throw new Failure(401, accepted);
+      }
+      if (!accepted) {
+        this.counters.refresh_failures++;
+        throw new Failure(401, "refresh_uncertain");
+      }
+      return await this.commit(name, row, accepted, forced, required);
+    }
     const scopes = typeof body.scope === "string" ? body.scope.split(/\s+/).filter(Boolean) : token.scopes;
     const expiresIn = body.expires_in;
     const validExpiry = expiresIn === undefined ? !subscription : Number.isSafeInteger(expiresIn) && (expiresIn as number) * 1000 > minimumLifetime && (expiresIn as number) > 0;
@@ -758,6 +890,10 @@ export class AccountAuthority extends DurableObject<EgressEnv> {
       scopes,
       refresh_expires_at: body.refresh_token_expires_in !== undefined ? now + (body.refresh_token_expires_in as number) * 1000 : token.refresh_expires_at,
     };
+    return await this.commit(name, row, next, forced, required);
+  }
+
+  private async commit(name: string, row: CredentialRow, next: StoredToken, forced: boolean, required: boolean): Promise<{ row: CredentialRow; token: StoredToken }> {
     const envelope = await seal(this.env, this.aad(name), next, required);
     const updated: CredentialRow = { ...row, envelope, generation: row.generation + 1, state: "ready", forced: forced ? 1 : 0, expires_at: next.expires_at, updated_at: Date.now() };
     this.run("UPDATE credentials SET envelope = ?, generation = ?, state = 'ready', forced = ?, expires_at = ?, updated_at = ? WHERE name = ?", updated.envelope, updated.generation, updated.forced, updated.expires_at, updated.updated_at, name);

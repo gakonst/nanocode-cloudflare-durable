@@ -70,7 +70,7 @@ export class AgentRuntime {
     const instance = await WebAssembly.instantiate(module, { host: runtime.imports() });
     runtime.wasm = instance.exports as unknown as Exports;
     try {
-      const opened = await runtime.command({ op: "init", config: { session_id: config.session_id, subscription: config.subscription, endpoint: config.endpoint, remote: config.remote ?? false } }) as { pending: string[] };
+      const opened = await runtime.command({ op: "init", config: { session_id: config.session_id, provider: config.provider ?? "claude", subscription: config.subscription, endpoint: config.endpoint, remote: config.remote ?? false } }) as { pending: string[] };
       runtime.pendingAtOpen = opened.pending;
     } catch (error) {
       runtime.terminate(error);

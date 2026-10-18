@@ -1,12 +1,15 @@
 import { readFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 
 export function credentials(path) {
   let document;
   if (path) {
     document = JSON.parse(readFileSync(path, "utf8"));
   } else {
-    const result = spawnSync("security", ["find-generic-password", "-w", "-s", "Claude Code-credentials"], { encoding: "utf8" });
+    const directory = process.env.CLAUDE_SECURESTORAGE_CONFIG_DIR ?? process.env.CLAUDE_CONFIG_DIR;
+    const suffix = directory ? `-${createHash("sha256").update(directory.normalize("NFC")).digest("hex").slice(0, 8)}` : "";
+    const result = spawnSync("security", ["find-generic-password", "-w", "-s", `Claude Code-credentials${suffix}`], { encoding: "utf8" });
     if (result.status !== 0) throw new Error("Pass the path to oauth.json, or sign in to Claude Code on this Mac");
     document = JSON.parse(result.stdout);
   }

@@ -1,7 +1,7 @@
 import { WorkerEntrypoint } from "cloudflare:workers";
-import { json, type AuthorityCommand, type AuthorityResult, type ModelDispatch, type SessionAuthority } from "../contracts";
+import { json, type AuthorityCommand, type AuthorityResult, type ModelDispatch, type ModelProvider, type SessionAuthority } from "../contracts";
 import { AccountAuthority, type Access, type ServiceAccess, type ServiceRequest } from "./account";
-import { ACCOUNT_PATTERN, connections, encoder, Failure, FORBIDDEN_HEADERS, mode, modelEndpoint, readLimited, setting, SUBSCRIPTION, type Connection, type EgressEnv } from "./common";
+import { ACCOUNT_PATTERN, CODEX, connections, encoder, Failure, FORBIDDEN_HEADERS, mode, modelEndpoint, modelProvider, readLimited, setting, SUBSCRIPTION, type Connection, type EgressEnv } from "./common";
 
 export { AccountAuthority };
 export { RemoteExecutorEgress } from "../remote/egress";
@@ -10,7 +10,10 @@ export type { EgressEnv };
 const PUBLIC_OPS = new Set(["health", "register_client", "create_grant", "authorize_code", "exchange_code", "refresh", "authorize", "revoke", "inspect", "list_connections"]);
 const MODEL_REQUEST_HEADER = /^(accept|content-type|anthropic-version|anthropic-beta|anthropic-dangerous-direct-browser-access|user-agent|x-app|x-claude-code-session-id|x-stainless-[a-z0-9-]{1,64})$/;
 const MODEL_RESPONSE_HEADER = /^(content-type|request-id|retry-after|x-should-retry|anthropic-ratelimit-[a-z0-9-]{1,64})$/;
+const CODEX_REQUEST_HEADER = /^(accept|content-type|user-agent|originator|version|openai-beta|session-id|thread-id|x-client-request-id|x-codex-turn-state|x-codex-turn-metadata|x-openai-internal-codex-responses-lite)$/;
+const CODEX_RESPONSE_HEADER = /^(content-type|retry-after|x-request-id|x-oai-request-id|openai-model|openai-processing-ms|x-reasoning-included|x-models-etag|x-codex-[a-z0-9-]{1,64})$/;
 const PROVIDER_ERRORS = new Set(["invalid_request_error", "authentication_error", "permission_error", "not_found_error", "request_too_large", "rate_limit_error", "api_error", "overloaded_error", "timeout_error", "billing_error"]);
+const CODEX_ERROR_CODES = new Set(["context_length_exceeded", "insufficient_quota", "usage_not_included", "cyber_policy", "misalignment_policy_violation", "invalid_prompt", "bio_policy", "usage_limit_reached", "rate_limit_exceeded", "invalid_function_parameters", "previous_response_not_found", "invalid_encrypted_content", "server_error", "server_is_overloaded", "slow_down", "websocket_connection_limit_reached", "temporarily_unavailable", "model_not_found"]);
 const CACHE_LIMIT = 1024;
 const AUTHORITY_BODY_LIMIT = 256 * 1024;
 const SERVICE_BODY_LIMIT = 33 << 20;
@@ -58,8 +61,15 @@ function providerError(status: number, type: string, message: string, retryAfter
   return new Response(JSON.stringify({ type: "error", error: { type, message } }), { status, headers });
 }
 
-function egressError(failure: { status: number; error: string }): Response {
+function codexError(status: number, error: Record<string, unknown>, retryAfter?: string | null): Response {
+  const headers = new Headers({ "content-type": "application/json", "cache-control": "no-store" });
+  if (retryAfter && /^[\x20-\x7e]{1,64}$/.test(retryAfter)) headers.set("retry-after", retryAfter);
+  return new Response(JSON.stringify({ error }), { status, headers });
+}
+
+function egressError(failure: { status: number; error: string }, provider: ModelProvider = "claude"): Response {
   const type = failure.status === 401 ? "authentication_error" : failure.status === 403 ? "permission_error" : failure.status === 400 || failure.status === 409 ? "invalid_request_error" : "api_error";
+  if (provider === "codex") return codexError(failure.status, { type, code: failure.error, message: failure.error });
   return providerError(failure.status, type, failure.error);
 }
 
@@ -79,12 +89,12 @@ function authorityOf(value: any): SessionAuthority {
   return authority;
 }
 
-function cacheKey(authority: SessionAuthority): string {
-  return [authority.account_id, authority.grant_id ?? "", authority.grant_revision ?? "", authority.grant_id ? authority.session_id : ""].join("\u0000");
+function cacheKey(authority: SessionAuthority, provider: ModelProvider): string {
+  return [provider, authority.account_id, authority.grant_id ?? "", authority.grant_revision ?? "", authority.grant_id ? authority.session_id : ""].join("\u0000");
 }
 
-async function resolveModel(env: EgressEnv, authority: SessionAuthority, rejected?: number): Promise<Access> {
-  const key = cacheKey(authority);
+async function resolveModel(env: EgressEnv, authority: SessionAuthority, provider: ModelProvider, rejected?: number): Promise<Access> {
+  const key = cacheKey(authority, provider);
   const entry = cache.get(key);
   if (rejected === undefined) {
     if (entry && entry.until > Date.now()) {
@@ -104,7 +114,7 @@ async function resolveModel(env: EgressEnv, authority: SessionAuthority, rejecte
   const margin = setting(env, "REFRESH_MARGIN_MS");
   const pending = (async (): Promise<Access> => {
     metrics.model_authority_rpcs++;
-    const access = await account(env, authority.account_id).modelAccess({ account_id: authority.account_id, authority, rejected_generation: rejected }) as Access;
+    const access = await account(env, authority.account_id).modelAccess({ account_id: authority.account_id, authority, rejected_generation: rejected, provider }) as Access;
     if (access.ok) {
       const now = Date.now();
       const until = Math.min(now + ttl, access.expires_at === null ? Number.MAX_SAFE_INTEGER : access.expires_at - margin, authority.grant_expires_at ?? Number.MAX_SAFE_INTEGER);
@@ -143,25 +153,62 @@ function modelHeaders(input: unknown, subscription: boolean): Headers {
   return headers;
 }
 
+function codexHeaders(input: unknown): Headers {
+  if (!Array.isArray(input) || input.length > 128) throw new Failure(400, "invalid_request");
+  const headers = new Headers();
+  for (const pair of input) {
+    if (!Array.isArray(pair) || pair.length !== 2 || typeof pair[0] !== "string" || typeof pair[1] !== "string") throw new Failure(400, "invalid_request");
+    const name = pair[0].toLowerCase();
+    if (!CODEX_REQUEST_HEADER.test(name)) continue;
+    try { headers.set(name, pair[1]); } catch { throw new Failure(400, "invalid_request"); }
+  }
+  headers.set("content-type", "application/json");
+  if (!headers.has("accept")) headers.set("accept", "text/event-stream");
+  return headers;
+}
+
 function sendModel(endpoint: string, headers: Headers, access: Granted, body: string, signal: AbortSignal): Promise<Response> {
   const outgoing = new Headers(headers);
   for (const [name, value] of access.headers) outgoing.set(name, value);
   return fetch(endpoint, { method: "POST", headers: outgoing, body, redirect: "manual", signal });
 }
 
-async function projectModel(response: Response): Promise<Response> {
+function codexDetail(parsed: any): Record<string, unknown> {
+  const source = [parsed?.error, parsed?.response?.error].find(item => item && typeof item === "object" && !Array.isArray(item)) ?? {};
+  const detail: Record<string, unknown> = { type: "api_error", message: "Provider request failed" };
+  if (typeof source.type === "string" && (PROVIDER_ERRORS.has(source.type) || CODEX_ERROR_CODES.has(source.type))) detail.type = source.type;
+  const code = typeof source.code === "string" ? source.code : parsed?.code;
+  if (typeof code === "string" && CODEX_ERROR_CODES.has(code)) detail.code = code;
+  const param = typeof source.param === "string" ? source.param : parsed?.param;
+  if (detail.code === "invalid_function_parameters" && typeof param === "string" && param.length <= 256) {
+    const path = /^(input\[\d{1,6}\](?:\.tools\[\d{1,6}\])+\.parameters)(?:$|[.\[])/.exec(param);
+    if (path) detail.param = path[1];
+  }
+  if (typeof source.retry_after === "number" && Number.isFinite(source.retry_after) && source.retry_after >= 0) detail.retry_after = source.retry_after;
+  return detail;
+}
+
+async function projectModel(response: Response, provider: ModelProvider = "claude"): Promise<Response> {
+  const codex = provider === "codex";
   if (response.status >= 300 && response.status < 400) {
     metrics.redirects_rejected++;
     await response.body?.cancel();
+    if (codex) return codexError(502, { type: "api_error", message: "Provider redirect rejected" });
     return providerError(502, "api_error", "Provider redirect rejected");
   }
   if (response.ok) {
     const headers = new Headers({ "cache-control": "no-store" });
-    for (const [name, value] of response.headers) if (MODEL_RESPONSE_HEADER.test(name)) headers.set(name, value);
+    const allowed = codex ? CODEX_RESPONSE_HEADER : MODEL_RESPONSE_HEADER;
+    for (const [name, value] of response.headers) if (allowed.test(name)) headers.set(name, value);
     return new Response(response.body, { status: response.status, headers });
   }
   metrics.model_provider_errors++;
   const text = await readLimited(response, 65_536);
+  if (codex) {
+    let parsed: unknown;
+    try { parsed = JSON.parse(text ?? ""); } catch {}
+    return codexError(response.status, codexDetail(parsed), response.headers.get("retry-after"));
+  }
   let type = "api_error";
   try {
     const parsed = JSON.parse(text ?? "");
@@ -193,36 +240,50 @@ export class SessionEgress extends WorkerEntrypoint<EgressEnv> {
     }
     if (path !== "/model") return json({ error: "not_found" }, 404);
     metrics.model_requests++;
+    let provider: ModelProvider = "claude";
     try {
       let dispatch: ModelDispatch;
       try { dispatch = await request.json<ModelDispatch>(); } catch { throw new Failure(400, "invalid_request"); }
-      const authority = authorityOf(dispatch?.authority);
-      const current = mode(this.env);
-      if (current === "unconfigured") throw new Failure(500, "configuration_error");
-      const subscription = current === "subscription";
-      if (dispatch.subscription !== subscription) throw new Failure(409, "subscription_mismatch");
+      if (!dispatch || typeof dispatch !== "object") throw new Failure(400, "invalid_request");
+      provider = modelProvider(dispatch.provider);
+      const authority = authorityOf(dispatch.authority);
       if (typeof dispatch.body !== "string") throw new Failure(400, "invalid_request");
-      const endpoint = modelEndpoint(this.env);
-      const headers = modelHeaders(dispatch.headers, subscription);
-      const first = await resolveModel(this.env, authority);
-      if (!first.ok) return egressError(first);
+      let endpoint: string;
+      let headers: Headers;
+      if (provider === "codex") {
+        if (!this.env.CODEX_OAUTH_JSON) throw new Failure(500, "configuration_error");
+        endpoint = CODEX.endpoint;
+        headers = codexHeaders(dispatch.headers);
+      } else {
+        const current = mode(this.env);
+        if (current === "unconfigured") throw new Failure(500, "configuration_error");
+        const subscription = current === "subscription";
+        if (dispatch.subscription !== subscription) throw new Failure(409, "subscription_mismatch");
+        endpoint = modelEndpoint(this.env);
+        headers = modelHeaders(dispatch.headers, subscription);
+      }
+      const first = await resolveModel(this.env, authority, provider);
+      if (!first.ok) return egressError(first, provider);
       let response = await sendModel(endpoint, headers, first, dispatch.body, request.signal);
       if (response.status === 401) {
         metrics.model_unauthorized++;
         await response.body?.cancel();
-        const next = await resolveModel(this.env, authority, first.generation);
-        if (!next.ok) return egressError(next);
-        if (next.generation === first.generation) return providerError(401, "authentication_error", "Provider request failed");
+        const next = await resolveModel(this.env, authority, provider, first.generation);
+        if (!next.ok) return egressError(next, provider);
+        if (next.generation === first.generation) {
+          if (provider === "codex") return codexError(401, { type: "authentication_error", message: "Provider request failed" });
+          return providerError(401, "authentication_error", "Provider request failed");
+        }
         metrics.model_recoveries++;
         response = await sendModel(endpoint, headers, next, dispatch.body, request.signal);
         if (response.status === 401) {
-          const entry = cache.get(cacheKey(authority));
-          if (entry?.access.generation === next.generation) cache.delete(cacheKey(authority));
+          const key = cacheKey(authority, provider);
+          if (cache.get(key)?.access.generation === next.generation) cache.delete(key);
         }
       }
-      return await projectModel(response);
+      return await projectModel(response, provider);
     } catch (error) {
-      return egressError(denial(error));
+      return egressError(denial(error), provider);
     }
   }
 }
