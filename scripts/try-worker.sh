@@ -51,7 +51,7 @@ stream_events() {
 import { createInterface } from "node:readline";
 const [provider, executor] = process.argv.slice(1);
 const calls = new Map();
-let data = [], terminal = false, last = "\n", speaker = "", nextCall = 0;
+let data = [], terminal = false, last = "\n", speaker = "", channel = "", nextCall = 0;
 function write(value) {
   if (!value) return;
   process.stdout.write(value);
@@ -91,14 +91,20 @@ function flush() {
   const agent = child?.id ? String(child.id) : "";
   const prefix = agent ? "[agent " + agent.slice(0, 8) + "] " : "";
   const payload = event?.payload ?? {};
-  if (event?.type === "assistant.delta" && typeof event.payload?.text === "string" && event.payload.text) {
-    if (speaker !== agent) { line(prefix.trimEnd()); speaker = agent; }
-    write(event.payload.text);
+  if (["assistant.delta", "reasoning.summary.delta"].includes(event?.type) && typeof payload.text === "string" && payload.text) {
+    const nextChannel = event.type === "reasoning.summary.delta" ? "reasoning" : "answer";
+    if (speaker !== agent || channel !== nextChannel) {
+      if (nextChannel === "reasoning") line(prefix + "[reasoning]");
+      else if (prefix || channel === "reasoning") line(prefix + "[answer]");
+      speaker = agent;
+      channel = nextChannel;
+    }
+    write(payload.text);
   }
   if (event?.type === "assistant.message" && last !== "\n") line();
   if (outer?.type === "queued") line("[queued]");
   if (outer?.type === "running") line("[running] " + provider + " on " + executor);
-  if (event?.type === "model.call.started") line(prefix + "[model] " + provider + " generating");
+  if (event?.type === "model.call.started") { line(prefix + "[model] " + provider + " generating"); channel = ""; }
   if (child?.type === "added") line("[agent started] " + (child.agent?.name ?? child.agent?.id ?? "subagent"));
   if (child?.type === "completion") line(prefix + "[agent finished] " + pretty(child.status));
   if (event?.type === "tool.call" || event?.type === "tool.result") {
