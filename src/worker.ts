@@ -101,7 +101,8 @@ export class AgentSession extends DurableObject<Env> {
   private readonly modelDiagnostics: { scope: string; value: unknown }[] = [];
   private readonly timings = new Map<string, Timings>();
   private readonly turnTimings = new Map<string, TurnTiming>();
-  private readonly counts = { runtime_initializations: 0, model_dispatches: 0, events_written: 0, alarms: 0, direct_starts: 0, recoveries: 0 };
+  private readonly eventTurns = new Map<string, string>();
+  private readonly counts = { runtime_initializations: 0, model_dispatches: 0, events_written: 0, event_turn_queries: 0, event_turn_cache_hits: 0, preparation_syncs: 0, preparation_syncs_skipped: 0, alarms: 0, direct_starts: 0, recoveries: 0 };
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -243,17 +244,24 @@ export class AgentSession extends DurableObject<Env> {
       scope = job?.scope ?? String(background!.key).slice("background:".length);
       const descriptor: SessionDescriptor = job ? this.descriptor(job) : JSON.parse(String(background!.value));
       let sessionId!: string;
+      let preparationRequired = !watchdogArmed;
       this.ctx.storage.transactionSync(() => {
         const serialized = JSON.stringify(descriptor);
-        if (!watchdogArmed || background?.key !== `background:${scope}` || background.value !== serialized) this.ctx.storage.sql.exec("INSERT INTO metadata VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", `background:${scope}`, serialized);
-        sessionId = this.sessionId(scope!, descriptor.session_id);
+        if (preparationRequired || background?.key !== `background:${scope}` || background.value !== serialized) {
+          this.ctx.storage.sql.exec("INSERT INTO metadata VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", `background:${scope}`, serialized);
+          preparationRequired = true;
+        }
+        sessionId = this.sessionId(scope!, descriptor.session_id, () => { preparationRequired = true; });
         if (job) {
           activeJob = job;
           if (job.status === "running") this.counts.recoveries++;
         }
       });
       const preparationSync = performance.now();
-      await this.ctx.storage.sync();
+      if (preparationRequired) {
+        this.counts.preparation_syncs++;
+        await this.ctx.storage.sync();
+      } else this.counts.preparation_syncs_skipped++;
       let timing: TurnTiming | undefined;
       if (job) {
         timing = this.turnTimings.get(job.request_id);
@@ -348,12 +356,13 @@ export class AgentSession extends DurableObject<Env> {
     return { ...(identity ? JSON.parse(String(identity)) : { account_id: this.env.ACCOUNT_ID, session_name: this.ctx.id.toString() }), session_id: "", subscription: this.env.MODEL_AUTH === "subscription" };
   }
 
-  private sessionId(scope: string, suggested?: string): string {
+  private sessionId(scope: string, suggested?: string, created?: () => void): string {
     const key = scope === "owner" ? "session_id" : `session_id:${scope}`;
     let session = this.store.row("SELECT value FROM metadata WHERE key = ?", key)?.value as string | undefined;
     if (!session) {
       session = suggested || sessionUuid();
       this.ctx.storage.sql.exec("INSERT INTO metadata VALUES (?, ?)", key, session);
+      created?.();
     }
     return session;
   }
@@ -519,7 +528,7 @@ export class AgentSession extends DurableObject<Env> {
     return json(read(after));
   }
 
-  private insertEvent(scope: string, requestId: string | null, event: unknown): void {
+  private insertEvent(scope: string, requestId: string | null, event: unknown, turns?: Map<string, string>): void {
     const value = event as any;
     const sdk = value?.source === "agent" ? value.event : value?.source === "subagent" ? value.update?.event : undefined;
     const turnId = sdk?.payload?.turn_id;
@@ -527,9 +536,24 @@ export class AgentSession extends DurableObject<Env> {
     if (value?.source === "agent" && typeof turnId === "string" && typeof acceptedId === "string" && this.job(acceptedId)?.scope === scope) {
       this.ctx.storage.sql.exec("INSERT INTO event_turns VALUES (?, ?, ?) ON CONFLICT(scope, turn_id) DO NOTHING", scope, turnId, acceptedId);
     }
-    if (typeof turnId === "string") requestId = value?.source === "agent"
-      ? String(this.store.row("SELECT request_id FROM event_turns WHERE scope = ? AND turn_id = ?", scope, turnId)?.request_id ?? turnId)
-      : turnId;
+    if (typeof turnId === "string") {
+      requestId = turnId;
+      if (value?.source === "agent") {
+        const key = JSON.stringify([scope, turnId]);
+        const cached = turns?.get(key) ?? this.eventTurns.get(key);
+        if (cached !== undefined) {
+          requestId = cached;
+          this.counts.event_turn_cache_hits++;
+        } else {
+          this.counts.event_turn_queries++;
+          const mapped = this.store.row("SELECT request_id FROM event_turns WHERE scope = ? AND turn_id = ?", scope, turnId)?.request_id;
+          if (mapped !== undefined) {
+            requestId = String(mapped);
+            turns?.set(key, requestId);
+          }
+        }
+      }
+    }
     else if (typeof acceptedId === "string") requestId = acceptedId;
     this.ctx.storage.sql.exec("INSERT INTO events (scope, request_id, body, created_at) VALUES (?, ?, ?, ?)", scope, requestId, JSON.stringify(event), Date.now());
     this.counts.events_written++;
@@ -542,7 +566,12 @@ export class AgentSession extends DurableObject<Env> {
 
   private async appendEvents(scope: string, requestId: string | null, events: unknown[]): Promise<void> {
     const started = performance.now();
-    this.ctx.storage.transactionSync(() => { for (const event of events) this.insertEvent(scope, requestId, event); });
+    const turns = new Map<string, string>();
+    this.ctx.storage.transactionSync(() => { for (const event of events) this.insertEvent(scope, requestId, event, turns); });
+    for (const [key, value] of turns) {
+      this.eventTurns.set(key, value);
+      while (this.eventTurns.size > 512) this.eventTurns.delete(this.eventTurns.keys().next().value!);
+    }
     this.scopeTimings(scope).record("events.insert", performance.now() - started);
     const syncing = performance.now();
     await this.ctx.storage.sync();

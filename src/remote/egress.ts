@@ -1,7 +1,7 @@
 import { WorkerEntrypoint } from "cloudflare:workers";
 import { EXECUTOR_ID, json, type SessionAuthority } from "../contracts";
 import type { AccountAuthority, ExecutorAccess } from "../egress/account";
-import { ACCOUNT_PATTERN, executors, executorTransport, Failure, modelAccount, type EgressEnv, type Executor, type ExecutorTransport } from "../egress/common";
+import { ACCOUNT_PATTERN, executorId, executors, executorTransport, Failure, modelAccount, type EgressEnv, type Executor, type ExecutorTransport } from "../egress/common";
 
 export interface RemoteEnv extends Pick<EgressEnv, "ACCOUNT_ID" | "RUNNERS_JSON" | "RUNNER_URL" | "RUNNER_TOKEN"> {
   ACCOUNTS: DurableObjectNamespace<AccountAuthority>;
@@ -43,7 +43,12 @@ async function select(request: Request, env: RemoteEnv): Promise<Executor> {
   let owner: string;
   try { owner = modelAccount(env); } catch { throw new Rejection(503, UNCONFIGURED); }
   if (session.account_id !== owner) throw new Rejection(403, "session account does not own the remote executor");
-  registry(env);
+  const configured = registry(env);
+  if (session.grant_id === undefined) {
+    const executor = configured.get(executorId(session.executor_id));
+    if (!executor) throw new Rejection(503, UNCONFIGURED);
+    return executor;
+  }
   let access: ExecutorAccess;
   try {
     access = await env.ACCOUNTS.get(env.ACCOUNTS.idFromName(owner)).executorAccess({ account_id: owner, authority: session });
@@ -55,7 +60,7 @@ async function select(request: Request, env: RemoteEnv): Promise<Executor> {
     if (access.status === 400) throw new Rejection(400, INVALID);
     throw new Rejection(403, FORBIDDEN);
   }
-  const executor = registry(env).get(access.executor_id);
+  const executor = configured.get(access.executor_id);
   if (!executor) throw new Rejection(503, UNCONFIGURED);
   return executor;
 }
