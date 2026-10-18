@@ -46,10 +46,39 @@ request_data=$(node --input-type=module -e '
 const [provider, executor, prompt] = process.argv.slice(1);
 process.stdout.write(JSON.stringify(JSON.stringify({ request_id: "try-1", provider, executor, prompt })));
 ' "$provider" "$executor" "$prompt")
-stream_text() {
+stream_events() {
   node --input-type=module -e '
 import { createInterface } from "node:readline";
-let data = [], terminal = false, text = "";
+const [provider, executor] = process.argv.slice(1);
+const calls = new Map();
+let data = [], terminal = false, last = "\n", speaker = "", nextCall = 0;
+function write(value) {
+  if (!value) return;
+  process.stdout.write(value);
+  last = value.slice(-1);
+}
+function line(value = "") {
+  if (last !== "\n") write("\n");
+  write(value + "\n");
+}
+function pretty(value) {
+  return typeof value === "string" ? value : JSON.stringify(value, null, 2);
+}
+function readable(value) {
+  if (typeof value !== "string") return pretty(value);
+  try {
+    const parsed = JSON.parse(value);
+    if (parsed && typeof parsed === "object") return typeof parsed.output === "string" ? parsed.output.trimEnd() : pretty(parsed);
+  } catch {}
+  return value;
+}
+function content(value) {
+  if (Array.isArray(value)) return value.map(block => content(block)).filter(Boolean).join("\n");
+  if (typeof value?.text === "string") return readable(value.text);
+  if (Array.isArray(value?.content_blocks)) return content(value.content_blocks);
+  if (value?.type) return "[" + value.type + "]";
+  return readable(value);
+}
 function flush() {
   if (!data.length) return;
   let envelope;
@@ -57,13 +86,44 @@ function flush() {
   catch { process.stderr.write("Invalid Worker stream.\n"); process.exitCode = 1; data = []; return; }
   data = [];
   const outer = envelope.event;
-  const event = outer?.source === "agent" ? outer.event : undefined;
+  const child = outer?.source === "subagent" ? outer.update : undefined;
+  const event = outer?.source === "agent" ? outer.event : child?.event;
+  const agent = child?.id ? String(child.id) : "";
+  const prefix = agent ? "[agent " + agent.slice(0, 8) + "] " : "";
+  const payload = event?.payload ?? {};
   if (event?.type === "assistant.delta" && typeof event.payload?.text === "string" && event.payload.text) {
-    text = event.payload.text;
-    process.stdout.write(text);
+    if (speaker !== agent) { line(prefix.trimEnd()); speaker = agent; }
+    write(event.payload.text);
+  }
+  if (event?.type === "assistant.message" && last !== "\n") line();
+  if (outer?.type === "queued") line("[queued]");
+  if (outer?.type === "running") line("[running] " + provider + " on " + executor);
+  if (event?.type === "model.call.started") line(prefix + "[model] " + provider + " generating");
+  if (child?.type === "added") line("[agent started] " + (child.agent?.name ?? child.agent?.id ?? "subagent"));
+  if (child?.type === "completion") line(prefix + "[agent finished] " + pretty(child.status));
+  if (event?.type === "tool.call" || event?.type === "tool.result") {
+    const key = agent + ":" + payload.call_id;
+    let call = calls.get(key);
+    if (!call) { call = { number: ++nextCall, tool: payload.tool ?? "tool" }; calls.set(key, call); }
+    if (event.type === "tool.call") {
+      const parent = calls.get(agent + ":" + payload.parent_call_id);
+      line(prefix + "[tool #" + call.number + "] " + call.tool + (parent ? " (in #" + parent.number + ")" : ""));
+      const args = payload.arguments;
+      if (typeof args?.cmd === "string") { line("$ " + args.cmd); if (args.workdir) line("cwd: " + args.workdir); }
+      else if (typeof args?.code === "string") line(args.code);
+      else if (args !== undefined) line(pretty(args));
+    } else {
+      const result = payload.structured_result;
+      const duration = typeof payload.duration_ns === "number" ? ", " + (payload.duration_ns / 1e6).toFixed(1) + "ms" : "";
+      const exit = typeof result?.exit_code === "number" ? ", exit " + result.exit_code : "";
+      line(prefix + "[result #" + call.number + "] " + call.tool + " (" + (payload.status ?? "finished") + duration + exit + ")");
+      const output = typeof result?.output === "string" ? result.output : content(payload.result ?? result);
+      if (output) line(output.trimEnd());
+    }
   }
   if (outer?.type === "result") {
     terminal = true;
+    line("[" + (outer.status ?? "failed") + "]");
     if (outer.status !== "completed") {
       process.stderr.write(`Worker turn ${outer.status ?? "failed"}.\n`);
       process.exitCode = 1;
@@ -75,12 +135,12 @@ for await (const line of createInterface({ input: process.stdin, crlfDelay: Infi
   else if (line.startsWith("data:")) data.push(line.slice(5).replace(/^ /, ""));
 }
 flush();
-if (text && !text.endsWith("\n")) process.stdout.write("\n");
+if (last !== "\n") write("\n");
 if (!terminal) { process.stderr.write("Stream ended without a final result.\n"); process.exitCode = 1; }
-'
+' "$provider" "$executor"
 }
 
-curl -NsS --fail-with-body --connect-timeout 15 --max-time 300 --config - <<EOF | stream_text
+curl -NsS --fail-with-body --connect-timeout 15 --max-time 300 --config - <<EOF | stream_events
 url = "https://nanocode-worker.gakonst.workers.dev/sessions/$session/turns"
 header = "Authorization: Bearer $worker_token"
 header = "Content-Type: application/json"
