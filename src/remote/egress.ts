@@ -1,54 +1,78 @@
 import { WorkerEntrypoint } from "cloudflare:workers";
-import { json, type SessionAuthority } from "../contracts";
+import { EXECUTOR_ID, json, type SessionAuthority } from "../contracts";
+import type { AccountAuthority, ExecutorAccess } from "../egress/account";
+import { ACCOUNT_PATTERN, executors, executorTransport, Failure, modelAccount, type EgressEnv, type Executor, type ExecutorTransport } from "../egress/common";
 
-export interface RemoteEnv {
-  RUNNER_URL?: string;
-  RUNNER_TOKEN?: string;
-  ACCOUNT_ID: string;
+export interface RemoteEnv extends Pick<EgressEnv, "ACCOUNT_ID" | "RUNNERS_JSON" | "RUNNER_URL" | "RUNNER_TOKEN"> {
+  ACCOUNTS: DurableObjectNamespace<AccountAuthority>;
+  [binding: `RUNNER_VPC_${string}`]: unknown;
 }
 
-const schemes: Record<string, string> = { "wss:": "https:", "https:": "https:", "ws:": "http:", "http:": "http:" };
-const loopback = new Set(["localhost", "127.0.0.1", "[::1]"]);
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+const INVALID = "invalid session authority";
+const FORBIDDEN = "session is not authorized for the remote executor";
+const UNCONFIGURED = "remote executor is not configured";
 
 class Rejection extends Error {
   constructor(readonly status: number, message: string) { super(message); }
 }
 
-function authorize(request: Request, env: RemoteEnv): SessionAuthority {
+function authority(request: Request): SessionAuthority {
   const header = request.headers.get("x-nanocode-authority");
   if (!header) throw new Rejection(403, "session authority required");
-  let authority: SessionAuthority;
-  try { authority = JSON.parse(header); } catch { throw new Rejection(400, "invalid session authority"); }
-  if (!authority || typeof authority !== "object" || typeof authority.account_id !== "string" || typeof authority.session_id !== "string") throw new Rejection(400, "invalid session authority");
-  if (authority.account_id !== env.ACCOUNT_ID) throw new Rejection(403, "session account does not own the remote executor");
-  if (authority.grant_id !== undefined) {
-    if (typeof authority.grant_id !== "string") throw new Rejection(400, "invalid session authority");
-    if (!Array.isArray(authority.connections) || !authority.connections.includes("runner")) throw new Rejection(403, "grant does not select the runner connection");
-  }
-  return authority;
+  let value: any;
+  try { value = JSON.parse(header); } catch { throw new Rejection(400, INVALID); }
+  const invalid = !value || typeof value !== "object" || Array.isArray(value)
+    || typeof value.account_id !== "string" || !ACCOUNT_PATTERN.test(value.account_id)
+    || typeof value.session_id !== "string" || !value.session_id || value.session_id.length > 128
+    || (value.executor_id !== undefined && (typeof value.executor_id !== "string" || !EXECUTOR_ID.test(value.executor_id)))
+    || (value.grant_id !== undefined && (typeof value.grant_id !== "string" || !UUID.test(value.grant_id) || !Number.isSafeInteger(value.grant_revision)));
+  if (invalid) throw new Rejection(400, INVALID);
+  return { account_id: value.account_id, session_id: value.session_id, grant_id: value.grant_id, grant_revision: value.grant_revision, executor_id: value.executor_id };
 }
 
-function destination(value: string | undefined): string {
-  if (!value) throw new Rejection(503, "remote executor is not configured");
-  let url: URL;
-  try { url = new URL(value); } catch { throw new Rejection(503, "remote executor destination is invalid"); }
-  const scheme = schemes[url.protocol];
-  if (!scheme || url.href !== `${url.protocol}//${url.host}${url.pathname}`) throw new Rejection(503, "remote executor destination must be a ws, wss, http or https URL without credentials, query or fragment");
-  if (scheme === "http:" && !loopback.has(url.hostname)) throw new Rejection(503, "plaintext remote executor destinations require a loopback host");
-  return `${scheme}//${url.host}${url.pathname}`;
+function registry(env: RemoteEnv): Map<string, Executor> {
+  try { return executors(env); } catch (error) {
+    if (error instanceof Failure) throw new Rejection(503, UNCONFIGURED);
+    throw error;
+  }
+}
+
+async function select(request: Request, env: RemoteEnv): Promise<Executor> {
+  const session = authority(request);
+  let owner: string;
+  try { owner = modelAccount(env); } catch { throw new Rejection(503, UNCONFIGURED); }
+  if (session.account_id !== owner) throw new Rejection(403, "session account does not own the remote executor");
+  registry(env);
+  let access: ExecutorAccess;
+  try {
+    access = await env.ACCOUNTS.get(env.ACCOUNTS.idFromName(owner)).executorAccess({ account_id: owner, authority: session });
+  } catch {
+    throw new Rejection(503, "remote executor authority is unavailable");
+  }
+  if (!access.ok) {
+    if (access.status === 500 || access.status === 503) throw new Rejection(503, UNCONFIGURED);
+    if (access.status === 400) throw new Rejection(400, INVALID);
+    throw new Rejection(403, FORBIDDEN);
+  }
+  const executor = registry(env).get(access.executor_id);
+  if (!executor) throw new Rejection(503, UNCONFIGURED);
+  return executor;
 }
 
 export class RemoteExecutorEgress extends WorkerEntrypoint<RemoteEnv> {
   async fetch(request: Request): Promise<Response> {
     try {
       if (request.method !== "GET" || request.headers.get("upgrade")?.toLowerCase() !== "websocket") throw new Rejection(426, "websocket upgrade required");
-      authorize(request, this.env);
-      const target = destination(this.env.RUNNER_URL);
-      const token = this.env.RUNNER_TOKEN;
-      if (!token?.trim()) throw new Rejection(503, "remote executor is not configured");
+      const executor = await select(request, this.env);
+      let transport: ExecutorTransport;
+      try { transport = executorTransport(this.env, executor); } catch (error) {
+        if (error instanceof Failure) throw new Rejection(503, UNCONFIGURED);
+        throw error;
+      }
       let upstream: Response;
       try {
-        upstream = await fetch(target, { headers: { upgrade: "websocket", authorization: `Bearer ${token}` }, redirect: "manual" });
+        upstream = await transport.fetch(new Request(executor.url, { headers: { upgrade: "websocket", authorization: `Bearer ${executor.token}` }, redirect: "manual" }));
       } catch {
         throw new Rejection(502, "remote executor is unreachable");
       }

@@ -1,4 +1,4 @@
-import type { AuthorityResult, ModelProvider, PrivateBinding } from "../contracts";
+import { DEFAULT_EXECUTOR, EXECUTOR_ID, LEGACY_RUNNER, runnerConnection, type AuthorityResult, type ModelProvider, type PrivateBinding } from "../contracts";
 import type { AccountAuthority } from "./account";
 
 export interface EgressEnv {
@@ -18,6 +18,9 @@ export interface EgressEnv {
   VAULT_KEY?: string;
   SESSION_FENCES?: PrivateBinding;
   RUNNER_URL?: string;
+  RUNNER_TOKEN?: string;
+  RUNNERS_JSON?: string;
+  [binding: `RUNNER_VPC_${string}`]: unknown;
 }
 
 export const SUBSCRIPTION = {
@@ -55,7 +58,7 @@ export function setting(env: EgressEnv, name: "CREDENTIAL_CACHE_TTL_MS" | "REFRE
   return value;
 }
 
-export function modelAccount(env: EgressEnv): string {
+export function modelAccount(env: Pick<EgressEnv, "ACCOUNT_ID">): string {
   const account = env.ACCOUNT_ID ?? "default";
   if (!ACCOUNT_PATTERN.test(account)) throw new Failure(500, "configuration_error");
   return account;
@@ -245,6 +248,90 @@ export function placeCredential(auth: Placement, secret: string): [string, strin
   if (auth.type === "bearer") return ["authorization", `Bearer ${secret}`];
   if (auth.type === "basic") return ["authorization", `Basic ${btoa(secret)}`];
   return [auth.name, `${auth.prefix}${secret}`];
+}
+
+export type Executor = { id: string; url: string; token: string; binding?: string };
+export type ExecutorTransport = { fetch(request: Request): Promise<Response> };
+type ExecutorEnv = Pick<EgressEnv, "RUNNERS_JSON" | "RUNNER_URL" | "RUNNER_TOKEN"> & { [binding: `RUNNER_VPC_${string}`]: unknown };
+
+const EXECUTOR_SCHEMES: Record<string, string> = { "wss:": "https:", "https:": "https:", "ws:": "http:", "http:": "http:" };
+const EXECUTOR_TOKEN = /^[\x21-\x7e]{1,4096}$/;
+const EXECUTOR_LIMIT = 64;
+const EXECUTOR_BINDING = /^RUNNER_VPC_[A-Z0-9_]+$/;
+
+let executorSource: string | undefined;
+let parsedExecutors = new Map<string, Executor>();
+
+export function executors(env: ExecutorEnv): Map<string, Executor> {
+  const source = JSON.stringify([env.RUNNERS_JSON ?? null, env.RUNNER_URL ?? null, env.RUNNER_TOKEN ?? null]);
+  if (source === executorSource) return parsedExecutors;
+  const fail = (): never => { throw new Failure(500, "configuration_error"); };
+  const result = new Map<string, Executor>();
+  if (env.RUNNERS_JSON) {
+    let document: unknown;
+    try { document = JSON.parse(env.RUNNERS_JSON); } catch { return fail(); }
+    if (!Array.isArray(document) || document.length > EXECUTOR_LIMIT) fail();
+    for (const entry of document as unknown[]) {
+      if (!entry || typeof entry !== "object" || Array.isArray(entry)) fail();
+      const { id, url, token, binding, ...rest } = entry as Record<string, unknown>;
+      if (Object.keys(rest).length || typeof id !== "string" || !EXECUTOR_ID.test(id) || result.has(id)) fail();
+      if (binding !== undefined && (typeof binding !== "string" || !EXECUTOR_BINDING.test(binding))) fail();
+      const value = executor(id as string, url, token, fail);
+      if (binding !== undefined) {
+        executorFetcher(env, binding as string);
+        value.binding = binding as string;
+      }
+      result.set(id as string, value);
+    }
+  }
+  if (env.RUNNER_URL !== undefined || env.RUNNER_TOKEN !== undefined) {
+    if (result.has(DEFAULT_EXECUTOR)) fail();
+    result.set(DEFAULT_EXECUTOR, executor(DEFAULT_EXECUTOR, env.RUNNER_URL, env.RUNNER_TOKEN, fail));
+  }
+  executorSource = source;
+  parsedExecutors = result;
+  return result;
+}
+
+function executor(id: string, value: unknown, token: unknown, fail: () => never): Executor {
+  if (typeof value !== "string" || value.length > 2048 || typeof token !== "string" || !EXECUTOR_TOKEN.test(token)) fail();
+  let url: URL;
+  try { url = new URL(value as string); } catch { return fail(); }
+  const scheme = EXECUTOR_SCHEMES[url.protocol];
+  if (!scheme || url.username || url.password || url.search || url.hash || url.href !== `${url.protocol}//${url.host}${url.pathname}`) fail();
+  if (scheme === "http:" && !loopback(url.hostname)) fail();
+  return { id, url: `${scheme}//${url.host}${url.pathname}`, token: token as string };
+}
+
+function executorFetcher(env: ExecutorEnv, name: string): ExecutorTransport {
+  if (!EXECUTOR_BINDING.test(name)) throw new Failure(500, "configuration_error");
+  const binding = env[name as `RUNNER_VPC_${string}`] as { fetch?: unknown } | null | undefined;
+  if (!binding || (typeof binding !== "object" && typeof binding !== "function") || typeof binding.fetch !== "function") throw new Failure(500, "configuration_error");
+  return binding as ExecutorTransport;
+}
+
+export function executorTransport(env: ExecutorEnv, executor: Executor): ExecutorTransport {
+  if (executor.binding === undefined) return { fetch: request => fetch(request) };
+  const binding = executorFetcher(env, executor.binding);
+  return { fetch: request => binding.fetch(request) };
+}
+
+export function executorId(value: unknown): string {
+  if (value === undefined || value === null) return DEFAULT_EXECUTOR;
+  if (typeof value !== "string" || !EXECUTOR_ID.test(value)) throw new Failure(400, "invalid_request");
+  return value;
+}
+
+export function executorConnection(value: string): string | undefined {
+  if (value === LEGACY_RUNNER) return DEFAULT_EXECUTOR;
+  const prefix = `${LEGACY_RUNNER}:`;
+  if (!value.startsWith(prefix)) return undefined;
+  const id = value.slice(prefix.length);
+  return EXECUTOR_ID.test(id) ? id : undefined;
+}
+
+export function executorSelected(selected: string[], id: string): boolean {
+  return selected.includes(runnerConnection(id)) || (id === DEFAULT_EXECUTOR && selected.includes(LEGACY_RUNNER));
 }
 
 type VaultKey = { kid: string; key: CryptoKey };

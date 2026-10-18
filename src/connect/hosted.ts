@@ -1,4 +1,4 @@
-import { json, type SessionDescriptor } from "../contracts";
+import { EXECUTOR_ID, json, type ModelProvider, type SessionDescriptor } from "../contracts";
 import { authorize, ConnectError, descriptorOf, IDENTIFIER, positiveInteger, readJson, relay, sessionFetch, SCOPES, text, threadId, type ConnectEnv, type Delegation } from "./common";
 
 const EVENT_PAGE_MAX = 500;
@@ -8,14 +8,16 @@ const SERVICE_METHODS = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"];
 const HEADER_NAME = /^[!#$%&'*+.^_`|~0-9A-Za-z-]{1,128}$/;
 const HEADER_VALUE = /^[\t\x20-\x7E\x80-\xFF]{0,8192}$/;
 
-export type TurnInput = { request_id: string; prompt: string };
+export type TurnInput = { request_id: string; prompt: string; provider?: ModelProvider; executor?: string };
 export type EventCursor = { after: number; limit?: number };
 export type ServiceInput = { connection_id: string; app_id?: string; method?: string; path?: string; headers?: Record<string, string>; body?: string; kind?: "connector" | "vault" };
 
 export function turnInput(value: any): TurnInput {
   if (!value || typeof value !== "object") throw new ConnectError(400, "invalid_request", "expected a JSON object");
   if (typeof value.prompt !== "string" || !value.prompt.trim() || value.prompt.length > PROMPT_LIMIT) throw new ConnectError(400, "invalid_request", `prompt must be a nonempty string of at most ${PROMPT_LIMIT} characters`);
-  return { request_id: text(value.request_id, "request_id"), prompt: value.prompt };
+  if (value.provider !== undefined && value.provider !== "claude" && value.provider !== "codex") throw new ConnectError(400, "invalid_request", "provider must be claude or codex");
+  if (value.executor !== undefined && (typeof value.executor !== "string" || !EXECUTOR_ID.test(value.executor))) throw new ConnectError(400, "invalid_request", "invalid executor");
+  return { request_id: text(value.request_id, "request_id"), prompt: value.prompt, provider: value.provider, executor: value.executor };
 }
 
 export function cursor(after: string | null, limit: string | null): EventCursor {
@@ -43,7 +45,7 @@ export async function createThread(env: ConnectEnv, delegated: Delegation): Prom
 
 export async function submitTurn(env: ConnectEnv, delegated: Delegation, thread: string | undefined, input: TurnInput): Promise<{ descriptor: SessionDescriptor; response: Response }> {
   const descriptor = await threadDescriptor(env, delegated, SCOPES.write, thread);
-  const response = await sessionFetch(env, descriptor, "/internal/turns", "POST", { descriptor, request_id: input.request_id, prompt: input.prompt });
+  const response = await sessionFetch(env, descriptor, "/internal/turns", "POST", input);
   return { descriptor, response };
 }
 

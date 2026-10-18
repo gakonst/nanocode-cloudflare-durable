@@ -22,14 +22,16 @@ export class EventHub {
     try { await ready; } finally { clearTimeout(timer); this.listeners.delete(finish); }
   }
 
-  stream(after: number, interval: number, read: (after: number) => Page, allowed: () => boolean): Response {
+  stream(after: number, interval: number, read: (after: number) => Page, allowed: () => boolean, finished?: (event: Page["events"][number]) => boolean): Response {
     let cursor = after;
     let closed = false;
+    let complete = false;
     let release: (() => void) | undefined;
     const encoder = new TextEncoder();
     const body = new ReadableStream<Uint8Array>({
       pull: async controller => {
         try {
+          if (complete) { controller.close(); closed = true; return; }
           while (!closed) {
             if (!allowed()) { controller.close(); closed = true; return; }
             let timedOut = false;
@@ -43,6 +45,7 @@ export class EventHub {
               release();
               release = undefined;
               cursor = page.next_cursor;
+              complete = !!finished && page.events.some(finished);
               controller.enqueue(encoder.encode(page.events.map(event => `id: ${event.seq}\ndata: ${JSON.stringify(event)}\n\n`).join("")));
               return;
             }

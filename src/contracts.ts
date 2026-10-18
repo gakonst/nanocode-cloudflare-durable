@@ -1,5 +1,13 @@
 export type ModelProvider = "claude" | "codex";
 
+export const EXECUTOR_ID = /^[a-z0-9][a-z0-9_-]{0,47}$/;
+export const DEFAULT_EXECUTOR = "default";
+export const LEGACY_RUNNER = "runner";
+
+export function runnerConnection(executor: string): string {
+  return `${LEGACY_RUNNER}:${executor}`;
+}
+
 export function sessionUuid(): string {
   const bytes = crypto.getRandomValues(new Uint8Array(16));
   let time = BigInt(Date.now());
@@ -24,6 +32,7 @@ export type SessionAuthority = {
   connections?: string[];
   catalog_digest?: string;
   grant_expires_at?: number;
+  executor_id?: string;
 };
 
 export type SessionDescriptor = SessionAuthority & {

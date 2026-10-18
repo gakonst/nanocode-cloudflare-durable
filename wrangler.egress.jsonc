@@ -9,6 +9,10 @@
   },
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["AccountAuthority"] }],
   "services": [{ "binding": "SESSION_FENCES", "service": "nanocode-worker", "entrypoint": "SessionControl" }],
+  "vpc_services": [
+    { "binding": "RUNNER_VPC_PARADIGM_A", "service_id": "01a14e2c-a47e-7160-90dc-146bb38585ea" },
+    { "binding": "RUNNER_VPC_PARADIGM_B", "service_id": "01a14e2c-a87a-7a93-9ac6-34a506f79763" }
+  ],
   "vars": {
     "ACCOUNT_ID": "default",
     "CREDENTIAL_CACHE_TTL_MS": "600000",

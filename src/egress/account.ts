@@ -1,9 +1,10 @@
 import { DurableObject } from "cloudflare:workers";
-import { sessionUuid, type AuthorityCommand, type AuthorityResult, type ModelProvider, type SessionAuthority, type SessionDescriptor } from "../contracts";
-import { ACCOUNT_PATTERN, base64url, CODEX, connections, exactOrigin, Failure, jwtClaims, mode, modelAccount, modelProvider, open, placeCredential, random, readLimited, seal, SECRET_PATTERN, setting, sha256, sha256hex, SUBSCRIPTION, vaultConfigured, type Connection, type EgressEnv } from "./common";
+import { DEFAULT_EXECUTOR, LEGACY_RUNNER, runnerConnection, sessionUuid, type AuthorityCommand, type AuthorityResult, type ModelProvider, type SessionAuthority, type SessionDescriptor } from "../contracts";
+import { ACCOUNT_PATTERN, base64url, CODEX, connections, exactOrigin, executorConnection, executorId, executors, executorSelected, Failure, jwtClaims, mode, modelAccount, modelProvider, open, placeCredential, random, readLimited, seal, SECRET_PATTERN, setting, sha256, sha256hex, SUBSCRIPTION, vaultConfigured, type Connection, type EgressEnv } from "./common";
 
 export type Access = { ok: true; generation: number; expires_at: number | null; headers: [string, string][] } | { ok: false; status: number; error: string };
 export type ServiceAccess = { ok: true; grant_id: string; generation: number; expires_at: number | null; refreshable: boolean; headers: [string, string][]; secrets: string[] } | { ok: false; status: number; error: string };
+export type ExecutorAccess = { ok: true; executor_id: string } | { ok: false; status: number; error: string };
 export type ServiceRequest = { account_id: string; token: string; origin: string; app_id?: string; connection_id: string; kind: "connector" | "vault"; rejected_generation?: number };
 
 type Grant = { grant_id: string; app_id: string; origin: string; principal: string; scopes: string; connections: string; catalog_digest: string | null; client_id: string | null; revision: number; status: string; created_at: number; expires_at: number | null };
@@ -304,6 +305,20 @@ export class AccountAuthority extends DurableObject<EgressEnv> {
     } catch (error) { return failure(error); }
   }
 
+  async executorAccess(input: { account_id: string; authority: SessionAuthority }): Promise<ExecutorAccess> {
+    try {
+      const account = this.bind(input?.account_id);
+      if (account !== modelAccount(this.env) || input.authority?.account_id !== account || typeof input.authority.session_id !== "string") throw new Failure(403, "forbidden");
+      const id = executorId(input.authority.executor_id);
+      if (!executors(this.env).has(id)) throw new Failure(503, "executor_unavailable");
+      if (input.authority.grant_id !== undefined) {
+        const grant = this.sessionGrant(input.authority);
+        if (!executorSelected(JSON.parse(grant.connections) as string[], id)) throw new Failure(403, "forbidden");
+      }
+      return { ok: true, executor_id: id };
+    } catch (error) { return failure(error); }
+  }
+
   private async resolveConnection(account: string, id: string, kind: "connector" | "vault", grantId: string, rejected?: number): Promise<ServiceAccess> {
     const connection = connections(this.env).get(id);
     if (!connection || !connection.accounts.includes(account)) throw new Failure(404, "not_found");
@@ -356,8 +371,12 @@ export class AccountAuthority extends DurableObject<EgressEnv> {
   private connectionIds(account: string, value: unknown): string[] {
     const available = connections(this.env);
     return list(value, item => {
+      const executor = typeof item === "string" ? executorConnection(item) : undefined;
+      if (executor !== undefined) {
+        if (account !== modelAccount(this.env) || !executors(this.env).has(executor)) throw new Failure(400, "invalid_request");
+        return item as string;
+      }
       const id = text(item, /^[A-Za-z0-9_-]{1,64}$/);
-      if (id === "runner" && this.env.RUNNER_URL && account === modelAccount(this.env)) return id;
       if (!available.get(id)?.accounts.includes(account)) throw new Failure(400, "invalid_request");
       return id;
     }, 0, 64);
@@ -723,7 +742,12 @@ export class AccountAuthority extends DurableObject<EgressEnv> {
       }
       result.push({ connection_id: connection.id, kind: connection.kind, methods: connection.methods, credential });
     }
-    if (this.env.RUNNER_URL && account === modelAccount(this.env)) result.push({ connection_id: "runner", kind: "executor", methods: ["code_mode", "Bash", "Read", "Write", "Edit"], credential: "private" });
+    if (account === modelAccount(this.env)) {
+      const methods = ["code_mode", "Bash", "Read", "Write", "Edit"];
+      const available = executors(this.env);
+      if (available.has(DEFAULT_EXECUTOR)) result.push({ connection_id: LEGACY_RUNNER, kind: "executor", executor_id: DEFAULT_EXECUTOR, methods, credential: "private" });
+      for (const id of available.keys()) result.push({ connection_id: runnerConnection(id), kind: "executor", executor_id: id, methods, credential: "private" });
+    }
     return { ok: true, connections: result };
   }
 

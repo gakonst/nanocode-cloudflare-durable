@@ -5,7 +5,7 @@ import { EventHub } from "./events";
 import { RemoteExecutor } from "./remote/host";
 import { handleConnect } from "./connect/index";
 export { SubscriptionAuth } from "./auth";
-import { headerJson, json, sessionUuid, type AgentResult, type PrivateBinding, type SessionDescriptor } from "./contracts";
+import { DEFAULT_EXECUTOR, EXECUTOR_ID, LEGACY_RUNNER, runnerConnection, headerJson, json, sessionUuid, type AgentResult, type PrivateBinding, type SessionDescriptor } from "./contracts";
 
 export interface Env {
   SESSIONS: DurableObjectNamespace<AgentSession>;
@@ -53,6 +53,7 @@ export default {
     if (!authorized) return json({ error: "unauthorized" }, 401);
     const url = new URL(request.url);
     if (url.pathname === "/health") return json({ ok: true, model: "claude-opus-5-5", models: { claude: "claude-opus-5-5", codex: "gpt-6.1-sol" }, auth: env.MODEL_AUTH, architecture: "session-local", credential_boundary: "private-egress" });
+    if (url.pathname === "/metrics" && request.method === "GET") return env.EGRESS.fetch(new Request("https://egress.internal/metrics"));
     const match = /^\/sessions\/([^/]+)(?:\/(turns|events|metrics|socket)(?:\/([^/]+)(?:\/(cancel))?)?)?$/.exec(url.pathname);
     if (!match) return json({ error: "route not found" }, 404);
     let name: string;
@@ -88,7 +89,7 @@ export class AgentSession extends DurableObject<Env> {
   private running?: Running;
   private pumping = false;
   private readonly eventHub = new EventHub();
-  private readonly counts = { runtime_initializations: 0, model_dispatches: 0, events_written: 0, alarms: 0, recoveries: 0 };
+  private readonly counts = { runtime_initializations: 0, model_dispatches: 0, events_written: 0, alarms: 0, direct_starts: 0, recoveries: 0 };
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -99,6 +100,7 @@ export class AgentSession extends DurableObject<Env> {
       CREATE TABLE IF NOT EXISTS events (seq INTEGER PRIMARY KEY AUTOINCREMENT, scope TEXT NOT NULL, request_id TEXT, body TEXT NOT NULL, created_at INTEGER NOT NULL);
       CREATE INDEX IF NOT EXISTS unfinished_jobs ON jobs(status);
       CREATE INDEX IF NOT EXISTS scoped_events ON events(scope, seq);
+      CREATE INDEX IF NOT EXISTS scoped_request_events ON events(scope, request_id, seq);
       CREATE TABLE IF NOT EXISTS grant_fences (grant_id TEXT PRIMARY KEY, revision INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS event_turns (scope TEXT NOT NULL, turn_id TEXT NOT NULL, request_id TEXT NOT NULL, PRIMARY KEY (scope, turn_id));
     `);
@@ -136,6 +138,22 @@ export class AgentSession extends DurableObject<Env> {
       if (typeof input?.request_id !== "string" || !input.request_id.trim() || typeof input.prompt !== "string" || !input.prompt.trim()) return json({ error: "request_id and prompt must be nonempty strings" }, 400);
       if (input.request_id.startsWith("subagent-completion:")) return json({ error: "request_id prefix is reserved" }, 400);
       if (input.provider !== undefined && input.provider !== "claude" && input.provider !== "codex") return json({ error: "provider must be claude or codex" }, 400);
+      if (input.executor !== undefined && (typeof input.executor !== "string" || !EXECUTOR_ID.test(input.executor))) return json({ error: "invalid executor" }, 400);
+      const streaming = request.headers.get("accept")?.includes("text/event-stream");
+      if (streaming) {
+        const after = Number(url.searchParams.get("after") ?? "0");
+        const limit = Number(url.searchParams.get("limit") ?? this.env.EVENT_PAGE_SIZE);
+        if (!Number.isSafeInteger(after) || after < 0 || !Number.isSafeInteger(limit) || limit < 1 || limit > policy(this.env.EVENT_PAGE_SIZE, "EVENT_PAGE_SIZE")) return json({ error: "invalid event cursor" }, 400);
+      }
+      const executorKey = `executor:${scope}`;
+      const storedExecutor = this.store.row("SELECT value FROM metadata WHERE key = ?", executorKey)?.value as string | undefined;
+      const initialized = !!this.store.row("SELECT value FROM metadata WHERE key = ?", scope === "owner" ? "session_id" : `session_id:${scope}`);
+      const legacyExecutor = this.env.RUNNER_ENABLED === "true" && (!descriptor.grant_id || descriptor.connections?.includes(LEGACY_RUNNER)) ? DEFAULT_EXECUTOR : "";
+      const boundExecutor = storedExecutor ?? (initialized ? legacyExecutor : undefined);
+      if (boundExecutor !== undefined && input.executor !== undefined && input.executor !== boundExecutor) return json({ error: "session executor is immutable; create a new session" }, 409);
+      const executor = input.executor ?? boundExecutor ?? legacyExecutor;
+      if (executor && descriptor.grant_id && !descriptor.connections?.includes(runnerConnection(executor)) && !(executor === DEFAULT_EXECUTOR && descriptor.connections?.includes(LEGACY_RUNNER))) return json({ error: "executor is not selected by this grant" }, 403);
+      descriptor.executor_id = executor || undefined;
       const providerKey = `model_provider:${scope}`;
       const boundProvider = this.store.row("SELECT value FROM metadata WHERE key = ?", providerKey)?.value
         ?? (this.store.row("SELECT value FROM metadata WHERE key = ?", scope === "owner" ? "session_id" : `session_id:${scope}`) ? "claude" : undefined);
@@ -152,14 +170,26 @@ export class AgentSession extends DurableObject<Env> {
           if (current && current !== identity) throw new Error("session authority mismatch");
           if (!current) this.ctx.storage.sql.exec("INSERT INTO metadata VALUES ('authority', ?)", identity);
           this.ctx.storage.sql.exec("INSERT INTO metadata VALUES (?, ?) ON CONFLICT(key) DO NOTHING", providerKey, descriptor.provider!);
+          this.ctx.storage.sql.exec("INSERT INTO metadata VALUES (?, ?) ON CONFLICT(key) DO NOTHING", executorKey, executor);
           this.sessionId(scope, descriptor.session_id);
           this.ctx.storage.sql.exec("INSERT INTO jobs (request_id, prompt, status, result, scope, descriptor, cancel_requested) VALUES (?, ?, 'queued', NULL, ?, ?, 0)", input.request_id, input.prompt, scope, JSON.stringify(descriptor));
           this.insertEvent(scope, input.request_id, { type: "queued", request_id: input.request_id });
         });
       }
       const job = existing ?? this.job(input.request_id)!;
-      if ((job.status === "queued" || job.status === "running") && !this.pumping) await this.ctx.storage.setAlarm(Date.now());
+      if ((job.status === "queued" || job.status === "running") && !this.pumping) await this.ctx.storage.setAlarm(Date.now() + policy(this.env.RECOVERY_DELAY_MS, "RECOVERY_DELAY_MS"));
       await this.ctx.storage.sync();
+      if ((job.status === "queued" || job.status === "running") && !this.pumping) {
+        this.counts.direct_starts++;
+        this.ctx.waitUntil(this.pump());
+      }
+      if (streaming) {
+        const cursor = Number(url.searchParams.get("after") ?? "0");
+        const terminal = !["queued", "running"].includes(job.status);
+        const last = terminal ? this.store.row("SELECT seq FROM events WHERE scope = ? AND request_id = ? ORDER BY seq DESC LIMIT 1", scope, input.request_id)?.seq : undefined;
+        if (terminal && (last === undefined || cursor >= Number(last))) return new Response(null, { headers: { "content-type": "text/event-stream", "cache-control": "no-store" } });
+        return this.events(scope, url, true, descriptor, input.request_id);
+      }
       return json(this.publicJob(job), ["queued", "running"].includes(job.status) ? 202 : 200);
     } catch (error) {
       if (error instanceof URIError) return json({ error: "invalid request encoding" }, 400);
@@ -169,6 +199,10 @@ export class AgentSession extends DurableObject<Env> {
 
   async alarm(): Promise<void> {
     this.counts.alarms++;
+    await this.pump();
+  }
+
+  private async pump(): Promise<void> {
     const delay = policy(this.env.RECOVERY_DELAY_MS, "RECOVERY_DELAY_MS");
     if (this.pumping) { await this.ctx.storage.setAlarm(Date.now() + delay); return; }
     this.pumping = true;
@@ -179,7 +213,6 @@ export class AgentSession extends DurableObject<Env> {
     let activeJob: Job | undefined;
     try {
       await this.ctx.storage.setAlarm(Date.now() + delay);
-      await this.ctx.storage.sync();
       const job = this.ctx.storage.sql.exec<Job>("SELECT * FROM jobs WHERE status IN ('queued', 'running') ORDER BY rowid LIMIT 1").toArray()[0];
       const background = this.store.row("SELECT key, value FROM metadata WHERE key LIKE 'background:%' ORDER BY key LIMIT 1");
       if (!job && !background) return;
@@ -192,7 +225,6 @@ export class AgentSession extends DurableObject<Env> {
         if (job) {
           activeJob = job;
           if (job.status === "running") this.counts.recoveries++;
-          this.ctx.storage.sql.exec("UPDATE jobs SET status = 'running', result = NULL WHERE request_id = ?", job.request_id);
         }
       });
       await this.ctx.storage.sync();
@@ -211,10 +243,12 @@ export class AgentSession extends DurableObject<Env> {
         const pendingJob = first ? this.job(first) : undefined;
         activeJob = pendingJob?.scope === scope && ["queued", "running"].includes(pendingJob.status) ? pendingJob : !first ? job : undefined;
         if (activeJob) {
-          this.ctx.storage.sql.exec("UPDATE jobs SET status = 'running', result = NULL WHERE request_id = ?", activeJob.request_id);
-          await this.ctx.storage.sync();
           this.running = { job: activeJob, runtime };
-          await this.appendEvent(scope, activeJob.request_id, { type: "running", request_id: activeJob.request_id });
+          this.ctx.storage.transactionSync(() => {
+            this.ctx.storage.sql.exec("UPDATE jobs SET status = 'running', result = NULL WHERE request_id = ?", activeJob!.request_id);
+            this.insertEvent(scope!, activeJob!.request_id, { type: "running", request_id: activeJob!.request_id });
+          });
+          await this.ctx.storage.sync();
           const latest = this.job(activeJob.request_id)!;
           const result = latest.cancel_requested ? await runtime.cancel(activeJob.request_id) : await runtime.run({ request_id: activeJob.request_id, prompt: activeJob.prompt });
           if (result.retry) throw new Error("runtime recovery required");
@@ -248,9 +282,10 @@ export class AgentSession extends DurableObject<Env> {
       this.pumping = false;
       const unfinished = this.store.row("SELECT request_id FROM jobs WHERE status IN ('queued', 'running') LIMIT 1");
       const background = this.store.row("SELECT key FROM metadata WHERE key LIKE 'background:%' LIMIT 1");
-      if (unfinished || background) await this.ctx.storage.setAlarm(Date.now() + (immediate ? 0 : delay));
+      if (unfinished || background) await this.ctx.storage.setAlarm(Date.now() + delay);
       else await this.ctx.storage.deleteAlarm();
       await this.ctx.storage.sync();
+      if (immediate && unfinished) this.ctx.waitUntil(this.pump());
     }
   }
 
@@ -282,29 +317,34 @@ export class AgentSession extends DurableObject<Env> {
     if (!resident) {
       this.counts.runtime_initializations++;
       resident = (async () => {
-        const authority = { account_id: descriptor.account_id, session_id: sessionId, grant_id: descriptor.grant_id, grant_revision: descriptor.grant_revision, connections: descriptor.connections, catalog_digest: descriptor.catalog_digest, grant_expires_at: descriptor.grant_expires_at };
-        const remote = this.env.RUNNER_ENABLED === "true" && (!descriptor.grant_id || descriptor.connections?.includes("runner"))
-          ? await RemoteExecutor.create(this.env.REMOTE, authority, { max_frame_bytes: policy(this.env.REMOTE_MAX_FRAME_BYTES, "REMOTE_MAX_FRAME_BYTES"), timeout_ms: policy(this.env.REMOTE_TIMEOUT_MS, "REMOTE_TIMEOUT_MS") })
+        const authority = { account_id: descriptor.account_id, session_id: sessionId, grant_id: descriptor.grant_id, grant_revision: descriptor.grant_revision, connections: descriptor.connections, catalog_digest: descriptor.catalog_digest, grant_expires_at: descriptor.grant_expires_at, executor_id: descriptor.executor_id };
+        const enabled = !!descriptor.executor_id || (this.env.RUNNER_ENABLED === "true" && (!descriptor.grant_id || descriptor.connections?.includes(LEGACY_RUNNER)));
+        let remote: RemoteExecutor | undefined;
+        let remoteFailed = false;
+        const connecting = enabled
+          ? RemoteExecutor.create(this.env.REMOTE, authority, { max_frame_bytes: policy(this.env.REMOTE_MAX_FRAME_BYTES, "REMOTE_MAX_FRAME_BYTES"), timeout_ms: policy(this.env.REMOTE_TIMEOUT_MS, "REMOTE_TIMEOUT_MS") }).then(value => remote = value, error => { remoteFailed = true; throw error; })
           : undefined;
+        void connecting?.catch(() => {});
         try {
-          return await AgentRuntime.create({ session_id: sessionId, provider: descriptor.provider ?? "claude", subscription: descriptor.subscription, endpoint: descriptor.provider === "codex" ? "https://chatgpt.com/backend-api/codex" : `https://api.anthropic.com/v1/messages${descriptor.subscription ? "?beta=true" : ""}`, remote: !!remote }, this.store, {
-        remote: remote ? {
-          failed: () => remote.failure !== undefined,
+          return await AgentRuntime.create({ session_id: sessionId, provider: descriptor.provider ?? "claude", subscription: descriptor.subscription, endpoint: descriptor.provider === "codex" ? "https://chatgpt.com/backend-api/codex" : `https://api.anthropic.com/v1/messages${descriptor.subscription ? "?beta=true" : ""}`, remote: enabled }, this.store, {
+        remote: connecting ? {
+          failed: () => remoteFailed || remote?.failure !== undefined,
           execute: async (request: any, id: number) => {
+            const executor = await connecting;
             if (request.op === "remote_send" && this.dispatchBlocked(scope, descriptor)) {
               const forbidden = request.frames.some((text: string) => {
                 const frame = JSON.parse(text);
                 return frame.type === "request" && ["Execute", "Wait"].includes(Object.keys(frame.operation)[0]);
               });
               if (forbidden) {
-                await remote.dispose();
+                await executor.dispose();
                 throw new Error("request authority stopped");
               }
             }
-            return remote.execute(request, id);
+            return executor.execute(request, id);
           },
-          cancel: id => remote.cancel(id),
-          dispose: () => remote.dispose(),
+          cancel: id => remote?.cancel(id),
+          dispose: async () => { await connecting.then(value => value.dispose(), () => {}); },
         } : undefined,
         dispatch: async (request, signal) => {
           if (this.dispatchBlocked(scope, descriptor)) throw new Error("request authority stopped");
@@ -321,7 +361,7 @@ export class AgentSession extends DurableObject<Env> {
           return response.json();
         },
       });
-        } catch (error) { await remote?.dispose(); throw error; }
+        } catch (error) { await connecting?.then(value => value.dispose(), () => {}); throw error; }
       })();
       this.runtimes.set(scope, resident);
       void resident.catch(() => { if (this.runtimes.get(scope) === resident) this.runtimes.delete(scope); });
@@ -389,16 +429,19 @@ export class AgentSession extends DurableObject<Env> {
     return (descriptor.grant_expires_at !== undefined && descriptor.grant_expires_at <= Date.now()) || (!!descriptor.grant_id && !!this.store.row("SELECT revision FROM grant_fences WHERE grant_id = ?", descriptor.grant_id));
   }
 
-  private events(scope: string, url: URL, streaming = false, descriptor?: SessionDescriptor): Response {
+  private events(scope: string, url: URL, streaming = false, descriptor?: SessionDescriptor, requestId?: string): Response {
     const after = Number(url.searchParams.get("after") ?? "0");
     const limit = Number(url.searchParams.get("limit") ?? this.env.EVENT_PAGE_SIZE);
     const maximum = policy(this.env.EVENT_PAGE_SIZE, "EVENT_PAGE_SIZE");
     if (!Number.isSafeInteger(after) || after < 0 || !Number.isSafeInteger(limit) || limit < 1 || limit > maximum) return json({ error: `after must be a nonnegative integer and limit must be between 1 and ${maximum}` }, 400);
     const read = (cursor: number) => {
-      const events = this.ctx.storage.sql.exec<{ seq: number; request_id: string | null; body: string; created_at: number }>("SELECT seq, request_id, body, created_at FROM events WHERE scope = ? AND seq > ? ORDER BY seq LIMIT ?", scope, cursor, limit).toArray().map(row => ({ seq: row.seq, request_id: row.request_id, created_at: row.created_at, event: JSON.parse(row.body) }));
+      const query = requestId === undefined
+        ? this.ctx.storage.sql.exec<{ seq: number; request_id: string | null; body: string; created_at: number }>("SELECT seq, request_id, body, created_at FROM events WHERE scope = ? AND seq > ? ORDER BY seq LIMIT ?", scope, cursor, limit)
+        : this.ctx.storage.sql.exec<{ seq: number; request_id: string | null; body: string; created_at: number }>("SELECT seq, request_id, body, created_at FROM events WHERE scope = ? AND request_id = ? AND seq > ? ORDER BY seq LIMIT ?", scope, requestId, cursor, limit);
+      const events = query.toArray().map(row => ({ seq: row.seq, request_id: row.request_id, created_at: row.created_at, event: JSON.parse(row.body) }));
       return { events, next_cursor: events.at(-1)?.seq ?? cursor, has_more: events.length === limit };
     };
-    if (streaming) return this.eventHub.stream(after, policy(this.env.CONNECT_STREAM_REVALIDATE_MS, "CONNECT_STREAM_REVALIDATE_MS"), read, () => !descriptor || !this.isFenced(descriptor));
+    if (streaming) return this.eventHub.stream(after, policy(this.env.CONNECT_STREAM_REVALIDATE_MS, "CONNECT_STREAM_REVALIDATE_MS"), read, () => !descriptor || !this.isFenced(descriptor), requestId === undefined ? undefined : event => (event.event as { type?: unknown } | undefined)?.type === "result");
     return json(read(after));
   }
 

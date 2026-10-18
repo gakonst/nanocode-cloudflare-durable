@@ -17,9 +17,14 @@ const CODEX_ERROR_CODES = new Set(["context_length_exceeded", "insufficient_quot
 const CACHE_LIMIT = 1024;
 const AUTHORITY_BODY_LIMIT = 256 * 1024;
 const SERVICE_BODY_LIMIT = 33 << 20;
+const DIAGNOSTIC_LIMIT = 64;
+const DIAGNOSTIC_MAX_MS = 3_600_000;
 
 type Granted = Extract<Access, { ok: true }>;
 type Entry = { access: Granted; until: number };
+type DiagnosticOrigin = "local_validation" | "authority" | "provider_http" | "transport" | "projection";
+type DiagnosticMime = "json" | "html" | "event_stream" | "other" | "missing";
+type ModelDiagnostic = { provider: "claude" | "codex"; attempt: 1 | 2; status: number; origin: DiagnosticOrigin; auth_lookup_ms: number; fetch_header_ms: number; error_projection_ms: number; mime: DiagnosticMime; mitigated: boolean; auth_error: boolean; request_id: boolean };
 
 const metrics = {
   model_requests: 0,
@@ -40,9 +45,38 @@ const metrics = {
 };
 const cache = new Map<string, Entry>();
 const inflight = new Map<string, Promise<Access>>();
+const diagnostics: ModelDiagnostic[] = [];
 
 function snapshot() {
   return { ...metrics, cache_entries: cache.size, inflight: inflight.size };
+}
+
+function diagnostic(provider: ModelProvider, attempt: 1 | 2, origin: DiagnosticOrigin): ModelDiagnostic {
+  return { provider: provider === "codex" ? "codex" : "claude", attempt, status: 0, origin, auth_lookup_ms: 0, fetch_header_ms: 0, error_projection_ms: 0, mime: "missing", mitigated: false, auth_error: false, request_id: false };
+}
+
+function elapsed(start: number): number {
+  const ms = Math.floor(Date.now() - start);
+  return Number.isFinite(ms) ? Math.min(Math.max(ms, 0), DIAGNOSTIC_MAX_MS) : 0;
+}
+
+function statusOf(status: unknown): number {
+  return typeof status === "number" && Number.isSafeInteger(status) && status >= 0 && status <= 999 ? status : 0;
+}
+
+function classify(trace: ModelDiagnostic, response: Response): void {
+  const type = response.headers.get("content-type");
+  trace.status = statusOf(response.status);
+  trace.origin = "provider_http";
+  trace.mime = type === null ? "missing" : /^application\/([a-z0-9.+-]*\+)?json\s*(;|$)/i.test(type) ? "json" : /^text\/html\s*(;|$)/i.test(type) ? "html" : /^text\/event-stream\s*(;|$)/i.test(type) ? "event_stream" : "other";
+  trace.mitigated = response.headers.has("cf-mitigated");
+  trace.auth_error = response.headers.has("x-openai-authorization-error");
+  trace.request_id = response.headers.has("x-request-id") || response.headers.has("x-oai-request-id") || response.headers.has("request-id");
+}
+
+function record(trace: ModelDiagnostic): void {
+  diagnostics.push({ provider: trace.provider, attempt: trace.attempt, status: statusOf(trace.status), origin: trace.origin, auth_lookup_ms: trace.auth_lookup_ms, fetch_header_ms: trace.fetch_header_ms, error_projection_ms: trace.error_projection_ms, mime: trace.mime, mitigated: trace.mitigated, auth_error: trace.auth_error, request_id: trace.request_id });
+  if (diagnostics.length > DIAGNOSTIC_LIMIT) diagnostics.splice(0, diagnostics.length - DIAGNOSTIC_LIMIT);
 }
 
 function account(env: EgressEnv, id: string) {
@@ -219,7 +253,7 @@ async function projectModel(response: Response, provider: ModelProvider = "claud
 
 export class SessionEgress extends WorkerEntrypoint<EgressEnv> {
   async fetch(request: Request): Promise<Response> {
-    if (request.method === "GET") return json({ ok: true, metrics: snapshot() });
+    if (request.method === "GET") return json({ ok: true, metrics: { ...snapshot(), model_diagnostics: diagnostics } });
     if (request.method !== "POST") return json({ error: "method_not_allowed" }, 405);
     const path = new URL(request.url).pathname;
     if (path === "/connections" || path === "/connector") {
@@ -241,6 +275,8 @@ export class SessionEgress extends WorkerEntrypoint<EgressEnv> {
     if (path !== "/model") return json({ error: "not_found" }, 404);
     metrics.model_requests++;
     let provider: ModelProvider = "claude";
+    let trace: ModelDiagnostic | null = null;
+    let started = 0;
     try {
       let dispatch: ModelDispatch;
       try { dispatch = await request.json<ModelDispatch>(); } catch { throw new Failure(400, "invalid_request"); }
@@ -262,28 +298,74 @@ export class SessionEgress extends WorkerEntrypoint<EgressEnv> {
         endpoint = modelEndpoint(this.env);
         headers = modelHeaders(dispatch.headers, subscription);
       }
+      trace = diagnostic(provider, 1, "authority");
+      started = Date.now();
       const first = await resolveModel(this.env, authority, provider);
-      if (!first.ok) return egressError(first, provider);
+      trace.auth_lookup_ms = elapsed(started);
+      if (!first.ok) {
+        trace.status = statusOf(first.status);
+        record(trace);
+        return egressError(first, provider);
+      }
+      trace.origin = "transport";
+      started = Date.now();
       let response = await sendModel(endpoint, headers, first, dispatch.body, request.signal);
+      trace.fetch_header_ms = elapsed(started);
+      classify(trace, response);
       if (response.status === 401) {
         metrics.model_unauthorized++;
+        started = Date.now();
         await response.body?.cancel();
+        record(trace);
+        trace = diagnostic(provider, 2, "authority");
+        started = Date.now();
         const next = await resolveModel(this.env, authority, provider, first.generation);
-        if (!next.ok) return egressError(next, provider);
+        trace.auth_lookup_ms = elapsed(started);
+        if (!next.ok) {
+          trace.status = statusOf(next.status);
+          record(trace);
+          return egressError(next, provider);
+        }
         if (next.generation === first.generation) {
+          trace.status = 401;
+          record(trace);
           if (provider === "codex") return codexError(401, { type: "authentication_error", message: "Provider request failed" });
           return providerError(401, "authentication_error", "Provider request failed");
         }
         metrics.model_recoveries++;
+        trace.origin = "transport";
+        started = Date.now();
         response = await sendModel(endpoint, headers, next, dispatch.body, request.signal);
+        trace.fetch_header_ms = elapsed(started);
+        classify(trace, response);
         if (response.status === 401) {
           const key = cacheKey(authority, provider);
           if (cache.get(key)?.access.generation === next.generation) cache.delete(key);
         }
       }
-      return await projectModel(response, provider);
+      started = Date.now();
+      const projected = await projectModel(response, provider);
+      if (!response.ok) trace.error_projection_ms = elapsed(started);
+      record(trace);
+      return projected;
     } catch (error) {
-      return egressError(denial(error), provider);
+      const failure = denial(error);
+      if (trace) {
+        if (trace.origin === "provider_http") {
+          trace.origin = "projection";
+          trace.error_projection_ms = elapsed(started);
+        } else {
+          if (trace.origin === "authority") trace.auth_lookup_ms = elapsed(started);
+          if (trace.origin === "transport") trace.fetch_header_ms = elapsed(started);
+          trace.status = statusOf(failure.status);
+        }
+        record(trace);
+      } else {
+        const local = diagnostic(provider, 1, "local_validation");
+        local.status = statusOf(failure.status);
+        record(local);
+      }
+      return egressError(failure, provider);
     }
   }
 }

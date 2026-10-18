@@ -1,4 +1,4 @@
-import { json } from "../contracts";
+import { EXECUTOR_ID, json } from "../contracts";
 import { authorize, ConnectError, delegation, readText, SCOPES, text, threadId, withCors, type ConnectEnv, type Delegation } from "./common";
 import { cancelTurn, cursor, eventPage, serviceCall, serviceInput, submitTurn, turnInput, turnStatus } from "./hosted";
 
@@ -10,7 +10,7 @@ const TOOLS = {
   "agent.turn": {
     scope: SCOPES.write,
     description: "Submit a prompt to a hosted agent thread. Omit thread_id to create a thread. Returns the queued or saved turn.",
-    inputSchema: { type: "object", properties: { thread_id: { type: "string", format: "uuid" }, request_id: { type: "string", minLength: 1, maxLength: 256 }, prompt: { type: "string", minLength: 1 } }, required: ["request_id", "prompt"], additionalProperties: false },
+    inputSchema: { type: "object", properties: { thread_id: { type: "string", format: "uuid" }, request_id: { type: "string", minLength: 1, maxLength: 256 }, prompt: { type: "string", minLength: 1 }, provider: { type: "string", enum: ["claude", "codex"] }, executor: { type: "string", pattern: EXECUTOR_ID.source } }, required: ["request_id", "prompt"], additionalProperties: false },
   },
   "agent.status": {
     scope: SCOPES.read,
