@@ -73,9 +73,9 @@ export class CheckpointStore {
       }
       case "replace": {
         const value = this.storage.transactionSync(() => {
-          const owner = this.row("SELECT owner, fence FROM owners WHERE id = ?", id);
+          const owner = this.row("SELECT owners.owner, owners.fence, COALESCE(states.revision, '0') AS revision FROM owners LEFT JOIN states ON states.id = owners.id WHERE owners.id = ?", id);
           if (!owner || owner.owner !== request.owner_id || owner.fence !== request.fence) throw new StoreFailure("fenced", "state owner was fenced");
-          const actual = String(this.row("SELECT revision FROM states WHERE id = ?", id)?.revision ?? "0");
+          const actual = String(owner.revision);
           if (actual !== request.expected_revision) throw new StoreFailure("conflict", "state revision conflict", request.expected_revision, actual);
           const revision = this.increment(actual);
           for (const record of request.records) {
