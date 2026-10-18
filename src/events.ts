@@ -46,7 +46,8 @@ export class EventHub {
               release = undefined;
               cursor = page.next_cursor;
               complete = !!finished && page.events.some(finished);
-              controller.enqueue(encoder.encode(page.events.map(event => `id: ${event.seq}\ndata: ${JSON.stringify(event)}\n\n`).join("")));
+              const streamedAt = Date.now();
+              controller.enqueue(encoder.encode(page.events.map(event => `id: ${event.seq}\ndata: ${JSON.stringify({ ...event, streamed_at: streamedAt })}\n\n`).join("")));
               return;
             }
             await ready;

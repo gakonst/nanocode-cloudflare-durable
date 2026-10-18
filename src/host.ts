@@ -1,6 +1,7 @@
 import module from "../dist/nanocode_worker.wasm";
-import type { AgentConfiguration, AgentInput, AgentResult, RuntimeOptions } from "./contracts";
+import { RECENT_MODEL_LIMIT, type AgentConfiguration, type AgentInput, type AgentResult, type ModelTiming, type RuntimeOptions } from "./contracts";
 import { CheckpointStore, StoreFailure } from "./store";
+import { Timings, type TimingSnapshot } from "./timing";
 
 type Exports = {
   memory: WebAssembly.Memory;
@@ -18,6 +19,7 @@ export type TurnOutcome = AgentResult & { waiting?: boolean };
 export type RuntimeActivity = { pending: string[]; quiescent: boolean; activity: unknown };
 
 export type RuntimeMetrics = {
+  timing: { runtime_id: string; started_at: number; elapsed_ms: number; spans: TimingSnapshot; checkpoints: TimingSnapshot; models: ModelTiming[] };
   initializations: number;
   runs: number;
   completed: number;
@@ -37,22 +39,31 @@ export type RuntimeMetrics = {
   host_cancellations: number;
   dropped_replies: number;
   disposals: number;
+  bridge_request_bytes: number;
+  bridge_reply_bytes: number;
 };
 
 const STORE_OPERATIONS = new Set(["peek", "read_record", "read_records", "list_states", "acquire", "replace"]);
 
 export class AgentRuntime {
+  private readonly runtimeId = crypto.randomUUID();
+  private readonly startedAt = Date.now();
+  private readonly started = performance.now();
+  private readonly timings = new Timings();
+  private readonly checkpointTimings = new Timings();
+  private readonly models: (ModelTiming & { runtime_id: string })[] = [];
   private wasm!: Exports;
   private readonly encoder = new TextEncoder();
   private readonly decoder = new TextDecoder();
   private readonly inflight = new Map<number, () => void>();
-  private readonly bodies = new Map<number, ReadableStreamDefaultReader<Uint8Array>>();
+  private readonly bodies = new Map<number, { reader: ReadableStreamDefaultReader<Uint8Array>; timing: ModelTiming }>();
   private readonly commands = new Map<number, Pending>();
   private readonly watchers = new Set<() => void>();
-  private readonly counters: RuntimeMetrics = {
+  private readonly counters: Omit<RuntimeMetrics, "timing"> = {
     initializations: 0, runs: 0, completed: 0, failed: 0, cancelled: 0, retries: 0, waits: 0, resumes: 0, rejected_runs: 0, cancellations: 0,
     host_calls: 0, store_calls: 0, model_requests: 0, body_reads: 0, event_batches: 0, events: 0,
     host_cancellations: 0, dropped_replies: 0, disposals: 0,
+    bridge_request_bytes: 0, bridge_reply_bytes: 0,
   };
   private nextBody = 0;
   private nextCommand = 0;
@@ -67,10 +78,14 @@ export class AgentRuntime {
 
   static async create(config: AgentConfiguration, store: CheckpointStore, options: RuntimeOptions): Promise<AgentRuntime> {
     const runtime = new AgentRuntime(store, options);
+    const instantiateStarted = performance.now();
     const instance = await WebAssembly.instantiate(module, { host: runtime.imports() });
+    runtime.timings.record("wasm.instantiate", performance.now() - instantiateStarted);
     runtime.wasm = instance.exports as unknown as Exports;
     try {
+      const initStarted = performance.now();
       const opened = await runtime.command({ op: "init", config: { session_id: config.session_id, provider: config.provider ?? "claude", subscription: config.subscription, endpoint: config.endpoint, remote: config.remote ?? false } }) as { pending: string[] };
+      runtime.timings.record("sdk.open", performance.now() - initStarted);
       runtime.pendingAtOpen = opened.pending;
     } catch (error) {
       runtime.terminate(error);
@@ -81,7 +96,7 @@ export class AgentRuntime {
   }
 
   get metrics(): Readonly<RuntimeMetrics> {
-    return { ...this.counters };
+    return { ...this.counters, timing: { runtime_id: this.runtimeId, started_at: this.startedAt, elapsed_ms: this.elapsed(), spans: this.timings.snapshot(), checkpoints: this.checkpointTimings.snapshot(), models: this.models.map(value => ({ ...value })) } };
   }
 
   get closed(): boolean {
@@ -185,11 +200,20 @@ export class AgentRuntime {
   private imports() {
     return {
       dispatch: (id: number, pointer: number, length: number) => {
+        const received = performance.now();
         const request = JSON.parse(this.read(pointer, length));
+        this.counters.bridge_request_bytes += length;
+        this.timings.record("bridge.decode", performance.now() - received);
+        if (request.op === "events") request.events = request.events.map((event: object) => ({ ...event, host_timing: { runtime_id: this.runtimeId, received_ms: received - this.started } }));
         this.counters.host_calls++;
         this.inflight.set(id, () => {});
         void Promise.resolve()
-          .then(() => this.execute(id, request))
+          .then(async () => {
+            const started = performance.now();
+            this.timings.record(`queue.${request.op}`, started - received);
+            try { return await this.execute(id, request); }
+            finally { this.timings.record(`host.${request.op}`, performance.now() - started); }
+          })
           .then(ok => ({ ok }), error => ({ error: AgentRuntime.encodeError(error) }))
           .then(reply => this.complete(id, reply));
       },
@@ -244,41 +268,63 @@ export class AgentRuntime {
         this.counters.model_requests++;
         const controller = new AbortController();
         this.onCancel(id, () => controller.abort());
-        const response = await this.options.dispatch({ endpoint: request.endpoint, headers: request.headers, body: request.body }, controller.signal);
+        const timing: ModelTiming & { runtime_id: string } = { runtime_id: this.runtimeId, dispatch_id: id, started_ms: this.elapsed(), body_read_wait_ms: 0, body_reads: 0, bytes: 0, max_chunk_gap_ms: 0 };
+        this.models.push(timing);
+        if (this.models.length > RECENT_MODEL_LIMIT) this.models.shift();
+        let response: Response;
+        try { response = await this.options.dispatch({ endpoint: request.endpoint, headers: request.headers, body: request.body }, controller.signal, timing); }
+        catch (error) { this.finishModel(timing, controller.signal.aborted ? "cancelled" : "failed"); throw error; }
+        timing.headers_ms = this.elapsed() - timing.started_ms;
+        timing.status = response.status;
         if (!this.live(id)) {
           void response.body?.cancel().catch(() => undefined);
+          this.finishModel(timing, "cancelled");
           return null;
         }
         if (response.status >= 300 && response.status < 400) {
           void response.body?.cancel().catch(() => undefined);
+          this.finishModel(timing, "failed");
           throw new Error("provider redirect rejected");
         }
-        if (!response.body) throw new Error("provider response has no body");
+        if (!response.body) { this.finishModel(timing, "failed"); throw new Error("provider response has no body"); }
         const body = ++this.nextBody;
-        this.bodies.set(body, response.body.getReader());
+        this.bodies.set(body, { reader: response.body.getReader(), timing });
         return { id: body, status: response.status, headers: [...response.headers] };
       }
       case "http_read": {
-        const reader = this.bodies.get(request.id);
-        if (!reader) throw new Error("provider response body is closed");
+        const body = this.bodies.get(request.id);
+        if (!body) throw new Error("provider response body is closed");
+        const { reader, timing } = body;
         this.counters.body_reads++;
         this.onCancel(id, () => {
           this.bodies.delete(request.id);
+          this.finishModel(timing, "cancelled");
           void reader.cancel().catch(() => undefined);
         });
-        const chunk = await reader.read();
+        const readStarted = performance.now();
+        let chunk: ReadableStreamReadResult<Uint8Array>;
+        try { chunk = await reader.read(); }
+        catch (error) { this.finishModel(timing, "failed"); throw error; }
+        finally { timing.body_read_wait_ms += performance.now() - readStarted; timing.body_reads++; }
         if (chunk.done) {
           this.bodies.delete(request.id);
           reader.releaseLock();
+          this.finishModel(timing, "eof");
           return null;
         }
+        const at = this.elapsed() - timing.started_ms;
+        if (chunk.value.byteLength) timing.first_byte_ms ??= at;
+        if (timing.last_byte_ms !== undefined) timing.max_chunk_gap_ms = Math.max(timing.max_chunk_gap_ms, at - timing.last_byte_ms);
+        timing.last_byte_ms = at;
+        timing.bytes += chunk.value.byteLength;
         return chunk.value;
       }
       case "http_close": {
-        const reader = this.bodies.get(request.id);
-        if (reader) {
+        const body = this.bodies.get(request.id);
+        if (body) {
           this.bodies.delete(request.id);
-          await reader.cancel().catch(() => undefined);
+          this.finishModel(body.timing, "closed");
+          await body.reader.cancel().catch(() => undefined);
         }
         return null;
       }
@@ -305,7 +351,7 @@ export class AgentRuntime {
       default: {
         if (!STORE_OPERATIONS.has(request.op)) throw new Error("unsupported host operation");
         this.counters.store_calls++;
-        return this.store.execute(request);
+        return this.store.execute(request, this.checkpointTimings);
       }
     }
   }
@@ -342,12 +388,14 @@ export class AgentRuntime {
     }
     if (this.stopped) return;
     this.depth++;
+    const started = performance.now();
     try {
       call();
       this.wasm.poll();
     } catch (error) {
       this.fail(error);
     } finally {
+      this.timings.record("wasm.enter", performance.now() - started);
       this.depth--;
     }
   }
@@ -364,7 +412,7 @@ export class AgentRuntime {
     this.counters.host_cancellations += cancellations.length;
     this.inflight.clear();
     for (const cancel of cancellations) cancel();
-    for (const reader of this.bodies.values()) void reader.cancel().catch(() => undefined);
+    for (const { reader, timing } of this.bodies.values()) { this.finishModel(timing, "cancelled"); void reader.cancel().catch(() => undefined); }
     this.bodies.clear();
     const commands = [...this.commands.values()];
     this.commands.clear();
@@ -377,12 +425,17 @@ export class AgentRuntime {
   }
 
   private write(value: unknown) {
-    return this.writeBytes(this.encoder.encode(JSON.stringify(value)));
+    const started = performance.now();
+    try { return this.writeBytes(this.encoder.encode(JSON.stringify(value))); }
+    finally { this.timings.record("bridge.encode", performance.now() - started); }
   }
 
   private writeBytes(bytes: Uint8Array) {
+    const started = performance.now();
+    this.counters.bridge_reply_bytes += bytes.byteLength;
     const pointer = this.wasm.allocate(bytes.length);
     new Uint8Array(this.wasm.memory.buffer, pointer, bytes.length).set(bytes);
+    this.timings.record("bridge.copy", performance.now() - started);
     return [pointer, bytes.length] as const;
   }
 
@@ -390,5 +443,13 @@ export class AgentRuntime {
     return error instanceof StoreFailure
       ? { kind: error.kind, detail: error.message, expected: error.expected, actual: error.actual }
       : { kind: "backend", detail: error instanceof Error ? error.message : String(error) };
+  }
+
+  private elapsed(): number { return performance.now() - this.started; }
+
+  private finishModel(timing: ModelTiming, outcome: ModelTiming["outcome"]): void {
+    if (timing.outcome) return;
+    timing.outcome = outcome;
+    timing.duration_ms = this.elapsed() - timing.started_ms;
   }
 }

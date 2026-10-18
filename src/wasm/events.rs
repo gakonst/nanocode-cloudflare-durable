@@ -6,8 +6,8 @@ use std::{
 };
 
 use futures_channel::oneshot;
-use futures_util::StreamExt;
 use nanocode::{AgentEvents, AgentUpdate, ScopedAgentUpdate, SubagentUpdates};
+use nanocode::agent::events::monotonic_now_ns;
 use serde_json::{Value, json};
 
 use super::bridge::call;
@@ -64,11 +64,12 @@ impl Sources {
         while batch.len() < BATCH {
             let mut progressed = false;
             if let Some(agent) = &mut self.agent {
-                match agent.poll_next_unpin(context) {
-                    Poll::Ready(Some(event)) => {
+                match agent.poll_recv_timed(context) {
+                    Poll::Ready(Some(timed)) => {
                         progressed = true;
-                        match serde_json::to_value(event) {
-                            Ok(event) => batch.push(json!({"source": "agent", "event": event})),
+                        let received_ns = monotonic_now_ns();
+                        match serde_json::to_value(timed.event) {
+                            Ok(event) => batch.push(json!({"source": "agent", "event": event, "sdk_timing": {"emitted_ns": timed.timing.emitted_ns, "received_ns": received_ns, "queue_ns": received_ns.saturating_sub(timed.timing.emitted_ns), "source_received_ns": timed.timing.source_received_ns}})),
                             Err(error) => return Poll::Ready(Some(Err(error))),
                         }
                     }

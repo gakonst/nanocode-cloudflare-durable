@@ -1,3 +1,5 @@
+import { Timings } from "./timing";
+
 type Row = Record<string, SqlStorageValue>;
 
 export class StoreFailure extends Error {
@@ -7,6 +9,7 @@ export class StoreFailure extends Error {
 }
 
 export class CheckpointStore {
+  readonly timings = new Timings();
   readonly metrics = { operations: {} as Record<string, number>, point_queries: 0 };
   constructor(readonly storage: DurableObjectStorage) {
     storage.sql.exec(`
@@ -26,7 +29,27 @@ export class CheckpointStore {
     return row ?? { revision: "0", payload: null };
   }
 
-  async execute(request: any): Promise<unknown> {
+  async execute(request: any, observer?: Timings): Promise<unknown> {
+    const started = performance.now();
+    try { return await this.operation(request, observer); }
+    finally {
+      const elapsed = performance.now() - started;
+      this.timings.record(request.op, elapsed);
+      observer?.record(request.op, elapsed);
+    }
+  }
+
+  private async sync(operation: string, observer?: Timings): Promise<void> {
+    const started = performance.now();
+    try { await this.storage.sync(); }
+    finally {
+      const elapsed = performance.now() - started;
+      this.timings.record(`${operation}.sync`, elapsed);
+      observer?.record(`${operation}.sync`, elapsed);
+    }
+  }
+
+  private async operation(request: any, observer?: Timings): Promise<unknown> {
     this.metrics.operations[request.op] = (this.metrics.operations[request.op] ?? 0) + 1;
     const id = request.state_id;
     switch (request.op) {
@@ -45,7 +68,7 @@ export class CheckpointStore {
           this.storage.sql.exec("INSERT INTO owners VALUES (?, ?, ?) ON CONFLICT(id) DO UPDATE SET owner = excluded.owner, fence = excluded.fence", id, request.owner_id, fence);
           return { ...this.peek(id), fence };
         });
-        await this.storage.sync();
+        await this.sync("acquire", observer);
         return value;
       }
       case "replace": {
@@ -62,7 +85,7 @@ export class CheckpointStore {
           this.storage.sql.exec("INSERT INTO states VALUES (?, ?, ?) ON CONFLICT(id) DO UPDATE SET revision = excluded.revision, payload = excluded.payload", id, revision, request.payload);
           return { revision };
         });
-        await this.storage.sync();
+        await this.sync("replace", observer);
         return value;
       }
       default: throw new Error("unknown checkpoint operation");

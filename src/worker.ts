@@ -5,7 +5,8 @@ import { EventHub } from "./events";
 import { RemoteExecutor } from "./remote/host";
 import { handleConnect } from "./connect/index";
 export { SubscriptionAuth } from "./auth";
-import { DEFAULT_EXECUTOR, EXECUTOR_ID, LEGACY_RUNNER, runnerConnection, headerJson, json, sessionUuid, type AgentResult, type PrivateBinding, type SessionDescriptor } from "./contracts";
+import { DEFAULT_EXECUTOR, EXECUTOR_ID, LEGACY_RUNNER, RECENT_MODEL_LIMIT, runnerConnection, headerJson, json, sessionUuid, type AgentResult, type PrivateBinding, type SessionDescriptor } from "./contracts";
+import { Timings, timingDifference, type TimingSnapshot } from "./timing";
 
 export interface Env {
   SESSIONS: DurableObjectNamespace<AgentSession>;
@@ -28,6 +29,7 @@ export interface Env {
 
 type Job = { request_id: string; prompt: string; status: string; result: string | null; scope: string; descriptor: string; cancel_requested: number };
 type Running = { job: Job; runtime: AgentRuntime };
+type TurnTiming = { started: number; admitted_at?: number; admission_ms?: number; admission_sync_ms?: number; pump_wait_ms?: number; preparation_sync_ms?: number; runtime_open_ms?: number; runtime_reused?: boolean; running_sync_ms?: number; run_ms?: number; recovered?: boolean; checkpoints: TimingSnapshot; runtime?: TimingSnapshot };
 
 function policy(value: string, name: string): number {
   const number = Number(value);
@@ -47,6 +49,7 @@ async function ownerAuthorized(request: Request, env: Env): Promise<boolean> {
 
 export default {
   async fetch(request, env): Promise<Response> {
+    const started = performance.now();
     const authorized = await ownerAuthorized(request, env);
     const connect = await handleConnect(request, env, authorized);
     if (connect) return connect;
@@ -70,7 +73,11 @@ export default {
     headers.set("x-nanocode-descriptor", headerJson(descriptor));
     const target = new URL(request.url);
     target.pathname = path;
-    return env.SESSIONS.get(env.SESSIONS.idFromName(sessionName), { locationHint: env.SESSION_LOCATION_HINT }).fetch(new Request(target, { method: request.method, headers, body: request.body, redirect: "manual" }));
+    const dispatched = performance.now();
+    const response = await env.SESSIONS.get(env.SESSIONS.idFromName(sessionName), { locationHint: env.SESSION_LOCATION_HINT }).fetch(new Request(target, { method: request.method, headers, body: request.body, redirect: "manual" }));
+    const responseHeaders = new Headers(response.headers);
+    responseHeaders.set("server-timing", `public_pre_session;dur=${dispatched - started}, session_response;dur=${performance.now() - dispatched}`);
+    return new Response(response.body, { status: response.status, statusText: response.statusText, headers: responseHeaders });
   },
 } satisfies ExportedHandler<Env>;
 
@@ -87,10 +94,13 @@ export class SessionControl extends WorkerEntrypoint<Env> {
 export class AgentSession extends DurableObject<Env> {
   private readonly store: CheckpointStore;
   private readonly runtimes = new Map<string, Promise<AgentRuntime>>();
+  private readonly residents = new Map<string, AgentRuntime>();
   private running?: Running;
   private pumping = false;
   private readonly eventHub = new EventHub();
   private readonly modelDiagnostics: { scope: string; value: unknown }[] = [];
+  private readonly timings = new Map<string, Timings>();
+  private readonly turnTimings = new Map<string, TurnTiming>();
   private readonly counts = { runtime_initializations: 0, model_dispatches: 0, events_written: 0, alarms: 0, direct_starts: 0, recoveries: 0 };
 
   constructor(ctx: DurableObjectState, env: Env) {
@@ -113,6 +123,7 @@ export class AgentSession extends DurableObject<Env> {
   }
 
   async fetch(request: Request): Promise<Response> {
+    const admitted = performance.now();
     try {
       const url = new URL(request.url);
       if (url.pathname === "/internal/fence") return await this.fence(request);
@@ -125,7 +136,7 @@ export class AgentSession extends DurableObject<Env> {
       if (this.isFenced(descriptor)) return json({ error: "grant revoked" }, 403);
       const scope = descriptor.grant_id ?? "owner";
       const parts = url.pathname.split("/");
-      if (request.method === "GET" && parts[2] === "metrics") return json({ ...this.counts, model_diagnostics: this.modelDiagnostics.filter(entry => entry.scope === scope).map(entry => entry.value), checkpoints: this.store.metrics, resident_runtimes: this.runtimes.size, runtime: this.running?.runtime.metrics, persisted: this.store.row("SELECT (SELECT COUNT(*) FROM states) AS states, (SELECT COUNT(*) FROM records) AS records, (SELECT COUNT(*) FROM jobs WHERE scope = ? AND status IN ('queued', 'running')) AS unfinished", scope) });
+      if (request.method === "GET" && parts[2] === "metrics") return json({ ...this.counts, model_diagnostics: this.modelDiagnostics.filter(entry => entry.scope === scope).map(entry => entry.value), timing: this.timings.get(scope)?.snapshot() ?? {}, checkpoints: { ...this.store.metrics, timing: this.residents.get(scope)?.metrics.timing.checkpoints ?? {} }, resident_runtimes: this.runtimes.size, runtime: this.residents.get(scope)?.metrics, persisted: this.store.row("SELECT (SELECT COUNT(*) FROM states) AS states, (SELECT COUNT(*) FROM records) AS records, (SELECT COUNT(*) FROM jobs WHERE scope = ? AND status IN ('queued', 'running')) AS unfinished", scope) });
       if (request.method === "GET" && parts[2] === "events") return this.events(scope, url, request.headers.get("accept")?.includes("text/event-stream"), descriptor);
       if (parts[2] === "socket") return json({ error: "use the authenticated event stream" }, 405);
       if (parts[2] === "cancel" && parts.length === 4 && request.method === "POST") return await this.cancel(decodeURIComponent(parts[3]), scope);
@@ -178,10 +189,20 @@ export class AgentSession extends DurableObject<Env> {
           this.ctx.storage.sql.exec("INSERT INTO jobs (request_id, prompt, status, result, scope, descriptor, cancel_requested) VALUES (?, ?, 'queued', NULL, ?, ?, 0)", input.request_id, input.prompt, scope, JSON.stringify(descriptor));
           this.insertEvent(scope, input.request_id, { type: "queued", request_id: input.request_id });
         });
+        this.turnTimings.set(input.request_id, { started: admitted, checkpoints: {} });
       }
       const job = existing ?? this.job(input.request_id)!;
       if ((job.status === "queued" || job.status === "running") && !this.pumping) await this.ctx.storage.setAlarm(Date.now() + policy(this.env.RECOVERY_DELAY_MS, "RECOVERY_DELAY_MS"));
+      const admissionSync = performance.now();
       await this.ctx.storage.sync();
+      if (!existing) {
+        const timing = this.turnTimings.get(input.request_id);
+        if (timing) {
+          timing.admission_sync_ms = performance.now() - admissionSync;
+          timing.admission_ms = performance.now() - admitted;
+          timing.admitted_at = performance.now();
+        }
+      }
       if ((job.status === "queued" || job.status === "running") && !this.pumping) {
         this.counts.direct_starts++;
         this.ctx.waitUntil(this.pump(true));
@@ -231,8 +252,28 @@ export class AgentSession extends DurableObject<Env> {
           if (job.status === "running") this.counts.recoveries++;
         }
       });
+      const preparationSync = performance.now();
       await this.ctx.storage.sync();
+      let timing: TurnTiming | undefined;
+      if (job) {
+        timing = this.turnTimings.get(job.request_id);
+        if (!timing) {
+          timing = { started: preparationSync, recovered: true, checkpoints: {} };
+          this.turnTimings.set(job.request_id, timing);
+        }
+        timing.pump_wait_ms = preparationSync - (timing.admitted_at ?? preparationSync);
+        timing.preparation_sync_ms = performance.now() - preparationSync;
+        timing.runtime_reused = this.runtimes.has(scope);
+      }
+      const runtimeStarted = performance.now();
+      const initializations = this.counts.runtime_initializations;
       runtime = await this.runtime(scope, sessionId, descriptor);
+      if (timing) {
+        timing.runtime_reused = initializations === this.counts.runtime_initializations;
+        timing.runtime_open_ms = performance.now() - runtimeStarted;
+        timing.runtime = timing.runtime_reused ? runtime.metrics.timing.spans : undefined;
+        timing.checkpoints = timing.runtime_reused ? runtime.metrics.timing.checkpoints : {};
+      }
       if (this.isFenced(descriptor)) {
         await runtime.revoke();
         for (const cancelled of this.ctx.storage.sql.exec<Job>("SELECT * FROM jobs WHERE scope = ? AND status IN ('queued', 'running') ORDER BY rowid", scope).toArray()) {
@@ -252,9 +293,14 @@ export class AgentSession extends DurableObject<Env> {
             this.ctx.storage.sql.exec("UPDATE jobs SET status = 'running', result = NULL WHERE request_id = ?", activeJob!.request_id);
             this.insertEvent(scope!, activeJob!.request_id, { type: "running", request_id: activeJob!.request_id });
           });
+          const runningSync = performance.now();
           await this.ctx.storage.sync();
+          const turnTiming = this.turnTimings.get(activeJob.request_id);
+          if (turnTiming) turnTiming.running_sync_ms = performance.now() - runningSync;
           const latest = this.job(activeJob.request_id)!;
+          const runStarted = performance.now();
           const result = latest.cancel_requested ? await runtime.cancel(activeJob.request_id) : await runtime.run({ request_id: activeJob.request_id, prompt: activeJob.prompt });
+          if (turnTiming) turnTiming.run_ms = performance.now() - runStarted;
           if (result.retry) throw new Error("runtime recovery required");
           waiting = !!result.waiting;
           if (!result.waiting) this.finish(activeJob, result);
@@ -270,6 +316,7 @@ export class AgentSession extends DurableObject<Env> {
         this.ctx.storage.sql.exec("DELETE FROM metadata WHERE key = ?", `background:${scope}`);
         if (this.isFenced(descriptor)) {
           this.runtimes.delete(scope);
+          this.residents.delete(scope);
           await runtime.dispose();
         }
       }
@@ -278,8 +325,9 @@ export class AgentSession extends DurableObject<Env> {
       }
       immediate = !!this.store.row("SELECT request_id FROM jobs WHERE status IN ('queued', 'running') LIMIT 1");
     } catch {
+      if (activeJob) this.turnTimings.delete(activeJob.request_id);
       if (activeJob) this.ctx.storage.sql.exec("UPDATE jobs SET result = ? WHERE request_id = ? AND status = 'running'", JSON.stringify({ error: "Agent execution interrupted; recovery scheduled" }), activeJob.request_id);
-      if (scope) this.runtimes.delete(scope);
+      if (scope) { this.runtimes.delete(scope); this.residents.delete(scope); }
       if (runtime) await runtime.dispose().catch(() => {});
     } finally {
       this.running = undefined;
@@ -314,7 +362,7 @@ export class AgentSession extends DurableObject<Env> {
     let resident = this.runtimes.get(scope);
     if (resident) return resident.then(async runtime => {
       if (runtime.reusable) return runtime;
-      if (this.runtimes.get(scope) === resident) this.runtimes.delete(scope);
+      if (this.runtimes.get(scope) === resident) { this.runtimes.delete(scope); this.residents.delete(scope); }
       await runtime.dispose().catch(() => {});
       return this.runtime(scope, sessionId, descriptor);
     });
@@ -325,8 +373,9 @@ export class AgentSession extends DurableObject<Env> {
         const enabled = !!descriptor.executor_id || (this.env.RUNNER_ENABLED === "true" && (!descriptor.grant_id || descriptor.connections?.includes(LEGACY_RUNNER)));
         let remote: RemoteExecutor | undefined;
         let remoteFailed = false;
+        const connectStarted = performance.now();
         const connecting = enabled
-          ? RemoteExecutor.create(this.env.REMOTE, authority, { max_frame_bytes: policy(this.env.REMOTE_MAX_FRAME_BYTES, "REMOTE_MAX_FRAME_BYTES"), timeout_ms: policy(this.env.REMOTE_TIMEOUT_MS, "REMOTE_TIMEOUT_MS") }).then(value => remote = value, error => { remoteFailed = true; throw error; })
+          ? RemoteExecutor.create(this.env.REMOTE, authority, { max_frame_bytes: policy(this.env.REMOTE_MAX_FRAME_BYTES, "REMOTE_MAX_FRAME_BYTES"), timeout_ms: policy(this.env.REMOTE_TIMEOUT_MS, "REMOTE_TIMEOUT_MS") }).then(value => remote = value, error => { remoteFailed = true; throw error; }).finally(() => this.scopeTimings(scope).record("remote.connect", performance.now() - connectStarted))
           : undefined;
         void connecting?.catch(() => {});
         try {
@@ -350,15 +399,17 @@ export class AgentSession extends DurableObject<Env> {
           cancel: id => remote?.cancel(id),
           dispose: async () => { await connecting.then(value => value.dispose(), () => {}); },
         } : undefined,
-        dispatch: async (request, signal) => {
+        dispatch: async (request, signal, timing) => {
           if (this.dispatchBlocked(scope, descriptor)) throw new Error("request authority stopped");
           this.counts.model_dispatches++;
           const response = await this.env.EGRESS.fetch(new Request("https://egress.internal/model", { method: "POST", signal, headers: { "content-type": "application/json" }, body: JSON.stringify({ ...request, authority, provider: descriptor.provider ?? "claude", subscription: descriptor.subscription }) }));
           const diagnostic = response.headers.get("x-nanocode-model-diagnostic");
           if (diagnostic) {
             try {
-              this.modelDiagnostics.push({ scope, value: JSON.parse(diagnostic) });
-              if (this.modelDiagnostics.length > 64) this.modelDiagnostics.shift();
+              const value = JSON.parse(diagnostic);
+              if (timing) timing.diagnostic = value;
+              this.modelDiagnostics.push({ scope, value: { ...value, runtime_id: timing?.runtime_id, dispatch_id: timing?.dispatch_id } });
+              if (this.modelDiagnostics.length > RECENT_MODEL_LIMIT) this.modelDiagnostics.shift();
             } catch {}
             const headers = new Headers(response.headers);
             headers.delete("x-nanocode-model-diagnostic");
@@ -377,19 +428,27 @@ export class AgentSession extends DurableObject<Env> {
         },
       });
         } catch (error) { await connecting?.then(value => value.dispose(), () => {}); throw error; }
-      })();
+      })().then(runtime => {
+        if (this.runtimes.get(scope) === resident) this.residents.set(scope, runtime);
+        return runtime;
+      });
       this.runtimes.set(scope, resident);
-      void resident.catch(() => { if (this.runtimes.get(scope) === resident) this.runtimes.delete(scope); });
+      void resident.catch(() => { if (this.runtimes.get(scope) === resident) { this.runtimes.delete(scope); this.residents.delete(scope); } });
     }
     return resident;
   }
 
   private finish(job: Job, result: AgentResult): void {
     const status = result.cancelled ? "cancelled" : result.error ? "failed" : "completed";
+    const timing = this.turnTimings.get(job.request_id);
+    const runtime = this.running?.job.request_id === job.request_id ? this.running.runtime.metrics.timing : undefined;
+    const { started, admitted_at, checkpoints, runtime: before, ...phases } = timing ?? { started: performance.now(), checkpoints: {} };
+    const measured = { ...result, timing: { ...phases, observed_ms: performance.now() - started, runtime_id: runtime?.runtime_id, checkpoint_spans: timingDifference(runtime?.checkpoints ?? {}, checkpoints), runtime_spans: runtime ? timingDifference(runtime.spans, before ?? {}) : undefined } };
     this.ctx.storage.transactionSync(() => {
-      this.ctx.storage.sql.exec("UPDATE jobs SET status = ?, result = ? WHERE request_id = ?", status, JSON.stringify(result), job.request_id);
-      this.insertEvent(job.scope, job.request_id, { type: "result", request_id: job.request_id, status, ...result });
+      this.ctx.storage.sql.exec("UPDATE jobs SET status = ?, result = ? WHERE request_id = ?", status, JSON.stringify(measured), job.request_id);
+      this.insertEvent(job.scope, job.request_id, { type: "result", request_id: job.request_id, status, ...measured });
     });
+    this.turnTimings.delete(job.request_id);
   }
 
   private async cancel(id: string, scope: string): Promise<Response> {
@@ -482,8 +541,18 @@ export class AgentSession extends DurableObject<Env> {
   }
 
   private async appendEvents(scope: string, requestId: string | null, events: unknown[]): Promise<void> {
+    const started = performance.now();
     this.ctx.storage.transactionSync(() => { for (const event of events) this.insertEvent(scope, requestId, event); });
+    this.scopeTimings(scope).record("events.insert", performance.now() - started);
+    const syncing = performance.now();
     await this.ctx.storage.sync();
+    this.scopeTimings(scope).record("events.sync", performance.now() - syncing);
+  }
+
+  private scopeTimings(scope: string): Timings {
+    let value = this.timings.get(scope);
+    if (!value) { value = new Timings(); this.timings.set(scope, value); }
+    return value;
   }
 
   private job(id: string): Job | undefined {

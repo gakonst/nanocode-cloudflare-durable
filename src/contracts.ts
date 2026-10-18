@@ -87,8 +87,26 @@ export type AgentResult = {
   waiting?: boolean;
 };
 
+export const RECENT_MODEL_LIMIT = 64;
+
+export type ModelTiming = {
+  dispatch_id: number;
+  started_ms: number;
+  headers_ms?: number;
+  first_byte_ms?: number;
+  last_byte_ms?: number;
+  body_read_wait_ms: number;
+  body_reads: number;
+  bytes: number;
+  max_chunk_gap_ms: number;
+  duration_ms?: number;
+  status?: number;
+  outcome?: "eof" | "closed" | "cancelled" | "failed";
+  diagnostic?: unknown;
+};
+
 export type RuntimeOptions = {
-  dispatch(request: { endpoint: string; headers: [string, string][]; body: string }, signal?: AbortSignal): Promise<Response>;
+  dispatch(request: { endpoint: string; headers: [string, string][]; body: string }, signal?: AbortSignal, timing?: ModelTiming & { runtime_id: string }): Promise<Response>;
   wake?(): void;
   event(value: unknown): Promise<void>;
   events?(values: unknown[]): Promise<void>;
