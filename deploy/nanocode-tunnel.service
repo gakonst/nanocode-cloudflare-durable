@@ -1,0 +1,23 @@
+[Unit]
+Description=Nanocode private tunnel
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=nanocode-tunnel
+Group=nanocode-tunnel
+ExecStart=/usr/local/bin/cloudflared tunnel --no-autoupdate --protocol quic --loglevel warn --metrics 127.0.0.1:20241 run --token-file /etc/nanocode-worker/tunnel-token
+Restart=always
+RestartSec=30
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+CapabilityBoundingSet=
+RestrictSUIDSGID=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+
+[Install]
+WantedBy=multi-user.target

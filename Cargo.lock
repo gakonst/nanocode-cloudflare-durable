@@ -1095,6 +1095,7 @@ dependencies = [
  "nanocode-subagents",
  "nanocode-tool-runtime",
  "nanocode-tools",
+ "nix 0.31.3",
  "serde_json",
  "tokio",
 ]

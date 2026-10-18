@@ -20,6 +20,7 @@ export interface EgressEnv {
   RUNNER_URL?: string;
   RUNNER_TOKEN?: string;
   RUNNERS_JSON?: string;
+  CODEX_TRANSPORT?: PrivateBinding;
   [binding: `RUNNER_VPC_${string}`]: unknown;
 }
 

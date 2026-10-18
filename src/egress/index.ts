@@ -1,7 +1,7 @@
 import { WorkerEntrypoint } from "cloudflare:workers";
-import { json, type AuthorityCommand, type AuthorityResult, type ModelDispatch, type ModelProvider, type SessionAuthority } from "../contracts";
+import { json, sessionUuid, type AuthorityCommand, type AuthorityResult, type ModelDispatch, type ModelProvider, type SessionAuthority } from "../contracts";
 import { AccountAuthority, type Access, type ServiceAccess, type ServiceRequest } from "./account";
-import { ACCOUNT_PATTERN, CODEX, connections, encoder, Failure, FORBIDDEN_HEADERS, mode, modelEndpoint, modelProvider, readLimited, setting, SUBSCRIPTION, type Connection, type EgressEnv } from "./common";
+import { ACCOUNT_PATTERN, CODEX, connections, encoder, Failure, FORBIDDEN_HEADERS, mode, modelAccount, modelEndpoint, modelProvider, readLimited, setting, SUBSCRIPTION, type Connection, type EgressEnv } from "./common";
 
 export { AccountAuthority };
 export { RemoteExecutorEgress } from "../remote/egress";
@@ -74,9 +74,19 @@ function classify(trace: ModelDiagnostic, response: Response): void {
   trace.request_id = response.headers.has("x-request-id") || response.headers.has("x-oai-request-id") || response.headers.has("request-id");
 }
 
+function diagnosticValue(trace: ModelDiagnostic): ModelDiagnostic {
+  return { provider: trace.provider, attempt: trace.attempt, status: statusOf(trace.status), origin: trace.origin, auth_lookup_ms: trace.auth_lookup_ms, fetch_header_ms: trace.fetch_header_ms, error_projection_ms: trace.error_projection_ms, mime: trace.mime, mitigated: trace.mitigated, auth_error: trace.auth_error, request_id: trace.request_id };
+}
+
 function record(trace: ModelDiagnostic): void {
-  diagnostics.push({ provider: trace.provider, attempt: trace.attempt, status: statusOf(trace.status), origin: trace.origin, auth_lookup_ms: trace.auth_lookup_ms, fetch_header_ms: trace.fetch_header_ms, error_projection_ms: trace.error_projection_ms, mime: trace.mime, mitigated: trace.mitigated, auth_error: trace.auth_error, request_id: trace.request_id });
+  diagnostics.push(diagnosticValue(trace));
   if (diagnostics.length > DIAGNOSTIC_LIMIT) diagnostics.splice(0, diagnostics.length - DIAGNOSTIC_LIMIT);
+}
+
+function modelResponse(response: Response, trace: ModelDiagnostic): Response {
+  const headers = new Headers(response.headers);
+  headers.set("x-nanocode-model-diagnostic", JSON.stringify(diagnosticValue(trace)));
+  return new Response(response.body, { status: response.status, statusText: response.statusText, headers });
 }
 
 function account(env: EgressEnv, id: string) {
@@ -201,10 +211,11 @@ function codexHeaders(input: unknown): Headers {
   return headers;
 }
 
-function sendModel(endpoint: string, headers: Headers, access: Granted, body: string, signal: AbortSignal): Promise<Response> {
+function sendModel(env: EgressEnv, provider: ModelProvider, endpoint: string, headers: Headers, access: Granted, body: string, signal: AbortSignal): Promise<Response> {
   const outgoing = new Headers(headers);
   for (const [name, value] of access.headers) outgoing.set(name, value);
-  return fetch(endpoint, { method: "POST", headers: outgoing, body, redirect: "manual", signal });
+  const request = new Request(endpoint, { method: "POST", headers: outgoing, body, redirect: "manual", signal });
+  return provider === "codex" && env.CODEX_TRANSPORT ? env.CODEX_TRANSPORT.fetch(request) : fetch(request);
 }
 
 function codexDetail(parsed: any): Record<string, unknown> {
@@ -253,7 +264,26 @@ async function projectModel(response: Response, provider: ModelProvider = "claud
 
 export class SessionEgress extends WorkerEntrypoint<EgressEnv> {
   async fetch(request: Request): Promise<Response> {
-    if (request.method === "GET") return json({ ok: true, metrics: { ...snapshot(), model_diagnostics: diagnostics } });
+    if (request.method === "GET") {
+      if (new URL(request.url).pathname === "/probe/codex") {
+        const id = sessionUuid();
+        const access = await resolveModel(this.env, { account_id: modelAccount(this.env), session_id: id }, "codex");
+        if (!access.ok) return json({ status: access.status, origin: "authority" });
+        const headers = new Headers({ upgrade: "websocket", "openai-beta": "responses_websockets=2026-02-06", "x-openai-internal-codex-responses-lite": "true", "user-agent": "nanocode-worker/0.1.0", "session-id": id, "thread-id": id, "x-client-request-id": id });
+        for (const [name, value] of access.headers) headers.set(name, value);
+        const start = Date.now();
+        try {
+          const request = new Request(CODEX.endpoint, { headers, redirect: "manual" });
+          const response = await (this.env.CODEX_TRANSPORT ? this.env.CODEX_TRANSPORT.fetch(request) : fetch(request));
+          const trace = diagnostic("codex", 1, "provider_http");
+          classify(trace, response);
+          if (response.webSocket) { response.webSocket.accept(); response.webSocket.close(1000, "transport probe"); }
+          else await response.body?.cancel();
+          return json({ status: response.status, mime: trace.mime, milliseconds: elapsed(start), websocket: !!response.webSocket });
+        } catch { return json({ status: 0, origin: "transport", milliseconds: elapsed(start) }); }
+      }
+      return json({ ok: true, metrics: { ...snapshot(), model_diagnostics: diagnostics } });
+    }
     if (request.method !== "POST") return json({ error: "method_not_allowed" }, 405);
     const path = new URL(request.url).pathname;
     if (path === "/connections" || path === "/connector") {
@@ -305,11 +335,11 @@ export class SessionEgress extends WorkerEntrypoint<EgressEnv> {
       if (!first.ok) {
         trace.status = statusOf(first.status);
         record(trace);
-        return egressError(first, provider);
+        return modelResponse(egressError(first, provider), trace);
       }
       trace.origin = "transport";
       started = Date.now();
-      let response = await sendModel(endpoint, headers, first, dispatch.body, request.signal);
+      let response = await sendModel(this.env, provider, endpoint, headers, first, dispatch.body, request.signal);
       trace.fetch_header_ms = elapsed(started);
       classify(trace, response);
       if (response.status === 401) {
@@ -324,18 +354,18 @@ export class SessionEgress extends WorkerEntrypoint<EgressEnv> {
         if (!next.ok) {
           trace.status = statusOf(next.status);
           record(trace);
-          return egressError(next, provider);
+          return modelResponse(egressError(next, provider), trace);
         }
         if (next.generation === first.generation) {
           trace.status = 401;
           record(trace);
-          if (provider === "codex") return codexError(401, { type: "authentication_error", message: "Provider request failed" });
-          return providerError(401, "authentication_error", "Provider request failed");
+          if (provider === "codex") return modelResponse(codexError(401, { type: "authentication_error", message: "Provider request failed" }), trace);
+          return modelResponse(providerError(401, "authentication_error", "Provider request failed"), trace);
         }
         metrics.model_recoveries++;
         trace.origin = "transport";
         started = Date.now();
-        response = await sendModel(endpoint, headers, next, dispatch.body, request.signal);
+        response = await sendModel(this.env, provider, endpoint, headers, next, dispatch.body, request.signal);
         trace.fetch_header_ms = elapsed(started);
         classify(trace, response);
         if (response.status === 401) {
@@ -347,7 +377,7 @@ export class SessionEgress extends WorkerEntrypoint<EgressEnv> {
       const projected = await projectModel(response, provider);
       if (!response.ok) trace.error_projection_ms = elapsed(started);
       record(trace);
-      return projected;
+      return modelResponse(projected, trace);
     } catch (error) {
       const failure = denial(error);
       if (trace) {
@@ -361,11 +391,11 @@ export class SessionEgress extends WorkerEntrypoint<EgressEnv> {
         }
         record(trace);
       } else {
-        const local = diagnostic(provider, 1, "local_validation");
-        local.status = statusOf(failure.status);
-        record(local);
+        trace = diagnostic(provider, 1, "local_validation");
+        trace.status = statusOf(failure.status);
+        record(trace);
       }
-      return egressError(failure, provider);
+      return modelResponse(egressError(failure, provider), trace);
     }
   }
 }

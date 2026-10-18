@@ -23,6 +23,7 @@ export interface Env {
   REMOTE_MAX_FRAME_BYTES: string;
   REMOTE_TIMEOUT_MS: string;
   PUBLIC_ORIGIN?: string;
+  SESSION_LOCATION_HINT?: DurableObjectLocationHint;
 }
 
 type Job = { request_id: string; prompt: string; status: string; result: string | null; scope: string; descriptor: string; cancel_requested: number };
@@ -53,7 +54,7 @@ export default {
     if (!authorized) return json({ error: "unauthorized" }, 401);
     const url = new URL(request.url);
     if (url.pathname === "/health") return json({ ok: true, model: "claude-opus-5-5", models: { claude: "claude-opus-5-5", codex: "gpt-6.1-sol" }, auth: env.MODEL_AUTH, architecture: "session-local", credential_boundary: "private-egress" });
-    if (url.pathname === "/metrics" && request.method === "GET") return env.EGRESS.fetch(new Request("https://egress.internal/metrics"));
+    if (url.pathname === "/metrics" && request.method === "GET") return env.EGRESS.fetch(new Request(url.searchParams.get("probe") === "codex" ? "https://egress.internal/probe/codex" : "https://egress.internal/metrics"));
     const match = /^\/sessions\/([^/]+)(?:\/(turns|events|metrics|socket)(?:\/([^/]+)(?:\/(cancel))?)?)?$/.exec(url.pathname);
     if (!match) return json({ error: "route not found" }, 404);
     let name: string;
@@ -69,7 +70,7 @@ export default {
     headers.set("x-nanocode-descriptor", headerJson(descriptor));
     const target = new URL(request.url);
     target.pathname = path;
-    return env.SESSIONS.get(env.SESSIONS.idFromName(sessionName)).fetch(new Request(target, { method: request.method, headers, body: request.body, redirect: "manual" }));
+    return env.SESSIONS.get(env.SESSIONS.idFromName(sessionName), { locationHint: env.SESSION_LOCATION_HINT }).fetch(new Request(target, { method: request.method, headers, body: request.body, redirect: "manual" }));
   },
 } satisfies ExportedHandler<Env>;
 
@@ -79,7 +80,7 @@ export class SessionControl extends WorkerEntrypoint<Env> {
     let input: any;
     try { input = await request.json(); } catch { return json({ error: "invalid JSON" }, 400); }
     if (typeof input?.account_id !== "string" || typeof input.grant_id !== "string" || typeof input.session_name !== "string" || !Number.isSafeInteger(input.revision) || input.revision < 1) return json({ error: "invalid fence" }, 400);
-    return this.env.SESSIONS.get(this.env.SESSIONS.idFromName(input.session_name)).fetch(new Request("https://session.internal/internal/fence", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(input) }));
+    return this.env.SESSIONS.get(this.env.SESSIONS.idFromName(input.session_name), { locationHint: this.env.SESSION_LOCATION_HINT }).fetch(new Request("https://session.internal/internal/fence", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(input) }));
   }
 }
 
@@ -89,6 +90,7 @@ export class AgentSession extends DurableObject<Env> {
   private running?: Running;
   private pumping = false;
   private readonly eventHub = new EventHub();
+  private readonly modelDiagnostics: { scope: string; value: unknown }[] = [];
   private readonly counts = { runtime_initializations: 0, model_dispatches: 0, events_written: 0, alarms: 0, direct_starts: 0, recoveries: 0 };
 
   constructor(ctx: DurableObjectState, env: Env) {
@@ -123,7 +125,7 @@ export class AgentSession extends DurableObject<Env> {
       if (this.isFenced(descriptor)) return json({ error: "grant revoked" }, 403);
       const scope = descriptor.grant_id ?? "owner";
       const parts = url.pathname.split("/");
-      if (request.method === "GET" && parts[2] === "metrics") return json({ ...this.counts, checkpoints: this.store.metrics, resident_runtimes: this.runtimes.size, runtime: this.running?.runtime.metrics, persisted: this.store.row("SELECT (SELECT COUNT(*) FROM states) AS states, (SELECT COUNT(*) FROM records) AS records, (SELECT COUNT(*) FROM jobs WHERE scope = ? AND status IN ('queued', 'running')) AS unfinished", scope) });
+      if (request.method === "GET" && parts[2] === "metrics") return json({ ...this.counts, model_diagnostics: this.modelDiagnostics.filter(entry => entry.scope === scope).map(entry => entry.value), checkpoints: this.store.metrics, resident_runtimes: this.runtimes.size, runtime: this.running?.runtime.metrics, persisted: this.store.row("SELECT (SELECT COUNT(*) FROM states) AS states, (SELECT COUNT(*) FROM records) AS records, (SELECT COUNT(*) FROM jobs WHERE scope = ? AND status IN ('queued', 'running')) AS unfinished", scope) });
       if (request.method === "GET" && parts[2] === "events") return this.events(scope, url, request.headers.get("accept")?.includes("text/event-stream"), descriptor);
       if (parts[2] === "socket") return json({ error: "use the authenticated event stream" }, 405);
       if (parts[2] === "cancel" && parts.length === 4 && request.method === "POST") return await this.cancel(decodeURIComponent(parts[3]), scope);
@@ -172,6 +174,7 @@ export class AgentSession extends DurableObject<Env> {
           this.ctx.storage.sql.exec("INSERT INTO metadata VALUES (?, ?) ON CONFLICT(key) DO NOTHING", providerKey, descriptor.provider!);
           this.ctx.storage.sql.exec("INSERT INTO metadata VALUES (?, ?) ON CONFLICT(key) DO NOTHING", executorKey, executor);
           this.sessionId(scope, descriptor.session_id);
+          this.ctx.storage.sql.exec("INSERT INTO metadata VALUES (?, ?) ON CONFLICT(key) DO NOTHING", `background:${scope}`, JSON.stringify(descriptor));
           this.ctx.storage.sql.exec("INSERT INTO jobs (request_id, prompt, status, result, scope, descriptor, cancel_requested) VALUES (?, ?, 'queued', NULL, ?, ?, 0)", input.request_id, input.prompt, scope, JSON.stringify(descriptor));
           this.insertEvent(scope, input.request_id, { type: "queued", request_id: input.request_id });
         });
@@ -181,7 +184,7 @@ export class AgentSession extends DurableObject<Env> {
       await this.ctx.storage.sync();
       if ((job.status === "queued" || job.status === "running") && !this.pumping) {
         this.counts.direct_starts++;
-        this.ctx.waitUntil(this.pump());
+        this.ctx.waitUntil(this.pump(true));
       }
       if (streaming) {
         const cursor = Number(url.searchParams.get("after") ?? "0");
@@ -202,7 +205,7 @@ export class AgentSession extends DurableObject<Env> {
     await this.pump();
   }
 
-  private async pump(): Promise<void> {
+  private async pump(watchdogArmed = false): Promise<void> {
     const delay = policy(this.env.RECOVERY_DELAY_MS, "RECOVERY_DELAY_MS");
     if (this.pumping) { await this.ctx.storage.setAlarm(Date.now() + delay); return; }
     this.pumping = true;
@@ -212,7 +215,7 @@ export class AgentSession extends DurableObject<Env> {
     let waiting = false;
     let activeJob: Job | undefined;
     try {
-      await this.ctx.storage.setAlarm(Date.now() + delay);
+      if (!watchdogArmed) await this.ctx.storage.setAlarm(Date.now() + delay);
       const job = this.ctx.storage.sql.exec<Job>("SELECT * FROM jobs WHERE status IN ('queued', 'running') ORDER BY rowid LIMIT 1").toArray()[0];
       const background = this.store.row("SELECT key, value FROM metadata WHERE key LIKE 'background:%' ORDER BY key LIMIT 1");
       if (!job && !background) return;
@@ -220,7 +223,8 @@ export class AgentSession extends DurableObject<Env> {
       const descriptor: SessionDescriptor = job ? this.descriptor(job) : JSON.parse(String(background!.value));
       let sessionId!: string;
       this.ctx.storage.transactionSync(() => {
-        this.ctx.storage.sql.exec("INSERT INTO metadata VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", `background:${scope}`, JSON.stringify(descriptor));
+        const serialized = JSON.stringify(descriptor);
+        if (!watchdogArmed || background?.key !== `background:${scope}` || background.value !== serialized) this.ctx.storage.sql.exec("INSERT INTO metadata VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", `background:${scope}`, serialized);
         sessionId = this.sessionId(scope!, descriptor.session_id);
         if (job) {
           activeJob = job;
@@ -285,7 +289,7 @@ export class AgentSession extends DurableObject<Env> {
       if (unfinished || background) await this.ctx.storage.setAlarm(Date.now() + delay);
       else await this.ctx.storage.deleteAlarm();
       await this.ctx.storage.sync();
-      if (immediate && unfinished) this.ctx.waitUntil(this.pump());
+      if (immediate && unfinished) this.ctx.waitUntil(this.pump(true));
     }
   }
 
@@ -349,7 +353,18 @@ export class AgentSession extends DurableObject<Env> {
         dispatch: async (request, signal) => {
           if (this.dispatchBlocked(scope, descriptor)) throw new Error("request authority stopped");
           this.counts.model_dispatches++;
-          return this.env.EGRESS.fetch(new Request("https://egress.internal/model", { method: "POST", signal, headers: { "content-type": "application/json" }, body: JSON.stringify({ ...request, authority, provider: descriptor.provider ?? "claude", subscription: descriptor.subscription }) }));
+          const response = await this.env.EGRESS.fetch(new Request("https://egress.internal/model", { method: "POST", signal, headers: { "content-type": "application/json" }, body: JSON.stringify({ ...request, authority, provider: descriptor.provider ?? "claude", subscription: descriptor.subscription }) }));
+          const diagnostic = response.headers.get("x-nanocode-model-diagnostic");
+          if (diagnostic) {
+            try {
+              this.modelDiagnostics.push({ scope, value: JSON.parse(diagnostic) });
+              if (this.modelDiagnostics.length > 64) this.modelDiagnostics.shift();
+            } catch {}
+            const headers = new Headers(response.headers);
+            headers.delete("x-nanocode-model-diagnostic");
+            return new Response(response.body, { status: response.status, statusText: response.statusText, headers });
+          }
+          return response;
         },
         wake: () => this.eventHub.notify(),
         event: event => this.appendEvent(scope, null, event),

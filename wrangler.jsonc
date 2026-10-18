@@ -22,6 +22,7 @@
   ],
   "vars": {
     "ACCOUNT_ID": "default",
+    "SESSION_LOCATION_HINT": "enam",
     "MODEL_AUTH": "subscription",
     "RECOVERY_DELAY_MS": "30000",
     "CONNECT_STREAM_REVALIDATE_MS": "5000",

@@ -7,6 +7,7 @@ export interface ConnectEnv {
   ACCOUNT_ID: string;
   CONNECT_STREAM_REVALIDATE_MS: string;
   PUBLIC_ORIGIN?: string;
+  SESSION_LOCATION_HINT?: DurableObjectLocationHint;
 }
 
 export type Delegation = { token: string; account: string; origin: string; cors: string | null };
@@ -251,7 +252,7 @@ function headerJson(value: unknown): string {
 
 export async function sessionFetch(env: ConnectEnv, descriptor: SessionDescriptor, path: string, method: string, body?: unknown, accept?: string): Promise<Response> {
   const sessions: DurableObjectNamespace = env.SESSIONS;
-  const stub = sessions.get(sessions.idFromName(descriptor.session_name));
+  const stub = sessions.get(sessions.idFromName(descriptor.session_name), { locationHint: env.SESSION_LOCATION_HINT });
   const headers = new Headers({ "x-nanocode-descriptor": headerJson(descriptor) });
   if (body !== undefined) headers.set("content-type", "application/json");
   if (accept) headers.set("accept", accept);

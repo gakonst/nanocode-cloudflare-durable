@@ -68,7 +68,8 @@ function curl(route, { body, accept, event } = {}) {
 
 for (let index = 0; index < count; index++) {
   const id = `turn-${index}`;
-  const toolPrompt = `Use remote Code Mode and workspace tools for this synthetic benchmark. Do not delegate. In one exec, use tools.apply_patch to create bench-${index}.txt containing benchmark-ok, and await Promise.all of three tools.exec_command calls, each running printf remote-tool-ok. Also call tools.list_agents({}) to exercise a callback to the brain. Store a value using store("benchmark", ${index}). In a separate exec, print load("benchmark") and read bench-${index}.txt using tools.exec_command. Do not inspect secrets or unrelated files. Finish with exactly nanocode-worker-ok.`;
+  const file = `${session}-${index}.txt`;
+  const toolPrompt = `Use remote Code Mode and workspace tools for this synthetic benchmark. Do not delegate. In one exec, use tools.apply_patch to create ${file} containing benchmark-ok, and await Promise.all of three tools.exec_command calls, each running printf remote-tool-ok. Also call tools.list_agents({}) to exercise a callback to the brain. Store a value using store("benchmark", ${index}). In a separate exec, print load("benchmark") and read ${file} using tools.exec_command. Do not inspect secrets or unrelated files. Finish with exactly nanocode-worker-ok.`;
   const input = { request_id: id, prompt: values.tools ? toolPrompt : "Reply exactly nanocode-worker-ok.", provider: values.provider, ...(values.executor ? { executor: values.executor } : {}) };
   const sample = { request_id: id, kind: index ? "warm-session" : "new-session", events: [], model_calls: [], tool_calls: [] };
   report.samples.push(sample);
@@ -92,7 +93,7 @@ for (let index = 0; index < count; index++) {
   } });
   sample.curl = transport;
   if (stages.has("model.call.started")) sample.server_setup_ms = stages.get("model.call.started") - stages.get("queued");
-  if (stages.has("assistant.delta")) sample.server_provider_to_delta_ms = stages.get("assistant.delta") - stages.get("model.call.started");
+  if (stages.has("assistant.delta")) sample.server_model_start_to_text_ms = stages.get("assistant.delta") - stages.get("model.call.started");
   if (!sample.status) throw new Error("Finite stream closed without a result");
   if (index === 0) {
     const replay = await curl(path, { body: input });
