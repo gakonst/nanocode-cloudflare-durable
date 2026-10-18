@@ -13,6 +13,8 @@ let providerCalls = 0;
 let rejectAccess;
 let hangRefresh = false;
 let observedMarker = false;
+let delayValid = false;
+const transport = process.argv.includes("--transport");
 let mf;
 const assertions = [];
 const check = (value, message) => { if (!value) throw new Error(message); assertions.push(message); };
@@ -33,9 +35,10 @@ const provider = async request => {
   const auth = request.headers.get("authorization");
   if (auth === `Bearer ${rejectAccess}`) return Response.json({ error: { type: "authentication_error", message: "mock failure" } }, { status: 401 });
   if (auth !== `Bearer ${currentAccess}`) throw new Error("Unexpected access generation");
+  if (delayValid) { delayValid = false; await new Promise(resolve => setTimeout(resolve, 800)); }
   return new Response("ok", { headers: { "content-type": "text/plain" } });
 };
-const options = localOptions({ provider, agent: { MODEL_AUTH: "subscription" }, egress: { OAUTH_JSON: JSON.stringify(seed), VAULT_KEY: secret() } });
+const options = localOptions({ provider, agent: { MODEL_AUTH: "subscription" }, egress: { OAUTH_JSON: JSON.stringify(seed), VAULT_KEY: secret(), ...(transport ? { MODEL_RESPONSE_HEADERS_TIMEOUT_MS: "200" } : {}) } });
 const dispatch = async () => {
   const bindings = await mf.getBindings("nanocode-worker");
   return bindings.EGRESS.fetch(new Request("https://egress.internal/model", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ authority: { account_id: "default", session_id: "authority-measurement" }, subscription: true, headers: [], body: "{}" }) }));
@@ -67,15 +70,19 @@ try {
   await launch();
   check((await dispatch()).status === 200 && refreshes === 1, "Cold egress restoration reuses the committed rotated credential");
   rejectAccess = currentAccess;
+  delayValid = transport;
+  const forcedStarted = performance.now();
   const forced = await Promise.all(Array.from({ length: 20 }, dispatch));
-  check(forced.every(response => response.status === 200) && refreshes === 2, "Concurrent 401 responses force one generation-fenced refresh");
+  check(forced.filter(response => response.status === 200).length === (transport ? 19 : 20) && refreshes === 2, "Concurrent 401 responses force one generation-fenced refresh");
+  if (transport) check(forced.filter(response => response.status === 504).length === 1 && performance.now() - forcedStarted < 3000, "The second model dispatch after a401 refresh has a bounded header deadline");
   for (const response of forced) await response.text();
+  const refreshesBeforeInterruption = refreshes;
   await mf.dispose();
   options.workers[1].bindings.OAUTH_JSON = JSON.stringify({ ...seed, access: secret(), refresh: currentRefresh, expires: Date.now() - 1 });
   hangRefresh = true;
   await launch();
   const uncertain = dispatch().catch(() => undefined);
-  await until(() => refreshes === 3);
+  await until(() => refreshes === refreshesBeforeInterruption + 1);
   await mf.dispose();
   await uncertain;
   hangRefresh = false;
@@ -84,12 +91,12 @@ try {
   const retained = await durable.exec("SELECT state FROM credentials WHERE name = 'model'");
   check(retained[0].state === "exchanging", "Runtime replacement retains the uncertain refresh marker");
   const blocked = await dispatch();
-  check(blocked.status === 401 && refreshes === 3, "Uncertain refresh is not repeated after runtime replacement");
+  check(blocked.status === 401 && refreshes === refreshesBeforeInterruption + 1, "Uncertain refresh is not repeated after runtime replacement");
   await blocked.text();
   await mf.dispose();
   options.workers[1].bindings.OAUTH_JSON = JSON.stringify({ ...seed, access: secret(), refresh: currentRefresh, expires: Date.now() - 1 });
   await launch();
-  check((await dispatch()).status === 200 && refreshes === 4, "Fresh credential import resets the blocked refresh state");
+  check((await dispatch()).status === 200 && refreshes === refreshesBeforeInterruption + 2, "Fresh credential import resets the blocked refresh state");
   const report = { runtime: "local workerd", assertions, refreshes, providerCalls, credential_values_reported: false };
   writeFileSync("output/authority-measurement.json", JSON.stringify(report, null, 2));
   console.log(JSON.stringify(report, null, 2));

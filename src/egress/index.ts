@@ -1,6 +1,7 @@
 import { WorkerEntrypoint } from "cloudflare:workers";
 import { json, sessionUuid, type AuthorityCommand, type AuthorityResult, type ModelDispatch, type ModelProvider, type SessionAuthority } from "../contracts";
 import { AccountAuthority, type Access, type ServiceAccess, type ServiceRequest } from "./account";
+import { modelFetch } from "./model-transport";
 import { ACCOUNT_PATTERN, CODEX, connections, encoder, Failure, FORBIDDEN_HEADERS, mode, modelAccount, modelEndpoint, modelProvider, readLimited, setting, SUBSCRIPTION, type Connection, type EgressEnv } from "./common";
 
 export { AccountAuthority };
@@ -42,6 +43,7 @@ const metrics = {
   service_redacted: 0,
   redirects_rejected: 0,
   upstream_failures: 0,
+  model_timeouts: 0,
 };
 const cache = new Map<string, Entry>();
 const inflight = new Map<string, Promise<Access>>();
@@ -215,7 +217,7 @@ function sendModel(env: EgressEnv, provider: ModelProvider, endpoint: string, he
   const outgoing = new Headers(headers);
   for (const [name, value] of access.headers) outgoing.set(name, value);
   const request = new Request(endpoint, { method: "POST", headers: outgoing, body, redirect: "manual", signal });
-  return provider === "codex" && env.CODEX_TRANSPORT ? env.CODEX_TRANSPORT.fetch(request) : fetch(request);
+  return modelFetch(request, outgoing => provider === "codex" && env.CODEX_TRANSPORT ? env.CODEX_TRANSPORT.fetch(outgoing) : fetch(outgoing), setting(env, "MODEL_RESPONSE_HEADERS_TIMEOUT_MS"), setting(env, "MODEL_STREAM_IDLE_TIMEOUT_MS"), () => { metrics.model_timeouts++; });
 }
 
 function codexDetail(parsed: any): Record<string, unknown> {
@@ -387,8 +389,8 @@ export class SessionEgress extends WorkerEntrypoint<EgressEnv> {
         } else {
           if (trace.origin === "authority") trace.auth_lookup_ms = elapsed(started);
           if (trace.origin === "transport") trace.fetch_header_ms = elapsed(started);
-          trace.status = statusOf(failure.status);
         }
+        trace.status = statusOf(failure.status);
         record(trace);
       } else {
         trace = diagnostic(provider, 1, "local_validation");

@@ -14,6 +14,8 @@ export interface EgressEnv {
   CONNECT_REFRESH_TTL_MS: string;
   CONNECT_CODE_TTL_MS: string;
   RECOVERY_DELAY_MS: string;
+  MODEL_RESPONSE_HEADERS_TIMEOUT_MS: string;
+  MODEL_STREAM_IDLE_TIMEOUT_MS: string;
   CONNECTIONS_JSON?: string;
   VAULT_KEY?: string;
   SESSION_FENCES?: PrivateBinding;
@@ -53,7 +55,7 @@ export class Failure extends Error {
   }
 }
 
-export function setting(env: EgressEnv, name: "CREDENTIAL_CACHE_TTL_MS" | "REFRESH_MARGIN_MS" | "CONNECT_TOKEN_TTL_MS" | "CONNECT_REFRESH_TTL_MS" | "CONNECT_CODE_TTL_MS" | "RECOVERY_DELAY_MS"): number {
+export function setting(env: EgressEnv, name: "CREDENTIAL_CACHE_TTL_MS" | "REFRESH_MARGIN_MS" | "CONNECT_TOKEN_TTL_MS" | "CONNECT_REFRESH_TTL_MS" | "CONNECT_CODE_TTL_MS" | "RECOVERY_DELAY_MS" | "MODEL_RESPONSE_HEADERS_TIMEOUT_MS" | "MODEL_STREAM_IDLE_TIMEOUT_MS"): number {
   const value = Number(env[name]);
   if (!Number.isSafeInteger(value) || value <= 0) throw new Failure(500, "configuration_error");
   return value;
