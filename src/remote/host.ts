@@ -4,6 +4,12 @@ export type RemotePolicy = { max_frame_bytes: number; timeout_ms: number };
 
 const encoder = new TextEncoder();
 
+function validate(policy: RemotePolicy) {
+  for (const key of ["max_frame_bytes", "timeout_ms"] as const) {
+    if (!Number.isSafeInteger(policy[key]) || policy[key] <= 0) throw new Error(`remote ${key} must be a positive integer`);
+  }
+}
+
 export class RemoteExecutor {
   #socket: WebSocket;
   #policy: RemotePolicy;
@@ -12,6 +18,8 @@ export class RemoteExecutor {
   #frames: string[] = [];
   #waiter: { id: number; resolve(value: unknown): void } | undefined;
   #failure: string | undefined;
+  #closed!: (reason: string) => void;
+  readonly closed = new Promise<string>(resolve => { this.#closed = resolve; });
 
   private constructor(socket: WebSocket, policy: RemotePolicy) {
     this.#socket = socket;
@@ -21,10 +29,24 @@ export class RemoteExecutor {
     socket.addEventListener("error", () => this.#fail("runner connection failed", 1011));
   }
 
-  static async create(binding: PrivateBinding, authority: SessionAuthority, policy: RemotePolicy): Promise<RemoteExecutor> {
-    for (const key of ["max_frame_bytes", "timeout_ms"] as const) {
-      if (!Number.isSafeInteger(policy[key]) || policy[key] <= 0) throw new Error(`remote ${key} must be a positive integer`);
+  static async accept(socket: WebSocket, policy: RemotePolicy): Promise<RemoteExecutor> {
+    validate(policy);
+    const executor = new RemoteExecutor(socket, policy);
+    socket.accept();
+    let timer: number | undefined;
+    try {
+      await Promise.race([executor.#catalogReady(), new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error("hand catalog deadline elapsed")), policy.timeout_ms); })]);
+      return executor;
+    } catch (error) {
+      executor.#fail(error instanceof Error ? error.message : String(error), 1011);
+      throw error;
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
     }
+  }
+
+  static async create(binding: PrivateBinding, authority: SessionAuthority, policy: RemotePolicy): Promise<RemoteExecutor> {
+    validate(policy);
     const controller = new AbortController();
     let expire!: (error: Error) => void;
     const deadline = new Promise<never>((_, reject) => { expire = reject; });
@@ -116,6 +138,7 @@ export class RemoteExecutor {
   #fail(reason: string, code: number) {
     if (this.#failure !== undefined) return;
     this.#failure = reason;
+    this.#closed(reason);
     try { this.#socket.close(code); } catch {}
     this.#catalogWaiter?.reject(new Error(reason));
     this.#catalogWaiter = undefined;

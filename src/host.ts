@@ -73,6 +73,7 @@ export class AgentRuntime {
   private failure?: Error;
   private disposal?: Promise<void>;
   private pendingAtOpen: string[] = [];
+  private readonly attached = new Set<string>();
 
   private constructor(private readonly store: CheckpointStore, private readonly options: RuntimeOptions) {}
 
@@ -84,7 +85,7 @@ export class AgentRuntime {
     runtime.wasm = instance.exports as unknown as Exports;
     try {
       const initStarted = performance.now();
-      const opened = await runtime.command({ op: "init", config: { session_id: config.session_id, provider: config.provider ?? "claude", subscription: config.subscription, endpoint: config.endpoint, remote: config.remote ?? false } }) as { pending: string[] };
+      const opened = await runtime.command({ op: "init", config: { session_id: config.session_id, provider: config.provider ?? "claude", subscription: config.subscription, endpoint: config.endpoint, remote: config.remote ?? false, executor: config.executor, hands: config.hands ?? false } }) as { pending: string[] };
       runtime.timings.record("sdk.open", performance.now() - initStarted);
       runtime.pendingAtOpen = opened.pending;
     } catch (error) {
@@ -113,12 +114,28 @@ export class AgentRuntime {
 
   run(input: AgentInput): Promise<TurnOutcome> {
     this.counters.runs++;
-    return this.turn({ op: "run", input: { request_id: input.request_id, prompt: input.prompt } });
+    return this.turn({ op: "run", input: { request_id: input.request_id, prompt: input.prompt, hand: input.hand } });
   }
 
-  resume(request_id: string): Promise<TurnOutcome> {
+  resume(request_id: string, hand?: string): Promise<TurnOutcome> {
     this.counters.resumes++;
-    return this.turn({ op: "resume", request_id });
+    return this.turn({ op: "resume", request_id, hand });
+  }
+
+  async attach(hand: string, connection: string): Promise<void> {
+    if (this.closed || this.attached.has(connection)) return;
+    this.attached.add(connection);
+    try {
+      await this.command({ op: "attach", hand, connection });
+    } catch (error) {
+      this.attached.delete(connection);
+      throw error;
+    }
+  }
+
+  async detach(connection: string): Promise<void> {
+    if (this.closed || !this.attached.delete(connection)) return;
+    await this.command({ op: "detach", connection });
   }
 
   async cancel(request_id?: string): Promise<TurnOutcome> {

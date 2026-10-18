@@ -62,12 +62,12 @@ fn host_error(value: Value) -> CodeModeHostError {
 }
 
 thread_local! {
-    static CLIENT: RefCell<Weak<Client>> = const { RefCell::new(Weak::new()) };
+    static CLIENTS: RefCell<Vec<Weak<Client>>> = const { RefCell::new(Vec::new()) };
 }
 
 pub fn busy() -> bool {
-    CLIENT.with_borrow(|slot| {
-        slot.upgrade().is_some_and(|client| {
+    CLIENTS.with_borrow(|clients| {
+        clients.iter().filter_map(Weak::upgrade).any(|client| {
             !client.running.lock().unwrap().is_empty()
                 || client
                     .callbacks
@@ -251,22 +251,27 @@ impl Client {
 async fn write(
     mut frames: mpsc::UnboundedReceiver<Frame>,
     max_frame_bytes: usize,
+    connection: Option<&str>,
 ) -> Result<(), CodeModeHostError> {
     while let Some(frame) = frames.next().await {
         let mut batch = vec![frame.encode(max_frame_bytes)?];
         while let Ok(frame) = frames.try_recv() {
             batch.push(frame.encode(max_frame_bytes)?);
         }
-        call(json!({"op": "remote_send", "frames": batch}))
+        call(json!({"op": "remote_send", "connection": connection, "frames": batch}))
             .await
             .map_err(host_error)?;
     }
     Ok(())
 }
 
-async fn read(client: Weak<Client>, max_frame_bytes: usize) -> Result<(), CodeModeHostError> {
+async fn read(
+    client: Weak<Client>,
+    max_frame_bytes: usize,
+    connection: Option<&str>,
+) -> Result<(), CodeModeHostError> {
     loop {
-        let value = call(json!({"op": "remote_poll"}))
+        let value = call(json!({"op": "remote_poll", "connection": connection}))
             .await
             .map_err(|issue| error(format!("runner connection failed: {}", host_error(issue))))?;
         if let Some(reason) = value.get("closed") {
@@ -289,9 +294,10 @@ async fn drive(
     frames: mpsc::UnboundedReceiver<Frame>,
     closed: oneshot::Receiver<()>,
     max_frame_bytes: usize,
+    connection: Option<String>,
 ) {
-    let writer = pin!(write(frames, max_frame_bytes));
-    let reader = pin!(read(client.clone(), max_frame_bytes));
+    let writer = pin!(write(frames, max_frame_bytes, connection.as_deref()));
+    let reader = pin!(read(client.clone(), max_frame_bytes, connection.as_deref()));
     let result = match select(closed, select(writer, reader)).await {
         Either::Left(_) => Ok(()),
         Either::Right((Either::Left((result, _)), _))
@@ -304,11 +310,11 @@ async fn drive(
     if let Some(client) = client.upgrade() {
         client.terminate(message.clone());
     }
-    let _ = call(json!({"op": "remote_close", "reason": message})).await;
+    let _ = call(json!({"op": "remote_close", "connection": connection, "reason": message})).await;
 }
 
-pub async fn host() -> Result<RemoteCodeModeHost, String> {
-    let catalog = call(json!({"op": "remote_catalog"}))
+pub async fn host(connection: Option<String>) -> Result<RemoteCodeModeHost, String> {
+    let catalog = call(json!({"op": "remote_catalog", "connection": connection}))
         .await
         .map_err(|issue| host_error(issue).to_string())?;
     let max_frame_bytes: usize =
@@ -321,7 +327,7 @@ pub async fn host() -> Result<RemoteCodeModeHost, String> {
     let text = catalog["frame"]
         .as_str()
         .ok_or("remote catalog frame must be text")?;
-    let Frame::Catalog { definitions } =
+    let Frame::Catalog { definitions, .. } =
         Frame::decode(text, max_frame_bytes).map_err(|e| e.to_string())?
     else {
         return Err("runner did not publish a code mode catalog".into());
@@ -338,13 +344,17 @@ pub async fn host() -> Result<RemoteCodeModeHost, String> {
         timeout: Duration::from_millis(timeout_ms),
         failure: Mutex::new(None),
     });
-    CLIENT.with_borrow_mut(|slot| *slot = Arc::downgrade(&client));
+    CLIENTS.with_borrow_mut(|clients| {
+        clients.retain(|client| client.strong_count() > 0);
+        clients.push(Arc::downgrade(&client));
+    });
     let (closed, closed_rx) = oneshot::channel();
     spawn(drive(
         Arc::downgrade(&client),
         frames,
         closed_rx,
         client.max_frame_bytes,
+        connection,
     ));
     Ok(RemoteCodeModeHost::new(
         WorkerTransport {

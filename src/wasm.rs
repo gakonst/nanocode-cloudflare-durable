@@ -16,8 +16,9 @@ use std::{
 };
 
 use nanocode::{
-    Agent, ClaudeClient, ClaudeModel, ExecutionPolicyDisposition, Model, ModelSelection, Nanocodex,
-    NanocodexError, OpenAi, PromptRequest, Tools, TurnControl,
+    Agent, ClaudeClient, ClaudeModel, CodeModeExecutors, CodeModeHost, ExecutionPolicyDisposition,
+    ExecutorSelection, Model, ModelSelection, Nanocodex, NanocodexError, OpenAi, PromptRequest,
+    Tools, TurnControl,
     backend::Prompt,
     codex::{OpenAiAuth, transport::ResponsesTransport},
     durability::{SessionRecord, SessionStore, TurnStatus},
@@ -43,6 +44,10 @@ struct Configuration {
     endpoint: String,
     #[serde(default)]
     remote: bool,
+    #[serde(default)]
+    executor: Option<String>,
+    #[serde(default)]
+    hands: bool,
 }
 
 impl Configuration {
@@ -58,6 +63,8 @@ impl Configuration {
 struct Input {
     request_id: String,
     prompt: String,
+    #[serde(default)]
+    hand: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -72,6 +79,15 @@ enum Command {
     },
     Resume {
         request_id: String,
+        #[serde(default)]
+        hand: Option<String>,
+    },
+    Attach {
+        hand: String,
+        connection: String,
+    },
+    Detach {
+        connection: String,
     },
     Cancel {
         #[serde(default)]
@@ -84,6 +100,8 @@ enum Command {
 
 struct Session {
     runtime: Nanocodex,
+    executors: CodeModeExecutors,
+    hands: RefCell<HashMap<String, (String, Arc<dyn CodeModeHost>)>>,
     agent: Agent,
     store: SessionStore,
     events: events::Events,
@@ -173,10 +191,16 @@ async fn open(config: Configuration) -> Result<Session, String> {
                 .map_err(text)?,
         )
         .durability(store.clone());
-    if config.remote {
+    let executors = CodeModeExecutors::new();
+    if config.remote || config.hands {
+        if config.remote {
+            let name: Arc<str> = config.executor.as_deref().unwrap_or("default").into();
+            executors.insert(Arc::clone(&name), Arc::new(remote::host(None).await?));
+            executors.set_default(Some(name));
+        }
         builder = builder
-            .instructions("Shell, filesystem, and Code Mode tools execute on the selected remote host. Use paths relative to its configured workspace. Query pwd through the remote shell when an absolute remote path is needed.")
-            .code_mode_host(remote::host().await?)
+            .instructions("Shell, filesystem, and Code Mode tools execute on the selected remote host: the hand that sent the current prompt when it is attached, otherwise the session's configured executor. Use paths relative to its configured workspace. Query pwd through the remote shell when an absolute remote path is needed.")
+            .code_mode_host(executors.clone())
             .map_err(text)?;
     }
     let runtime = builder
@@ -204,6 +228,8 @@ async fn open(config: Configuration) -> Result<Session, String> {
     match opened {
         Ok((agent, events, model, opened)) => Ok(Session {
             runtime,
+            executors,
+            hands: RefCell::default(),
             agent,
             store,
             events,
@@ -341,12 +367,35 @@ impl Session {
         })
     }
 
-    async fn run(&self, request_id: &str, prompt: Prompt) -> Result<Value, String> {
+    async fn run(
+        &self,
+        request_id: &str,
+        prompt: Prompt,
+        hand: Option<String>,
+    ) -> Result<Value, String> {
         if self.busy.replace(true) {
             return Ok(waiting());
         }
         let _busy = Busy(self);
+        self.executors.select(
+            self.root(),
+            hand.map(|hand| ExecutorSelection::Executor(hand.into())),
+        );
         self.execute(request_id, prompt, false).await
+    }
+
+    async fn attach(&self, hand: String, connection: String) -> Result<Value, String> {
+        let host: Arc<dyn CodeModeHost> = Arc::new(remote::host(Some(connection.clone())).await?);
+        self.executors.insert(hand.as_str(), Arc::clone(&host));
+        self.hands.borrow_mut().insert(connection, (hand, host));
+        Ok(Value::Null)
+    }
+
+    fn detach(&self, connection: &str) -> Value {
+        if let Some((hand, host)) = self.hands.borrow_mut().remove(connection) {
+            self.executors.remove_host(&hand, &host);
+        }
+        Value::Null
     }
 
     async fn stored(&self, request_id: &str) -> Result<Option<Prompt>, String> {
@@ -365,12 +414,12 @@ impl Session {
         }
     }
 
-    async fn resume(&self, request_id: &str) -> Result<Value, String> {
+    async fn resume(&self, request_id: &str, hand: Option<String>) -> Result<Value, String> {
         if self.busy.get() || self.live.borrow().contains_key(request_id) {
             return Ok(waiting());
         }
         match self.stored(request_id).await? {
-            Some(prompt) => self.run(request_id, prompt).await,
+            Some(prompt) => self.run(request_id, prompt, hand).await,
             None => Ok(json!({"error": "request is not a durable root operation"})),
         }
     }
@@ -507,10 +556,15 @@ async fn execute(command: Command) -> Result<Value, String> {
         Command::Pending => ready()?.pending().await,
         Command::Run { input } => {
             ready()?
-                .run(&input.request_id, Prompt::from(input.prompt))
+                .run(&input.request_id, Prompt::from(input.prompt), input.hand)
                 .await
         }
-        Command::Resume { request_id } => ready()?.resume(&request_id).await,
+        Command::Resume { request_id, hand } => ready()?.resume(&request_id, hand).await,
+        Command::Attach { hand, connection } => ready()?.attach(hand, connection).await,
+        Command::Detach { connection } => Ok(match current() {
+            Some(session) => session.detach(&connection),
+            None => Value::Null,
+        }),
         Command::Cancel { request_id } => match current() {
             Some(session) => session.cancel(request_id).await,
             None => Ok(Value::Null),

@@ -21,6 +21,7 @@ export interface Env {
   CONNECT_STREAM_REVALIDATE_MS: string;
   EVENT_PAGE_SIZE: string;
   RUNNER_ENABLED: string;
+  HANDS_ENABLED?: string;
   REMOTE_MAX_FRAME_BYTES: string;
   REMOTE_TIMEOUT_MS: string;
   PUBLIC_ORIGIN?: string;
@@ -58,7 +59,7 @@ export default {
     const url = new URL(request.url);
     if (url.pathname === "/health") return json({ ok: true, model: "claude-opus-5-5", models: { claude: "claude-opus-5-5", codex: "gpt-6.1-sol" }, auth: env.MODEL_AUTH, architecture: "session-local", credential_boundary: "private-egress" });
     if (url.pathname === "/metrics" && request.method === "GET") return env.EGRESS.fetch(new Request(url.searchParams.get("probe") === "codex" ? "https://egress.internal/probe/codex" : "https://egress.internal/metrics"));
-    const match = /^\/sessions\/([^/]+)(?:\/(turns|events|metrics|socket)(?:\/([^/]+)(?:\/(cancel))?)?)?$/.exec(url.pathname);
+    const match = /^\/sessions\/([^/]+)(?:\/(turns|events|metrics|socket|hands)(?:\/([^/]+)(?:\/(cancel))?)?)?$/.exec(url.pathname);
     if (!match) return json({ error: "route not found" }, 404);
     let name: string;
     try { name = decodeURIComponent(match[1]); } catch { return json({ error: "invalid session encoding" }, 400); }
@@ -75,6 +76,7 @@ export default {
     target.pathname = path;
     const dispatched = performance.now();
     const response = await env.SESSIONS.get(env.SESSIONS.idFromName(sessionName), { locationHint: env.SESSION_LOCATION_HINT }).fetch(new Request(target, { method: request.method, headers, body: request.body, redirect: "manual" }));
+    if (response.webSocket) return response;
     const responseHeaders = new Headers(response.headers);
     responseHeaders.set("server-timing", `public_pre_session;dur=${dispatched - started}, session_response;dur=${performance.now() - dispatched}`);
     return new Response(response.body, { status: response.status, statusText: response.statusText, headers: responseHeaders });
@@ -95,6 +97,9 @@ export class AgentSession extends DurableObject<Env> {
   private readonly store: CheckpointStore;
   private readonly runtimes = new Map<string, Promise<AgentRuntime>>();
   private readonly residents = new Map<string, AgentRuntime>();
+  private readonly hands = new Map<string, Map<string, { connection: string; executor: RemoteExecutor }>>();
+  private readonly connections = new Map<string, RemoteExecutor>();
+  private nextConnection = 0;
   private running?: Running;
   private pumping = false;
   private readonly eventHub = new EventHub();
@@ -140,6 +145,12 @@ export class AgentSession extends DurableObject<Env> {
       if (request.method === "GET" && parts[2] === "metrics") return json({ ...this.counts, model_diagnostics: this.modelDiagnostics.filter(entry => entry.scope === scope).map(entry => entry.value), timing: this.timings.get(scope)?.snapshot() ?? {}, checkpoints: { ...this.store.metrics, timing: this.residents.get(scope)?.metrics.timing.checkpoints ?? {} }, resident_runtimes: this.runtimes.size, runtime: this.residents.get(scope)?.metrics, persisted: this.store.row("SELECT (SELECT COUNT(*) FROM states) AS states, (SELECT COUNT(*) FROM records) AS records, (SELECT COUNT(*) FROM jobs WHERE scope = ? AND status IN ('queued', 'running')) AS unfinished", scope) });
       if (request.method === "GET" && parts[2] === "events") return this.events(scope, url, request.headers.get("accept")?.includes("text/event-stream"), descriptor);
       if (parts[2] === "socket") return json({ error: "use the authenticated event stream" }, 405);
+      if (parts[2] === "hands") {
+        if (this.env.HANDS_ENABLED !== "true") return json({ error: "hands are not enabled" }, 404);
+        if (request.method === "GET" && parts.length === 3) return json({ hands: [...(this.hands.get(scope)?.keys() ?? [])] });
+        if (request.method === "GET" && parts.length === 4) return this.attachHand(scope, decodeURIComponent(parts[3]), request, descriptor);
+        return json({ error: "method not allowed" }, 405);
+      }
       if (parts[2] === "cancel" && parts.length === 4 && request.method === "POST") return await this.cancel(decodeURIComponent(parts[3]), scope);
       if (parts[2] !== "turns") return json({ error: "route not found" }, 404);
       if (request.method === "GET" && parts.length === 4) {
@@ -153,6 +164,9 @@ export class AgentSession extends DurableObject<Env> {
       if (input.request_id.startsWith("subagent-completion:")) return json({ error: "request_id prefix is reserved" }, 400);
       if (input.provider !== undefined && input.provider !== "claude" && input.provider !== "codex") return json({ error: "provider must be claude or codex" }, 400);
       if (input.executor !== undefined && (typeof input.executor !== "string" || !EXECUTOR_ID.test(input.executor))) return json({ error: "invalid executor" }, 400);
+      if (input.hand !== undefined && (typeof input.hand !== "string" || !EXECUTOR_ID.test(input.hand))) return json({ error: "invalid hand" }, 400);
+      if (input.hand !== undefined && this.env.HANDS_ENABLED !== "true") return json({ error: "hands are not enabled" }, 400);
+      if (input.hand !== undefined && descriptor.grant_id && !descriptor.connections?.includes(runnerConnection(input.hand))) return json({ error: "hand is not selected by this grant" }, 403);
       const streaming = request.headers.get("accept")?.includes("text/event-stream");
       if (streaming) {
         const after = Number(url.searchParams.get("after") ?? "0");
@@ -168,6 +182,7 @@ export class AgentSession extends DurableObject<Env> {
       const executor = input.executor ?? boundExecutor ?? legacyExecutor;
       if (executor && descriptor.grant_id && !descriptor.connections?.includes(runnerConnection(executor)) && !(executor === DEFAULT_EXECUTOR && descriptor.connections?.includes(LEGACY_RUNNER))) return json({ error: "executor is not selected by this grant" }, 403);
       descriptor.executor_id = executor || undefined;
+      descriptor.hand = input.hand;
       const providerKey = `model_provider:${scope}`;
       const boundProvider = this.store.row("SELECT value FROM metadata WHERE key = ?", providerKey)?.value
         ?? (this.store.row("SELECT value FROM metadata WHERE key = ?", scope === "owner" ? "session_id" : `session_id:${scope}`) ? "claude" : undefined);
@@ -176,7 +191,7 @@ export class AgentSession extends DurableObject<Env> {
       if (descriptor.provider === "codex" && descriptor.session_id && descriptor.session_id[14] !== "7") return json({ error: "Codex requires a new thread with a UUIDv7 session" }, 409);
       if (descriptor.provider === "codex") descriptor.subscription = true;
       const existing = this.job(input.request_id);
-      if (existing && (existing.prompt !== input.prompt || existing.scope !== scope)) return json({ error: "request_id already belongs to different input or authority" }, 409);
+      if (existing && (existing.prompt !== input.prompt || existing.scope !== scope || this.descriptor(existing).hand !== input.hand)) return json({ error: "request_id already belongs to different input or authority" }, 409);
       if (!existing) {
         policy(this.env.RECOVERY_DELAY_MS, "RECOVERY_DELAY_MS");
         this.ctx.storage.transactionSync(() => {
@@ -307,13 +322,13 @@ export class AgentSession extends DurableObject<Env> {
           if (turnTiming) turnTiming.running_sync_ms = performance.now() - runningSync;
           const latest = this.job(activeJob.request_id)!;
           const runStarted = performance.now();
-          const result = latest.cancel_requested ? await runtime.cancel(activeJob.request_id) : await runtime.run({ request_id: activeJob.request_id, prompt: activeJob.prompt });
+          const result = latest.cancel_requested ? await runtime.cancel(activeJob.request_id) : await runtime.run({ request_id: activeJob.request_id, prompt: activeJob.prompt, hand: this.descriptor(activeJob).hand });
           if (turnTiming) turnTiming.run_ms = performance.now() - runStarted;
           if (result.retry) throw new Error("runtime recovery required");
           waiting = !!result.waiting;
           if (!result.waiting) this.finish(activeJob, result);
         } else if (first) {
-          const result = await runtime.resume(first);
+          const result = await runtime.resume(first, pendingJob ? this.descriptor(pendingJob).hand : undefined);
           if (result.retry) throw new Error("runtime recovery required");
           waiting = !!result.waiting;
         }
@@ -380,6 +395,7 @@ export class AgentSession extends DurableObject<Env> {
       resident = (async () => {
         const authority = { account_id: descriptor.account_id, session_id: sessionId, grant_id: descriptor.grant_id, grant_revision: descriptor.grant_revision, connections: descriptor.connections, catalog_digest: descriptor.catalog_digest, grant_expires_at: descriptor.grant_expires_at, executor_id: descriptor.executor_id };
         const enabled = !!descriptor.executor_id || (this.env.RUNNER_ENABLED === "true" && (!descriptor.grant_id || descriptor.connections?.includes(LEGACY_RUNNER)));
+        const handsEnabled = this.env.HANDS_ENABLED === "true";
         let remote: RemoteExecutor | undefined;
         let remoteFailed = false;
         const connectStarted = performance.now();
@@ -388,11 +404,12 @@ export class AgentSession extends DurableObject<Env> {
           : undefined;
         void connecting?.catch(() => {});
         try {
-          return await AgentRuntime.create({ session_id: sessionId, provider: descriptor.provider ?? "claude", subscription: descriptor.subscription, endpoint: descriptor.provider === "codex" ? "https://chatgpt.com/backend-api/codex" : `https://api.anthropic.com/v1/messages${descriptor.subscription ? "?beta=true" : ""}`, remote: enabled }, this.store, {
-        remote: connecting ? {
+          const created = await AgentRuntime.create({ session_id: sessionId, provider: descriptor.provider ?? "claude", subscription: descriptor.subscription, endpoint: descriptor.provider === "codex" ? "https://chatgpt.com/backend-api/codex" : `https://api.anthropic.com/v1/messages${descriptor.subscription ? "?beta=true" : ""}`, remote: enabled, executor: descriptor.executor_id, hands: handsEnabled }, this.store, {
+        remote: connecting || handsEnabled ? {
           failed: () => remoteFailed || remote?.failure !== undefined,
           execute: async (request: any, id: number) => {
-            const executor = await connecting;
+            const executor = request.connection != null ? this.connections.get(request.connection) : await connecting;
+            if (!executor) throw new Error(request.connection != null ? "hand is not connected" : "remote executor is not configured");
             if (request.op === "remote_send" && this.dispatchBlocked(scope, descriptor)) {
               const forbidden = request.frames.some((text: string) => {
                 const frame = JSON.parse(text);
@@ -405,8 +422,11 @@ export class AgentSession extends DurableObject<Env> {
             }
             return executor.execute(request, id);
           },
-          cancel: id => remote?.cancel(id),
-          dispose: async () => { await connecting.then(value => value.dispose(), () => {}); },
+          cancel: id => {
+            remote?.cancel(id);
+            for (const executor of this.connections.values()) executor.cancel(id);
+          },
+          dispose: async () => { await connecting?.then(value => value.dispose(), () => {}); },
         } : undefined,
         dispatch: async (request, signal, timing) => {
           if (this.dispatchBlocked(scope, descriptor)) throw new Error("request authority stopped");
@@ -436,6 +456,8 @@ export class AgentSession extends DurableObject<Env> {
           return response.json();
         },
       });
+          for (const [hand, entry] of this.hands.get(scope) ?? []) await created.attach(hand, entry.connection).catch(() => {});
+          return created;
         } catch (error) { await connecting?.then(value => value.dispose(), () => {}); throw error; }
       })().then(runtime => {
         if (this.runtimes.get(scope) === resident) this.residents.set(scope, runtime);
@@ -445,6 +467,38 @@ export class AgentSession extends DurableObject<Env> {
       void resident.catch(() => { if (this.runtimes.get(scope) === resident) { this.runtimes.delete(scope); this.residents.delete(scope); } });
     }
     return resident;
+  }
+
+  private attachHand(scope: string, hand: string, request: Request, descriptor: SessionDescriptor): Response {
+    if (!EXECUTOR_ID.test(hand)) return json({ error: "invalid hand" }, 400);
+    if (request.headers.get("upgrade")?.toLowerCase() !== "websocket") return json({ error: "hands attach over WebSocket" }, 426);
+    if (descriptor.grant_id && !descriptor.connections?.includes(runnerConnection(hand))) return json({ error: "hand is not selected by this grant" }, 403);
+    const limits = { max_frame_bytes: policy(this.env.REMOTE_MAX_FRAME_BYTES, "REMOTE_MAX_FRAME_BYTES"), timeout_ms: policy(this.env.REMOTE_TIMEOUT_MS, "REMOTE_TIMEOUT_MS") };
+    const [client, server] = Object.values(new WebSocketPair());
+    this.ctx.waitUntil(this.registerHand(scope, hand, `${hand}#${++this.nextConnection}`, server, limits));
+    return new Response(null, { status: 101, webSocket: client });
+  }
+
+  private async registerHand(scope: string, hand: string, connection: string, socket: WebSocket, limits: { max_frame_bytes: number; timeout_ms: number }): Promise<void> {
+    let executor: RemoteExecutor;
+    try { executor = await RemoteExecutor.accept(socket, limits); } catch { return; }
+    let hands = this.hands.get(scope);
+    if (!hands) this.hands.set(scope, hands = new Map());
+    const previous = hands.get(hand);
+    hands.set(hand, { connection, executor });
+    this.connections.set(connection, executor);
+    void executor.closed.then(() => this.detachHand(scope, hand, connection));
+    if (previous) await previous.executor.dispose();
+    const resident = this.runtimes.get(scope);
+    const runtime = resident && await resident.catch(() => undefined);
+    if (runtime && hands.get(hand)?.connection === connection) await runtime.attach(hand, connection).catch(() => {});
+  }
+
+  private detachHand(scope: string, hand: string, connection: string): void {
+    this.connections.delete(connection);
+    const hands = this.hands.get(scope);
+    if (hands?.get(hand)?.connection === connection) hands.delete(hand);
+    void this.residents.get(scope)?.detach(connection).catch(() => {});
   }
 
   private finish(job: Job, result: AgentResult): void {

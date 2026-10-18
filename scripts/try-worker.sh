@@ -3,7 +3,8 @@ set +x
 set -euo pipefail
 
 usage() {
-  printf 'Usage: %s [claude|codex] [paradigm-a|paradigm-b] [prompt]\n' "$0"
+  printf 'Usage: %s [claude|codex] [paradigm-a|paradigm-b|here] [prompt]\n' "$0"
+  printf 'here attaches this machine as the hand for its own prompt with nanocodex runner --code-mode.\n'
 }
 
 if [[ ${1:-} == --help || ${1:-} == -h ]]; then
@@ -23,7 +24,7 @@ case "$provider" in
   *) usage >&2; exit 2 ;;
 esac
 case "$executor" in
-  paradigm-a|paradigm-b) ;;
+  paradigm-a|paradigm-b|here) ;;
   *) usage >&2; exit 2 ;;
 esac
 
@@ -42,10 +43,42 @@ if [[ ! $worker_token =~ ^[-A-Za-z0-9._~+/=]+$ ]]; then
 fi
 
 session="try-$(uuidgen)"
+origin=nanocode-worker.gakonst.workers.dev
+hand_pid=""
+stop_hand() {
+  if [[ -n $hand_pid ]]; then kill "$hand_pid" 2>/dev/null || true; fi
+}
+trap stop_hand EXIT
+if [[ $executor == here ]]; then
+  hand="cli-$(uuidgen | tr '[:upper:]' '[:lower:]' | cut -c1-8)"
+  hand_log="${TMPDIR:-/tmp}/nanocode-hand-$session.log"
+  NANOCODEX_RUNNER_TOKEN=$worker_token "${NANOCODEX_BIN:-nanocodex}" runner --code-mode --connect "wss://$origin/sessions/$session/hands/$hand" --name "$hand" -C "$PWD" 2>"$hand_log" &
+  hand_pid=$!
+  attached=""
+  for _ in $(seq 1 100); do
+    attached=$(curl -sS --connect-timeout 5 --max-time 10 --config - <<EOF || true
+url = "https://$origin/sessions/$session/hands"
+header = "Authorization: Bearer $worker_token"
+EOF
+)
+    if [[ $attached == *"\"$hand\""* ]]; then break; fi
+    if ! kill -0 "$hand_pid" 2>/dev/null; then
+      printf 'The local hand exited; see %s.\n' "$hand_log" >&2
+      exit 1
+    fi
+    sleep 0.1
+  done
+  if [[ $attached != *"\"$hand\""* ]]; then
+    printf 'The local hand did not attach; see %s.\n' "$hand_log" >&2
+    exit 1
+  fi
+  executor="$hand (this machine)"
+fi
 request_data=$(node --input-type=module -e '
-const [provider, executor, prompt] = process.argv.slice(1);
-process.stdout.write(JSON.stringify(JSON.stringify({ request_id: "try-1", provider, executor, prompt })));
-' "$provider" "$executor" "$prompt")
+const [provider, executor, prompt, hand] = process.argv.slice(1);
+const target = hand ? { hand } : { executor };
+process.stdout.write(JSON.stringify(JSON.stringify({ request_id: "try-1", provider, ...target, prompt })));
+' "$provider" "$executor" "$prompt" "${hand:-}")
 stream_events() {
   node --input-type=module -e '
 import { createInterface } from "node:readline";
@@ -147,7 +180,7 @@ if (!terminal) { process.stderr.write("Stream ended without a final result.\n");
 }
 
 curl -NsS --fail-with-body --connect-timeout 15 --max-time 300 --config - <<EOF | stream_events
-url = "https://nanocode-worker.gakonst.workers.dev/sessions/$session/turns"
+url = "https://$origin/sessions/$session/turns"
 header = "Authorization: Bearer $worker_token"
 header = "Content-Type: application/json"
 header = "Accept: text/event-stream"
