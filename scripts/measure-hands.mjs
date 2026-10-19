@@ -9,6 +9,7 @@ const sdk = resolve(process.env.NANOCODE_SDK_PATH ?? "../nanocodex");
 const binary = resolve(process.env.CARGO_TARGET_DIR ?? resolve(sdk, "target"), "debug/nanocodex");
 const policy = { max_frame_bytes: 1048576, timeout_ms: 30000 };
 const keepaliveMs = Number(process.env.HANDS_KEEPALIVE_MS ?? "45000");
+const graceMs = 2000;
 const latencyTurns = 10;
 const token = "local-measurement";
 const persistence = resolve(mkdtempSync("output/hands-state-"));
@@ -101,7 +102,7 @@ const outbound = async request => {
 };
 
 const buildMs = process.env.HANDS_SKIP_BUILD ? 0 : buildHand();
-const options = localOptions({ persistence, agent: { HANDS_ENABLED: "true", REMOTE_MAX_FRAME_BYTES: String(policy.max_frame_bytes), REMOTE_TIMEOUT_MS: String(policy.timeout_ms) } });
+const options = localOptions({ persistence, agent: { HANDS_ENABLED: "true", HANDS_ATTACH_GRACE_MS: String(graceMs), REMOTE_MAX_FRAME_BYTES: String(policy.max_frame_bytes), REMOTE_TIMEOUT_MS: String(policy.timeout_ms) } });
 options.workers[1].outboundService = outbound;
 const mf = new Miniflare(convertV4MiniflareOptions(options));
 const name = `hands-${Date.now()}`;
@@ -154,7 +155,7 @@ async function turn(id, scenario, hand) {
   const milliseconds = performance.now() - begin;
   measurements.push({ id, hand, status: result.status, milliseconds });
   if (result.status !== "completed") throw new Error(`Turn ${id} did not complete: ${JSON.stringify(result)}`);
-  return { milliseconds, results: observed[id] ?? [] };
+  return { milliseconds, results: observed[id] ?? [], timing: result.timing };
 }
 
 const expect = (condition, detail) => { if (!condition) throw new Error(detail); };
@@ -182,6 +183,17 @@ try {
   const detachMs = await until(async () => !(await attached()).includes("laptop"), "Killed hand stayed attached");
   const departed = await turn("where-departed", "hands-where", "laptop");
   expect(/not connected; nothing was dispatched/.test(departed.results[0]?.text ?? ""), `departed hand: ${JSON.stringify(departed.results)}`);
+  expect(departed.timing?.hand_wait_ms >= graceMs, `departed hand did not wait for its grace period: ${JSON.stringify(departed.timing)}`);
+
+  const lateTurn = turn("where-late", "hands-where", "late");
+  await new Promise(resolve => setTimeout(resolve, 300));
+  const lateStart = performance.now();
+  startHand("late", base);
+  const late = await lateTurn;
+  const lateAttachedMs = performance.now() - lateStart;
+  expect(late.results[0]?.text.includes(workspaces.late), `late hand: ${JSON.stringify(late.results)}`);
+  expect(late.timing?.hand_wait_ms > 0 && late.timing.hand_wait_ms < graceMs, `late hand wait: ${JSON.stringify(late.timing)}`);
+  await stopHand("late");
 
   const reconnectStart = performance.now();
   logs.laptop = "";
@@ -209,6 +221,8 @@ try {
     turn_ms: { laptop: laptop.milliseconds, desk: desk.milliseconds, without_hand: none.milliseconds, callback: callback.milliseconds },
     killed_hand_detached_ms: detachMs,
     departed_hand_result: departed.results[0]?.text,
+    departed_hand_wait_ms: departed.timing?.hand_wait_ms,
+    late_hand: { submitted_before_spawn_ms: 300, spawn_to_turn_complete_ms: lateAttachedMs, hand_wait_ms: late.timing?.hand_wait_ms, turn_ms: late.milliseconds },
     reconnect_to_attached_ms: reconnectMs,
     idle_ms: keepaliveMs,
     idle_reconnects: reconnects - 1,

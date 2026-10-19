@@ -22,6 +22,7 @@ export interface Env {
   EVENT_PAGE_SIZE: string;
   RUNNER_ENABLED: string;
   HANDS_ENABLED?: string;
+  HANDS_ATTACH_GRACE_MS: string;
   REMOTE_MAX_FRAME_BYTES: string;
   REMOTE_TIMEOUT_MS: string;
   PUBLIC_ORIGIN?: string;
@@ -30,7 +31,7 @@ export interface Env {
 
 type Job = { request_id: string; prompt: string; status: string; result: string | null; scope: string; descriptor: string; cancel_requested: number };
 type Running = { job: Job; runtime: AgentRuntime };
-type TurnTiming = { started: number; admitted_at?: number; admission_ms?: number; admission_sync_ms?: number; pump_wait_ms?: number; preparation_sync_ms?: number; runtime_open_ms?: number; runtime_reused?: boolean; running_sync_ms?: number; run_ms?: number; recovered?: boolean; checkpoints: TimingSnapshot; runtime?: TimingSnapshot };
+type TurnTiming = { started: number; admitted_at?: number; admission_ms?: number; admission_sync_ms?: number; pump_wait_ms?: number; preparation_sync_ms?: number; runtime_open_ms?: number; runtime_reused?: boolean; running_sync_ms?: number; hand_wait_ms?: number; run_ms?: number; recovered?: boolean; checkpoints: TimingSnapshot; runtime?: TimingSnapshot };
 
 function policy(value: string, name: string): number {
   const number = Number(value);
@@ -97,9 +98,10 @@ export class AgentSession extends DurableObject<Env> {
   private readonly store: CheckpointStore;
   private readonly runtimes = new Map<string, Promise<AgentRuntime>>();
   private readonly residents = new Map<string, AgentRuntime>();
-  private readonly hands = new Map<string, Map<string, { connection: string; executor: RemoteExecutor }>>();
+  private readonly hands = new Map<string, Map<string, { connection: string; executor: RemoteExecutor; ready: boolean }>>();
   private readonly connections = new Map<string, RemoteExecutor>();
   private nextConnection = 0;
+  private handWait?: { scope: string; hand: string; resolve(): void };
   private running?: Running;
   private pumping = false;
   private readonly eventHub = new EventHub();
@@ -147,7 +149,7 @@ export class AgentSession extends DurableObject<Env> {
       if (parts[2] === "socket") return json({ error: "use the authenticated event stream" }, 405);
       if (parts[2] === "hands") {
         if (this.env.HANDS_ENABLED !== "true") return json({ error: "hands are not enabled" }, 404);
-        if (request.method === "GET" && parts.length === 3) return json({ hands: [...(this.hands.get(scope)?.keys() ?? [])] });
+        if (request.method === "GET" && parts.length === 3) return json({ hands: [...(this.hands.get(scope) ?? [])].filter(([, entry]) => entry.ready).map(([hand]) => hand) });
         if (request.method === "GET" && parts.length === 4) return this.attachHand(scope, decodeURIComponent(parts[3]), request, descriptor);
         return json({ error: "method not allowed" }, 405);
       }
@@ -320,15 +322,22 @@ export class AgentSession extends DurableObject<Env> {
           await this.ctx.storage.sync();
           const turnTiming = this.turnTimings.get(activeJob.request_id);
           if (turnTiming) turnTiming.running_sync_ms = performance.now() - runningSync;
+          const hand = this.descriptor(activeJob).hand;
+          if (hand && !activeJob.cancel_requested) {
+            const waited = await this.awaitHand(scope, hand);
+            if (turnTiming) turnTiming.hand_wait_ms = waited;
+          }
           const latest = this.job(activeJob.request_id)!;
           const runStarted = performance.now();
-          const result = latest.cancel_requested ? await runtime.cancel(activeJob.request_id) : await runtime.run({ request_id: activeJob.request_id, prompt: activeJob.prompt, hand: this.descriptor(activeJob).hand });
+          const result = latest.cancel_requested ? await runtime.cancel(activeJob.request_id) : await runtime.run({ request_id: activeJob.request_id, prompt: activeJob.prompt, hand });
           if (turnTiming) turnTiming.run_ms = performance.now() - runStarted;
           if (result.retry) throw new Error("runtime recovery required");
           waiting = !!result.waiting;
           if (!result.waiting) this.finish(activeJob, result);
         } else if (first) {
-          const result = await runtime.resume(first, pendingJob ? this.descriptor(pendingJob).hand : undefined);
+          const hand = pendingJob ? this.descriptor(pendingJob).hand : undefined;
+          if (hand) await this.awaitHand(scope, hand);
+          const result = await runtime.resume(first, hand);
           if (result.retry) throw new Error("runtime recovery required");
           waiting = !!result.waiting;
         }
@@ -485,13 +494,31 @@ export class AgentSession extends DurableObject<Env> {
     let hands = this.hands.get(scope);
     if (!hands) this.hands.set(scope, hands = new Map());
     const previous = hands.get(hand);
-    hands.set(hand, { connection, executor });
+    hands.set(hand, { connection, executor, ready: false });
     this.connections.set(connection, executor);
     void executor.closed.then(() => this.detachHand(scope, hand, connection));
     if (previous) await previous.executor.dispose();
     const resident = this.runtimes.get(scope);
     const runtime = resident && await resident.catch(() => undefined);
     if (runtime && hands.get(hand)?.connection === connection) await runtime.attach(hand, connection).catch(() => {});
+    const entry = hands.get(hand);
+    if (entry?.connection !== connection) return;
+    entry.ready = true;
+    if (this.handWait?.scope === scope && this.handWait.hand === hand) this.handWait.resolve();
+  }
+
+  private async awaitHand(scope: string, hand: string): Promise<number> {
+    if (this.hands.get(scope)?.get(hand)?.ready) return 0;
+    const started = performance.now();
+    const grace = policy(this.env.HANDS_ATTACH_GRACE_MS, "HANDS_ATTACH_GRACE_MS");
+    let timer: number | undefined;
+    await new Promise<void>(resolve => {
+      this.handWait = { scope, hand, resolve };
+      timer = setTimeout(resolve, grace);
+    });
+    if (timer !== undefined) clearTimeout(timer);
+    this.handWait = undefined;
+    return performance.now() - started;
   }
 
   private detachHand(scope: string, hand: string, connection: string): void {
@@ -519,6 +546,7 @@ export class AgentSession extends DurableObject<Env> {
     if (!job || job.scope !== scope) return json({ error: "request not found" }, 404);
     if (!["queued", "running"].includes(job.status)) return json(this.publicJob(job));
     this.ctx.storage.sql.exec("UPDATE jobs SET cancel_requested = 1 WHERE request_id = ?", id);
+    if (this.running?.job.request_id === id) this.handWait?.resolve();
     if (job.status === "queued") this.finish(job, { cancelled: true, error: "request cancelled" });
     else {
       const resident = this.runtimes.get(scope);
