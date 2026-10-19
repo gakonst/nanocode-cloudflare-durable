@@ -166,7 +166,7 @@ const name = `background-${Date.now()}`;
 const base = `http://worker/sessions/${name}`;
 const headers = { authorization: "Bearer local-measurement", "content-type": "application/json" };
 const request = async (url, init = {}) => mf.dispatchFetch(url, { ...init, headers });
-const sql = async (query, ...bindings) => (await mf.unsafeGetDurableObjectStorage("nanocode-worker", "AgentSession", { name })).exec(query, ...bindings);
+const sql = async (query, ...bindings) => (await mf.unsafeGetDurableObjectStorage("nanocode", "AgentSession", { name: JSON.stringify(["owner", name]) })).exec(query, ...bindings);
 const count = (filter = () => true) => calls.filter(filter).length;
 const steps = [];
 const findings = [];
@@ -288,7 +288,7 @@ async function eventSummary() {
 
 try {
   await mf.ready;
-  const bindings = await mf.getBindings("nanocode-worker");
+  const bindings = await mf.getBindings("nanocode");
   for (const key of ["ANTHROPIC_API_KEY", "OAUTH_JSON", "ACCOUNTS", "VAULT_KEY", "RUNNER_TOKEN", "WORKER_TOKEN", "VAULT"]) if (key in bindings) throw new Error("Provider secret boundary is violated");
 
   phase = "1-spawn";

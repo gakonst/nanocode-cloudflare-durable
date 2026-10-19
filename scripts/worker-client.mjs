@@ -3,7 +3,8 @@ import { createInterface } from "node:readline";
 import { performance } from "node:perf_hooks";
 import { parseArgs } from "node:util";
 
-const { values, positionals } = parseArgs({ allowPositionals: true, options: { origin: { type: "string", default: "https://nanocode-worker.gakonst.workers.dev" }, session: { type: "string" }, provider: { type: "string", default: "claude" }, executor: { type: "string" }, hand: { type: "string" }, "hand-log": { type: "string" }, label: { type: "string" }, timing: { type: "boolean", default: false } } });
+const { values, positionals } = parseArgs({ allowPositionals: true, options: { origin: { type: "string" }, session: { type: "string" }, provider: { type: "string", default: "claude" }, executor: { type: "string" }, hand: { type: "string" }, "hand-log": { type: "string" }, label: { type: "string" }, timing: { type: "boolean", default: false } } });
+if (!values.origin) throw new Error("Pass --origin with the Worker's HTTPS origin");
 const origin = new URL(values.origin);
 if (origin.username || origin.password || origin.search || origin.hash || origin.pathname !== "/" || origin.protocol !== "https:") throw new Error("Use an HTTPS origin");
 if (!values.session || !/^[A-Za-z0-9._-]{1,128}$/.test(values.session)) throw new Error("Pass --session");

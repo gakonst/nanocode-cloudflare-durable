@@ -1,16 +1,12 @@
 import { Miniflare, convertV4MiniflareOptions } from "miniflare";
 import { writeFileSync } from "node:fs";
 import { performance } from "node:perf_hooks";
-import { localOptions } from "./local-runtime.mjs";
+import { GATEWAY_KEY, LOCAL_TOKEN, localOptions } from "./local-runtime.mjs";
 
-const live = process.argv.includes("--live");
-const transport = process.argv.includes("--transport");
-const prompt = live ? "Reply exactly nanocode-worker-ok." : "Say hello";
+const prompt = "Say hello";
 let modelCalls = 0;
 let interruptNext = false;
 let failNext = false;
-let transportMode;
-let lateBodiesCancelled = 0;
 
 function stream(input, text = "durable wasm response") {
   const events = [
@@ -26,38 +22,26 @@ function stream(input, text = "durable wasm response") {
 
 const provider = async request => {
   const url = new URL(request.url);
-  if (url.hostname !== "provider.invalid" || request.headers.get("x-api-key") !== "local-provider") throw new Error("Provider request escaped configured credential policy");
+  if (url.hostname !== "provider.invalid" || request.headers.get("x-api-key") !== GATEWAY_KEY) throw new Error("Provider request escaped the gateway credential policy");
   const input = await request.json();
-  if (input.model !== "claude-opus-5-5" || JSON.stringify(input).includes("local-provider")) throw new Error("Invalid model or credentials entered model input");
+  if (input.model !== "claude-opus-5-5" || JSON.stringify(input).includes(GATEWAY_KEY)) throw new Error("Invalid model or credentials entered model input");
   modelCalls++;
-  const currentTransport = transportMode;
-  transportMode = undefined;
-  if (currentTransport === "headers") {
-    await new Promise(resolve => setTimeout(resolve, 800));
-    return new Response(new ReadableStream({ start(sink) { sink.enqueue(new TextEncoder().encode("late response")); }, cancel() { lateBodiesCancelled++; } }));
-  }
-  if (currentTransport === "body" || currentTransport === "error-body") return new Response(new ReadableStream({ start(sink) { sink.enqueue(new TextEncoder().encode("initial chunk\n")); } }), { status: currentTransport === "body" ? 200 : 400, headers: { "content-type": "text/event-stream" } });
-  if (currentTransport === "active") {
-    let chunks = 0;
-    return new Response(new ReadableStream({ async pull(sink) { await new Promise(resolve => setTimeout(resolve, 120)); if (++chunks > 8) sink.close(); else sink.enqueue(new TextEncoder().encode("active-stream\n")); } }));
-  }
-  if (failNext) { failNext = false; return Response.json({ error: { type: "invalid_request_error", message: "local-provider must never reach the agent" } }, { status: 400 }); }
+  if (failNext) { failNext = false; return Response.json({ error: { type: "invalid_request_error", message: "provider rejected the request" } }, { status: 400 }); }
   if (interruptNext) { interruptNext = false; return new Response(new ReadableStream({ start() {} }), { headers: { "content-type": "text/event-stream" } }); }
   return stream(input);
 };
 
-const options = localOptions({ live, provider: live ? undefined : provider, egress: transport && !live ? { MODEL_RESPONSE_HEADERS_TIMEOUT_MS: "200", MODEL_STREAM_IDLE_TIMEOUT_MS: "400" } : {} });
+const options = localOptions({ provider });
 let mf = new Miniflare(convertV4MiniflareOptions(options));
 const name = `measure-${Date.now()}`;
-const sessionName = name;
+const objectName = JSON.stringify(["owner", name]);
 const base = `http://worker/sessions/${name}/turns`;
-const headers = { authorization: "Bearer local-measurement", "content-type": "application/json" };
+const headers = { authorization: `Bearer ${LOCAL_TOKEN}`, "content-type": "application/json" };
 const request = async (url, init = {}) => mf.dispatchFetch(url, { ...init, headers });
 const measurements = [];
-const transportMeasurements = [];
 let session;
 
-async function until(condition, detail, timeout = live ? 120000 : 20000) {
+async function until(condition, detail, timeout = 20000) {
   const start = performance.now();
   while (!await condition()) {
     if (performance.now() - start > timeout) throw new Error(detail);
@@ -89,15 +73,13 @@ async function complete(id, start = performance.now(), expected = "completed") {
 }
 
 async function turn(id, expected) { const start = performance.now(); await submit(id); return complete(id, start, expected); }
-const storage = () => mf.unsafeGetDurableObjectStorage("nanocode-worker", "AgentSession", { name: sessionName });
+const storage = () => mf.unsafeGetDurableObjectStorage("nanocode", "AgentSession", { name: objectName });
 const metrics = async () => (await request(`http://worker/sessions/${name}/metrics`)).json();
 
 try {
   await mf.ready;
-  const bindings = await mf.getBindings("nanocode-worker");
-  for (const key of ["ANTHROPIC_API_KEY", "OAUTH_JSON", "ACCOUNTS", "VAULT_KEY", "RUNNER_TOKEN", "WORKER_TOKEN", "VAULT"]) if (key in bindings) throw new Error("Provider secret boundary is violated");
-  const egressBindings = await mf.getBindings("nanocode-egress");
-  for (const key of ["ANTHROPIC_API_KEY", "OAUTH_JSON", "CODEX_OAUTH_JSON", "VAULT_KEY", "RUNNER_TOKENS_JSON"]) if (key in egressBindings) throw new Error("A stored credential reached private egress");
+  const bindings = await mf.getBindings("nanocode");
+  if (Object.values(bindings).some(value => typeof value === "string" && value.includes(GATEWAY_KEY))) throw new Error("A provider credential reached the Worker");
   await turn("cold");
   await turn("warm");
   const warm = await metrics();
@@ -109,12 +91,12 @@ try {
   measurements.push({ id: "duplicate", milliseconds: performance.now() - replayStart });
   const conflict = await request(base, { method: "POST", body: JSON.stringify({ request_id: "cold", prompt: "Different prompt" }) });
   if (conflict.status !== 409) throw new Error("Conflicting request identity was accepted");
-  await mf.unsafeEvictDurableObject("nanocode-worker", "AgentSession", { name: sessionName });
+  await mf.unsafeEvictDurableObject("nanocode", "AgentSession", { name: objectName });
   await request(`${base}/cold`);
   const readOnly = await metrics();
   if (readOnly.runtime_initializations !== 0) throw new Error("Status polling initialized WASM");
   await turn("after-eviction");
-  if (!live) {
+  {
     const durable = await storage();
     await durable.exec("CREATE TRIGGER measurement_outage BEFORE UPDATE ON states BEGIN SELECT RAISE(ABORT, 'measurement checkpoint outage'); END");
     const callsBeforeOutage = modelCalls;
@@ -163,50 +145,13 @@ try {
     await complete("cancel-active", performance.now(), "cancelled");
     await complete("cancel-queued", performance.now(), "cancelled");
     await turn("after-cancellation");
-    if (transport) {
-      const bindings = await mf.getBindings("nanocode-worker");
-      const dispatch = signal => bindings.EGRESS.fetch(new Request("https://egress.internal/model", { method: "POST", signal, headers: { "content-type": "application/octet-stream", "x-nanocode-model": JSON.stringify({ authority: { account_id: "default", session_id: "transport-measurement" }, subscription: false, headers: [] }) }, body: JSON.stringify({ model: "claude-opus-5-5" }) }));
-      for (const fault of ["headers", "body", "error-body", "active"]) {
-        transportMode = fault;
-        const start = performance.now();
-        const response = await dispatch();
-        let failed = false;
-        let bytes = 0;
-        try { bytes = (await response.arrayBuffer()).byteLength; } catch { failed = true; }
-        const milliseconds = performance.now() - start;
-        console.log(JSON.stringify({ fault, status: response.status, failed, bytes, milliseconds }));
-        if ((fault === "headers" || fault === "error-body") && response.status !== 504) throw new Error(`Unbounded provider ${fault}`);
-        const counters = await (await bindings.EGRESS.fetch(new Request("https://egress.internal/metrics"))).json();
-        if (fault === "body" && (response.status !== 200 || counters.metrics.model_timeouts !== 2 || (!failed && bytes !== 14))) throw new Error("Stalled provider body did not terminate at its idle deadline");
-        if (fault === "active" && (response.status !== 200 || failed || bytes !== 112 || milliseconds < 900)) throw new Error("Active stream was cut off by its header deadline");
-        if (milliseconds > 3000) throw new Error("Provider transport deadline did not bound the operation");
-        transportMeasurements.push({ fault, status: response.status, failed, bytes, milliseconds });
-      }
-      transportMode = "headers";
-      const controller = new AbortController();
-      const start = performance.now();
-      const pending = dispatch(controller.signal);
-      setTimeout(() => controller.abort(), 50);
-      await pending.then(response => response.body?.cancel(), () => {});
-      if (performance.now() - start > 1000) throw new Error("Provider cancellation stalled");
-      transportMeasurements.push({ fault: "cancelled", milliseconds: performance.now() - start });
-      await new Promise(resolve => setTimeout(resolve, 900));
-      transportMeasurements.push({ late_bodies_cancelled: lateBodiesCancelled });
-      for (const fault of ["headers", "body"]) {
-        transportMode = fault;
-        const start = performance.now();
-        await turn(`sdk-${fault}-timeout`, ["completed", "failed"]);
-        if (performance.now() - start > 10000) throw new Error("Stalled provider blocked the SDK queue");
-      }
-      await turn("after-transport-timeouts");
-    }
     const savedState = await restored.exec("SELECT payload FROM states UNION ALL SELECT value AS payload FROM records UNION ALL SELECT body AS payload FROM events UNION ALL SELECT result AS payload FROM jobs");
-    if (JSON.stringify(savedState).includes("local-provider")) throw new Error("Provider credential appeared in agent persistence");
+    if (JSON.stringify(savedState).includes(GATEWAY_KEY)) throw new Error("Provider credential appeared in agent persistence");
   }
   const durable = await storage();
   const persisted = await durable.exec("SELECT (SELECT COUNT(*) FROM states) AS states, (SELECT COUNT(*) FROM records) AS records, (SELECT COUNT(*) FROM events) AS events, (SELECT COUNT(*) FROM jobs WHERE status = 'completed') AS completed, (SELECT COUNT(*) FROM jobs WHERE status IN ('queued', 'running')) AS unfinished");
   if (persisted[0].unfinished !== 0) throw new Error("Durable queue did not drain");
-  const report = { runtime: "local workerd", model: live ? "live Opus 5.5" : "mock Opus 5.5 SSE", warm, measurements, transportMeasurements, modelCalls: live ? undefined : modelCalls, persisted };
-  writeFileSync(live ? "output/subscription-measurement.json" : "output/local-measurement.json", JSON.stringify(report, null, 2));
+  const report = { runtime: "local workerd with a mock AI Gateway binding", model: "mock Opus 5.5 SSE", warm, measurements, modelCalls, persisted };
+  writeFileSync("output/local-measurement.json", JSON.stringify(report, null, 2));
   console.log(JSON.stringify(report, null, 2));
 } finally { await mf.dispose(); }

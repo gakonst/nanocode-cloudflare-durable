@@ -1,77 +1,43 @@
 import { Miniflare, convertV4MiniflareOptions } from "miniflare";
-import { randomBytes } from "node:crypto";
 import { writeFileSync } from "node:fs";
 import { performance } from "node:perf_hooks";
-import { localOptions } from "./local-runtime.mjs";
+import { GATEWAY_KEY, LOCAL_TOKEN, localOptions } from "./local-runtime.mjs";
 
-const CONNECT_DELAY_MS = 300;
-const LINGER_MS = 1500;
-const SAMPLES = 5;
-const MOCK = `
-const state = { handshakes: 0, open: 0, requests: [] };
+const held = [];
 
-function lastUser(body) {
-  const items = Array.isArray(body.input) ? body.input : [];
-  return JSON.stringify([...items].reverse().find(item => item.type === "message" && item.role === "user")?.content ?? "");
+function sse(model, text) {
+  const events = [
+    ["message_start", { type: "message_start", message: { id: "message-watch", type: "message", role: "assistant", model, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 8, output_tokens: 0 } } }],
+    ["content_block_start", { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } }],
+    ["content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "text_delta", text } }],
+    ["content_block_stop", { type: "content_block_stop", index: 0 }],
+    ["message_delta", { type: "message_delta", delta: { stop_reason: "end_turn", stop_sequence: null }, usage: { output_tokens: 4 } }],
+    ["message_stop", { type: "message_stop" }],
+  ];
+  return new Response(events.map(([event, data]) => `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`).join(""), { headers: { "content-type": "text/event-stream" } });
 }
 
-function reply(server, id) {
-  const item = { type: "message", id: "msg_" + id, role: "assistant", status: "completed", content: [{ type: "output_text", text: "watch-ok" }] };
-  server.send(JSON.stringify({ type: "response.created", response: { id, status: "in_progress" } }));
-  server.send(JSON.stringify({ type: "response.output_item.added", output_index: 0, item: { ...item, status: "in_progress", content: [] } }));
-  server.send(JSON.stringify({ type: "response.output_text.delta", output_index: 0, item_id: item.id, content_index: 0, delta: "watch-ok" }));
-  server.send(JSON.stringify({ type: "response.output_item.done", output_index: 0, item }));
-  server.send(JSON.stringify({ type: "response.completed", response: { id, status: "completed", model: "gpt-6.1-sol", output: [item], usage: { input_tokens: 8, output_tokens: 4, total_tokens: 12 } } }));
-}
-
-export default {
-  async fetch(incoming, env) {
-    if (new URL(incoming.url).hostname === "mock.control") return Response.json(state);
-    if (incoming.headers.get("upgrade")?.toLowerCase() !== "websocket") return new Response("websocket only", { status: 400 });
-    await new Promise(resolve => setTimeout(resolve, Number(env.CONNECT_DELAY_MS)));
-    const connection = ++state.handshakes;
-    const [client, server] = Object.values(new WebSocketPair());
-    server.accept();
-    state.open++;
-    let open = true;
-    const closed = () => {
-      if (open) { open = false; state.open--; }
-      try { server.close(1000, "closed"); } catch {}
-    };
-    server.addEventListener("close", closed);
-    server.addEventListener("error", closed);
-    server.addEventListener("message", event => {
-      const body = JSON.parse(String(event.data));
-      const held = lastUser(body).includes("hold the response");
-      state.requests.push({ connection, previous: body.previous_response_id ?? null, held });
-      if (!held) reply(server, "resp_" + state.requests.length);
-    });
-    return new Response(null, { status: 101, webSocket: client, headers: { "x-request-id": "req_ws_" + connection, "openai-model": "gpt-6.1-sol" } });
-  },
+const provider = async request => {
+  if (new URL(request.url).hostname !== "provider.invalid" || request.headers.get("x-api-key") !== GATEWAY_KEY) throw new Error("Provider request escaped the gateway credential policy");
+  const input = await request.json();
+  const last = JSON.stringify(input.messages?.at(-1)?.content ?? "");
+  if (last.includes("hold the response")) {
+    held.push(Date.now());
+    return new Response(new ReadableStream({ start() {} }), { headers: { "content-type": "text/event-stream" } });
+  }
+  return sse(input.model, "watch-ok");
 };
-`;
 
-const secret = () => randomBytes(32).toString("base64url");
-const segment = value => Buffer.from(JSON.stringify(value)).toString("base64url");
-const account = `account-${randomBytes(9).toString("base64url")}`;
-const access = [segment({ alg: "RS256", typ: "JWT" }), segment({ exp: Math.floor(Date.now() / 1000) + 3600, "https://api.openai.com/auth": { chatgpt_account_id: account } }), secret()].join(".");
-const options = localOptions({
-  provider: async () => { throw new Error("Private egress attempted direct network access"); },
-  agent: { MODEL_SOCKET_LINGER_MS: String(LINGER_MS) },
-  vault: { CODEX_OAUTH_JSON: JSON.stringify({ auth_mode: "chatgpt", tokens: { access_token: access, refresh_token: secret(), account_id: account } }), VAULT_KEY: secret() },
-  egressServices: { CODEX_TRANSPORT: "codex-mock" },
-  workers: [{ name: "codex-mock", routes: ["mock.control/*"], modules: [{ type: "ESModule", path: "codex-mock.mjs", contents: MOCK }], compatibilityDate: "2026-10-16", bindings: { CONNECT_DELAY_MS: String(CONNECT_DELAY_MS) } }],
-});
-const authorization = "Bearer local-measurement";
+const options = localOptions({ provider });
+const authorization = `Bearer ${LOCAL_TOKEN}`;
 const mf = new Miniflare(convertV4MiniflareOptions(options));
 const assertions = [];
 const check = (value, message) => { if (!value) throw new Error(message); assertions.push(message); };
-const median = values => { const sorted = [...values].sort((a, b) => a - b); return sorted.length ? sorted[Math.floor((sorted.length - 1) / 2)] : null; };
 const round = value => value === null || value === undefined ? value : Math.round(value * 100) / 100;
 const sleep = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
-const stats = async () => (await mf.dispatchFetch("https://mock.control/")).json();
 const metrics = async name => (await mf.dispatchFetch(`http://worker/sessions/${name}/metrics`, { headers: { authorization } })).json();
-const storage = name => mf.unsafeGetDurableObjectStorage("nanocode-worker", "AgentSession", { name });
+const objectName = name => JSON.stringify(["owner", name]);
+const storage = name => mf.unsafeGetDurableObjectStorage("nanocode", "AgentSession", { name: objectName(name) });
 
 async function until(condition, detail, timeout = 30000) {
   const started = performance.now();
@@ -108,15 +74,13 @@ async function reply(watcher, type, count) {
 async function socketTurn(watcher, id, prompt, extra = {}) {
   const started = performance.now();
   const replies = watcher.replies.filter(entry => entry.type === "turn").length;
-  watcher.socket.send(JSON.stringify({ type: "turn", request_id: id, prompt, provider: "codex", ...extra }));
+  watcher.socket.send(JSON.stringify({ type: "turn", request_id: id, prompt, ...extra }));
   const accepted = await reply(watcher, "turn", replies + 1);
   if (accepted.status !== 202) throw new Error(`Turn ${id} rejected with ${accepted.status}: ${JSON.stringify(accepted.body)}`);
   await until(async () => result(watcher, id), `Turn ${id} never reached the watcher`);
   const done = result(watcher, id);
   return { milliseconds: done.received - started, status: done.event.status, message: done.event.ok?.message };
 }
-
-const idle = () => until(async () => (await stats()).open === 0, "The model socket outlived the linger", LINGER_MS + 10000);
 
 try {
   await mf.ready;
@@ -138,45 +102,23 @@ try {
   await until(async () => backlog.events.length === primary.events.length && tail.events.at(-1)?.seq === primary.events.at(-1).seq, "Backlog did not replay");
   check(JSON.stringify(backlog.events.map(entry => [entry.seq, entry.event])) === JSON.stringify(primary.events.map(entry => [entry.seq, entry.event])) && tail.events[0].seq === middle + 1 && contiguous(tail), "A new watcher replays the stored events from its cursor exactly once");
 
-  const submitted = await mf.dispatchFetch(`http://worker/sessions/${name}/turns`, { method: "POST", headers: { authorization, "content-type": "application/json" }, body: JSON.stringify({ request_id: "http", prompt: "Say hello over HTTP", provider: "codex" }) });
+  const submitted = await mf.dispatchFetch(`http://worker/sessions/${name}/turns`, { method: "POST", headers: { authorization, "content-type": "application/json" }, body: JSON.stringify({ request_id: "http", prompt: "Say hello over HTTP" }) });
   check(submitted.status === 202, "An HTTP turn is still accepted alongside watchers");
   await until(async () => [primary, backlog, tail].every(watcher => result(watcher, "http")), "HTTP turn events did not fan out");
   check([primary, backlog, tail].every(contiguous) && backlog.events.at(-1).seq === primary.events.at(-1).seq && tail.events.at(-1).seq === primary.events.at(-1).seq, "Every watcher receives live events from turns submitted elsewhere without gaps or duplicates");
 
-  const cold = [];
-  for (let index = 0; index < SAMPLES; index++) {
-    await idle();
-    const before = (await stats()).handshakes;
-    cold.push(await socketTurn(primary, `cold-${index}`, "Say hello cold"));
-    check((await stats()).handshakes === before + 1, `Cold turn ${index} opened one model socket`);
-  }
-  const warm = [];
-  const warmHandshake = [];
-  for (let index = 0; index < SAMPLES; index++) {
-    await idle();
-    const before = (await stats()).handshakes;
-    const started = performance.now();
-    const replies = primary.replies.filter(entry => entry.type === "warm").length;
-    primary.socket.send(JSON.stringify({ type: "warm" }));
-    check((await reply(primary, "warm", replies + 1)).warmed === true, `Warm ${index} reported a preconnect`);
-    await until(async () => (await stats()).open === 1, "Warm did not open a model socket");
-    warmHandshake.push(performance.now() - started);
-    warm.push(await socketTurn(primary, `warm-${index}`, "Say hello warm"));
-    check((await stats()).handshakes === before + 1, `Warm turn ${index} reused the preconnected socket`);
-  }
-  await idle();
-  check((await stats()).open === 0, "A warmed socket closes after the linger");
+  primary.socket.send(JSON.stringify({ type: "warm" }));
+  check((await reply(primary, "warm", 1)).warmed === true, "Warm restores the resident runtime for the next turn");
 
-  primary.socket.send(JSON.stringify({ type: "turn", request_id: "held", prompt: "Please hold the response", provider: "codex" }));
-  await until(async () => (await stats()).requests.some(entry => entry.held), "Held request did not reach the model");
+  primary.socket.send(JSON.stringify({ type: "turn", request_id: "held", prompt: "Please hold the response" }));
+  await until(async () => held.length === 1, "Held request did not reach the model");
   primary.socket.send(JSON.stringify({ type: "cancel", request_id: "held" }));
   const cancelled = await reply(primary, "cancel", 1);
   await until(async () => result(primary, "held"), "Cancelled turn never finished");
   check(cancelled.status < 300 && result(primary, "held").event.status === "cancelled", "A cancel sent over the socket settles the turn as cancelled");
 
-  await idle();
   const startsBefore = (await metrics(name)).direct_starts;
-  const evicted = await mf.unsafeEvictDurableObject("nanocode-worker", "AgentSession", { name }).then(() => true, error => String(error));
+  const evicted = await mf.unsafeEvictDurableObject("nanocode", "AgentSession", { name: objectName(name) }).then(() => true, error => String(error));
   await sleep(200);
   check(evicted === true && [primary, backlog, tail].every(watcher => watcher.closed === null), "Watchers stay connected while the idle session object is evicted");
   primary.socket.send("ping");
@@ -203,19 +145,10 @@ try {
   check(true, "Closing a watcher removes its registration");
 
   const report = {
-    runtime: "local workerd (Miniflare): compiled WASM SDK in the session Durable Object, private egress, mock Codex Responses upstream bound as CODEX_TRANSPORT",
+    runtime: "local workerd (Miniflare): compiled WASM SDK in the session Durable Object, mock AI Gateway binding and Claude Messages upstream",
     assertions,
     events: { first_turn_ms: round(first.milliseconds), backlog_events: backlog.events.length },
-    latency: {
-      note: "Mock upstream adds a simulated handshake delay. Turn time is socket send to the result event on the same socket; warm turns are sent after the preconnected socket is open, as when the user is still typing.",
-      simulated_handshake_ms: CONNECT_DELAY_MS,
-      linger_ms: LINGER_MS,
-      cold_turn_ms: { samples: cold.length, median: round(median(cold.map(entry => entry.milliseconds))), max: round(Math.max(...cold.map(entry => entry.milliseconds))) },
-      warm_turn_ms: { samples: warm.length, median: round(median(warm.map(entry => entry.milliseconds))), max: round(Math.max(...warm.map(entry => entry.milliseconds))) },
-      warm_to_open_ms: { median: round(median(warmHandshake)) },
-      eviction_wake_turn_ms: round(woken.milliseconds),
-      close_handshake_ms: round(closeMs),
-    },
+    latency: { note: "Loopback mock upstream; informational only.", eviction_wake_turn_ms: round(woken.milliseconds), close_handshake_ms: round(closeMs) },
   };
   writeFileSync("output/watch-measurement.json", JSON.stringify(report, null, 2));
   console.log(JSON.stringify(report, null, 2));

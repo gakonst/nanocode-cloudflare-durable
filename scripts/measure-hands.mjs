@@ -255,7 +255,7 @@ try {
   const idle = await turn("where-idle", "hands-where", laptopName);
   expect(idle.results[0]?.text.includes(workspaces.laptop), `idle hand: ${JSON.stringify(idle.results)}`);
 
-  await mf.unsafeEvictDurableObject("nanocode-worker", "AgentSession", { name });
+  await mf.unsafeEvictDurableObject("nanocode", "AgentSession", { name: JSON.stringify(["owner", name]) });
   const hibernated = await attached();
   expect(hibernated.includes(laptopName) && hibernated.includes("desk"), `hands after the session left memory: ${JSON.stringify(hibernated)}`);
   const woken = await turn("where-woken", "hands-where", laptopName);
@@ -270,7 +270,7 @@ try {
   latencies.sort((a, b) => a - b);
 
   const report = {
-    runtime: "local workerd (Miniflare) public + egress Workers, nanocode hand processes dialing the session Durable Object over loopback",
+    runtime: "local workerd (Miniflare) Worker with a mock AI Gateway binding, nanocode hand processes dialing the session Durable Object over loopback",
     note: "Local transport and mock provider; not production colo latency.",
     hand_build_ms: buildMs,
     machine_named_hand: laptopName,
