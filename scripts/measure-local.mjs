@@ -20,28 +20,56 @@ function stream(input, text = "durable wasm response") {
   return new Response(events.map(([event, data]) => `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`).join(""), { headers: { "content-type": "text/event-stream" } });
 }
 
+const CODEX_TOOL_ROUNDS = 3;
 const codexRequests = [];
+const codexStored = new Set();
+const codexRounds = new Map();
+let codexTools = [];
+let codexHang = false;
 
-function responses(id) {
-  const item = { type: "message", id: `msg_${id}`, role: "assistant", status: "completed", content: [{ type: "output_text", text: "codex gateway response" }] };
+function responses(id, item) {
   const events = [
     { type: "response.created", response: { id, status: "in_progress" } },
-    { type: "response.output_item.added", output_index: 0, item: { ...item, status: "in_progress", content: [] } },
-    { type: "response.output_text.delta", output_index: 0, item_id: item.id, content_index: 0, delta: item.content[0].text },
+    { type: "response.output_item.added", output_index: 0, item: item.type === "message" ? { ...item, status: "in_progress", content: [] } : item },
+    ...(item.type === "message" ? [{ type: "response.output_text.delta", output_index: 0, item_id: item.id, content_index: 0, delta: item.content[0].text }] : []),
     { type: "response.output_item.done", output_index: 0, item },
     { type: "response.completed", response: { id, status: "completed", model: "gpt-6.1-sol", output: [item], usage: { input_tokens: 8, output_tokens: 4, total_tokens: 12 } } },
   ];
   return new Response(events.map(event => `data: ${JSON.stringify(event)}\n\n`).join(""), { headers: { "content-type": "text/event-stream", "x-request-id": `req_${id}` } });
 }
 
+function codex(text) {
+  const input = JSON.parse(text);
+  const items = Array.isArray(input.input) ? input.input : [];
+  for (const item of items) if (item.type === "additional_tools" && Array.isArray(item.tools)) codexTools = item.tools.map(tool => tool.name);
+  const entry = { model: input.model, store: input.store, stream: input.stream, input_items: items.length, body_bytes: Buffer.byteLength(text), previous: input.previous_response_id ?? null, credential_free: !text.includes(GATEWAY_KEY), status: 200 };
+  codexRequests.push(entry);
+  if (entry.previous && !codexStored.has(entry.previous)) {
+    entry.status = 400;
+    return Response.json({ error: { message: `Previous response with id '${entry.previous}' not found.`, type: "invalid_request_error", param: "previous_response_id", code: "previous_response_not_found" } }, { status: 400 });
+  }
+  const user = items.findLastIndex(item => item.type === "message" && item.role === "user");
+  const round = (user >= 0 ? 0 : codexRounds.get(entry.previous) ?? 0) + items.filter((item, index) => index > user && item.type === "function_call_output").length;
+  const id = `resp_${codexRequests.length}`;
+  entry.id = id;
+  codexRounds.set(id, round);
+  if (input.store) codexStored.add(id);
+  if (codexHang && round === 1) {
+    codexHang = false;
+    entry.held = true;
+    return new Response(new ReadableStream({ start() {} }), { headers: { "content-type": "text/event-stream" } });
+  }
+  const call = codexRequests.length;
+  return responses(id, round < CODEX_TOOL_ROUNDS
+    ? { type: "function_call", id: `fc_${call}`, call_id: `call_${call}`, name: "list_agents", arguments: "{}", status: "completed" }
+    : { type: "message", id: `msg_${call}`, role: "assistant", status: "completed", content: [{ type: "output_text", text: "codex gateway response" }] });
+}
+
 const provider = async request => {
   const url = new URL(request.url);
   if (url.hostname === "provider.invalid" && url.pathname === "/openai/v1/responses") {
     if (request.headers.get("authorization") !== `Bearer ${GATEWAY_KEY}`) throw new Error("Codex request escaped the gateway credential policy");
-    const text = await request.text();
-    const input = JSON.parse(text);
-    codexRequests.push({ model: input.model, store: input.store, stream: input.stream, input_items: Array.isArray(input.input) ? input.input.length : 0, previous: input.previous_response_id ?? null, credential_free: !text.includes(GATEWAY_KEY) });
-    return responses(`resp_${codexRequests.length}`);
+    return codex(await request.text());
   }
   if (url.hostname !== "provider.invalid" || request.headers.get("x-api-key") !== GATEWAY_KEY) throw new Error("Provider request escaped the gateway credential policy");
   const input = await request.json();
@@ -170,22 +198,41 @@ try {
     if (JSON.stringify(savedState).includes(GATEWAY_KEY)) throw new Error("Provider credential appeared in agent persistence");
   }
   const codexName = `codex-${Date.now()}`;
-  const codexTurn = async id => {
+  const codexPath = `http://worker/sessions/${codexName}`;
+  const codexTurn = async (id, cancel = false) => {
+    const from = codexRequests.length;
     const started = performance.now();
-    const submitted = await request(`http://worker/sessions/${codexName}/turns`, { method: "POST", body: JSON.stringify({ request_id: id, prompt, provider: "codex" }) });
+    const submitted = await request(`${codexPath}/turns`, { method: "POST", body: JSON.stringify({ request_id: id, prompt, provider: "codex" }) });
     if (submitted.status !== 202) throw new Error(`Codex submit rejected: ${await submitted.text()}`);
+    if (cancel) {
+      await until(() => codexRequests.slice(from).some(entry => entry.held), `Codex turn ${id} did not reach its held call`);
+      await request(`${codexPath}/turns/${id}/cancel`, { method: "POST" });
+    }
     let result;
     await until(async () => {
-      result = await (await request(`http://worker/sessions/${codexName}/turns/${id}`)).json();
+      result = await (await request(`${codexPath}/turns/${id}`)).json();
       return ["failed", "completed", "cancelled"].includes(result.status);
     }, `Codex turn ${id} stalled`);
-    measurements.push({ id: `codex-${id}`, milliseconds: performance.now() - started, result });
-    return result;
+    const calls = codexRequests.slice(from);
+    measurements.push({ id: `codex-${id}`, milliseconds: performance.now() - started, result, calls });
+    return { result, calls, answered: calls.filter(entry => entry.status === 200) };
   };
+  const continues = turn => turn.answered.slice(1).every((entry, index) => entry.previous === turn.answered[index].id && entry.input_items < codexRequests[0].input_items);
   const codexFirst = await codexTurn("first");
   const codexSecond = await codexTurn("second");
-  if (codexFirst.ok?.message !== "codex gateway response" || codexSecond.ok?.message !== "codex gateway response" || codexFirst.ok.model !== "gpt-6.1-sol") throw new Error(`Codex turns did not complete through AI Gateway: ${JSON.stringify([codexFirst, codexSecond])}`);
-  if (codexRequests.length !== 2 || !codexRequests.every(entry => entry.model === "gpt-6.1-sol" && entry.store === false && entry.stream && entry.previous === null && entry.credential_free) || codexRequests[1].input_items <= codexRequests[0].input_items) throw new Error(`Codex gateway requests were not stateless full replays: ${JSON.stringify(codexRequests)}`);
+  await mf.unsafeEvictDurableObject("nanocode", "AgentSession", { name: JSON.stringify(["owner", codexName]) });
+  const codexRestored = await codexTurn("after-eviction");
+  codexStored.clear();
+  const codexExpired = await codexTurn("expired");
+  codexHang = true;
+  const codexCancelled = await codexTurn("cancelled", true);
+  const codexResumed = await codexTurn("after-cancellation");
+  const codexCompleted = [codexFirst, codexSecond, codexRestored, codexExpired, codexResumed];
+  if (!codexTools.includes("list_agents")) throw new Error(`Codex tools did not include list_agents: ${codexTools}`);
+  if (!codexCompleted.every(turn => turn.result.ok?.message === "codex gateway response" && turn.result.ok.model === "gpt-6.1-sol" && turn.answered.length === CODEX_TOOL_ROUNDS + 1) || codexCancelled.result.status !== "cancelled") throw new Error(`Codex turns did not complete through AI Gateway: ${JSON.stringify(codexCompleted.map(turn => turn.result))}`);
+  if (!codexRequests.every(entry => entry.model === "gpt-6.1-sol" && entry.store === true && entry.stream && entry.credential_free)) throw new Error(`Codex gateway requests were not stored: ${JSON.stringify(codexRequests)}`);
+  if (codexFirst.calls[0].previous !== null || codexSecond.answered[0].previous !== codexFirst.answered.at(-1).id || !codexCompleted.every(continues)) throw new Error(`Codex model calls did not continue stored responses: ${JSON.stringify(codexRequests)}`);
+  if (codexExpired.calls[0].status !== 400 || codexExpired.answered[0].previous !== null || codexExpired.answered[0].input_items <= codexRequests[0].input_items) throw new Error(`An unknown previous response did not fall back to a full replay: ${JSON.stringify(codexExpired.calls)}`);
   const durable = await storage();
   const persisted = await durable.exec("SELECT (SELECT COUNT(*) FROM states) AS states, (SELECT COUNT(*) FROM records) AS records, (SELECT COUNT(*) FROM events) AS events, (SELECT COUNT(*) FROM jobs WHERE status = 'completed') AS completed, (SELECT COUNT(*) FROM jobs WHERE status IN ('queued', 'running')) AS unfinished");
   if (persisted[0].unfinished !== 0) throw new Error("Durable queue did not drain");

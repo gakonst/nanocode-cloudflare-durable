@@ -1105,6 +1105,7 @@ dependencies = [
  "nanocode-agent-types",
  "nanocode-home",
  "nanocode-platform",
+ "nanocode-sync",
  "nanocode-tool-contracts",
  "nanocode-types",
  "serde",
@@ -1591,6 +1592,7 @@ dependencies = [
  "arc-swap",
  "futures-util",
  "nanocode-platform",
+ "sync_wrapper",
  "tokio",
 ]
 

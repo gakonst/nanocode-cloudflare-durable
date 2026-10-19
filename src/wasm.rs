@@ -181,7 +181,6 @@ async fn open(config: Configuration) -> Result<Session, String> {
                 openai
                     .model(Model::Sol)
                     .raw_api_events(false)
-                    .store(false)
                     .api_base_url(config.endpoint)
                     .host_transport(transport::WorkerTransport)
                     .build()

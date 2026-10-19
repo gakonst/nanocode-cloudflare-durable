@@ -2,7 +2,7 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import { performance } from "node:perf_hooks";
 import { parseArgs } from "node:util";
 
-const { values, positionals } = parseArgs({ allowPositionals: true, options: { turns: { type: "string", default: "2" }, idle: { type: "string", default: "0" }, label: { type: "string" }, session: { type: "string" } } });
+const { values, positionals } = parseArgs({ allowPositionals: true, options: { turns: { type: "string", default: "2" }, idle: { type: "string", default: "0" }, label: { type: "string" }, session: { type: "string" }, prefix: { type: "string", default: "history" } } });
 const origin = new URL(positionals[0] ?? "https://nanocode.gakonst.workers.dev");
 const token = process.env.WORKER_TOKEN;
 if (!token || /[\r\n]/.test(token)) throw new Error("Provide WORKER_TOKEN through your secret manager");
@@ -36,12 +36,14 @@ async function turn(id) {
   }
 }
 
+await observe();
+const prior = new Set(diagnostics.keys());
 const results = [];
 const count = Number(values.turns);
-for (let index = 1; index <= count; index++) results.push(await turn("history-" + index));
+for (let index = 1; index <= count; index++) results.push(await turn(values.prefix + "-" + index));
 if (Number(values.idle) > 0) {
   await new Promise(resolve => setTimeout(resolve, Number(values.idle) * 1000));
-  results.push({ ...(await turn("after-idle")), idle_s: Number(values.idle) });
+  results.push({ ...(await turn(values.prefix + "-after-idle")), idle_s: Number(values.idle) });
 }
 const events = [];
 for (let after = 0; ;) {
@@ -51,7 +53,7 @@ for (let after = 0; ;) {
   after = page.next_cursor;
 }
 const sdk = events.filter(entry => entry.event?.source === "agent").map(entry => ({ request_id: entry.request_id, type: entry.event.event?.type, payload: entry.event.event?.payload ?? {} }));
-const dispatches = [...diagnostics.values()].map(entry => {
+const dispatches = [...diagnostics].filter(([key]) => !prior.has(key)).map(([, entry]) => {
   const attempt = Array.isArray(entry.attempts) ? entry.attempts.at(-1) : entry;
   const timing = timings.get(entry.runtime_id + ":" + entry.dispatch_id);
   return { runtime_id: entry.runtime_id, dispatch_id: entry.dispatch_id, transport: entry.transport, websocket: entry.websocket === true, status: entry.status, request_bytes: attempt?.body_bytes ?? null, input_items: attempt?.input_items ?? null, previous_response_id: attempt?.continued ?? null, headers_ms: timing?.headers_ms ?? null, last_byte_ms: timing?.last_byte_ms ?? null, response_bytes: timing?.bytes ?? null };
