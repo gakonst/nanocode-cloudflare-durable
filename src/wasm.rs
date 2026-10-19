@@ -1,4 +1,3 @@
-mod auth;
 mod bridge;
 mod events;
 #[path = "remote/runtime.rs"]
@@ -14,14 +13,15 @@ use std::{
 };
 
 use nanocode::{
-    Agent, ClaudeClient, ClaudeModel, CodeModeExecutors, CodeModeHost, ExecutionPolicyDisposition,
-    ExecutorSelection, Model, ModelSelection, Nanocode, NanocodeError, OpenAi, PromptRequest,
+    Agent, ClaudeClient, ClaudeModel, CodeModeExecutors, CodeModeHost, DurableOutcome, SessionEvents,
+    Model, ModelSelection, Nanocode, NanocodeError, OpenAi, PromptRequest,
     Tools, TurnControl,
     backend::Prompt,
     codex::{OpenAiAuth, transport::ResponsesTransport},
-    durability::{SessionRecord, SessionStore, TurnStatus},
+    durability::{SessionRecord, TurnStatus},
     subagents::SubagentActivity,
 };
+use nanocode_code_mode::remote::PLACEMENT_INSTRUCTIONS;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -103,8 +103,7 @@ struct Session {
     executors: CodeModeExecutors,
     hands: RefCell<HashMap<String, (String, Arc<dyn CodeModeHost>)>>,
     agent: Agent,
-    store: SessionStore,
-    events: events::Events,
+    events: SessionEvents,
     model: String,
     opened: Vec<String>,
     busy: Cell<bool>,
@@ -160,16 +159,18 @@ async fn open(config: Configuration) -> Result<Session, String> {
     let mut builder = Nanocode::builder();
     builder = match config.provider {
         Provider::Claude => {
-            let http = nanocode::claude::transport::HttpClient::new(transport::WorkerTransport);
+            let http = nanocode::claude::transport::HttpClient::new(
+                nanocode::claude::transport::SenderTransport(transport::WorkerTransport),
+            );
             let mut client =
-                ClaudeClient::with_auth_provider(http, config.endpoint, Arc::new(auth::WorkerAuth));
+                ClaudeClient::with_auth_headers(http, config.endpoint, http::HeaderMap::new());
             if config.subscription {
                 client = client.subscription_compatibility();
             }
             builder.claude(client)
         }
         Provider::Codex => builder.openai(
-            OpenAi::builder(OpenAiAuth::managed_chatgpt(Arc::new(auth::WorkerAuth)))
+            OpenAi::builder(OpenAiAuth::host_managed_chatgpt())
                 .model(Model::Sol)
                 .transport(ResponsesTransport::WebSocket)
                 .raw_api_events(false)
@@ -199,7 +200,7 @@ async fn open(config: Configuration) -> Result<Session, String> {
     }
     if config.remote || config.hands {
         builder = builder
-            .instructions("Code Mode scripts run on one machine: the hand that sent the prompt, the only attached hand, or the session's configured executor. Inside a script any tool call runs on another attached hand when its arguments include hand: \"<name>\", so one script can work on several machines at once, for example with Promise.all; tools.hands() lists them. Relative paths resolve from each hand's working directory; query pwd through the shell when an absolute path is needed.")
+            .instructions(PLACEMENT_INSTRUCTIONS)
             .code_mode_host(executors.clone())
             .map_err(text)?;
     }
@@ -210,7 +211,8 @@ async fn open(config: Configuration) -> Result<Session, String> {
     let opened = async {
         let stored = store.load(&config.session_id).await.map_err(text)?;
         let (agent, stream) = runtime.open_loaded(&store, &stored).await.map_err(text)?;
-        let events = events::Events::start(stream, subagents, coalesce);
+        let (events, pump) = SessionEvents::start(stream, subagents, coalesce, events::WorkerSink);
+        bridge::spawn(pump);
         let pending = stored
             .turns
             .iter()
@@ -231,7 +233,6 @@ async fn open(config: Configuration) -> Result<Session, String> {
             executors,
             hands: RefCell::default(),
             agent,
-            store,
             events,
             model,
             opened,
@@ -339,32 +340,23 @@ impl Session {
         if self.events.drained().await.is_err() {
             return Ok(json!({"retry": true}));
         }
-        let error = match outcome {
-            Ok(message) => {
-                return Ok(json!({"ok": {
+        Ok(
+            match self
+                .runtime
+                .durable_outcome(self.root(), request_id, outcome)
+                .await
+            {
+                DurableOutcome::Completed(message) => json!({"ok": {
                     "session_id": self.root(),
                     "model": self.model,
                     "message": message,
-                }}));
-            }
-            Err(error) => error,
-        };
-        let blocked =
-            error.execution_policy_disposition() == Some(ExecutionPolicyDisposition::Retry);
-        let status = self
-            .store
-            .turn(self.root(), request_id)
-            .await
-            .map(|turn| turn.map(|turn| turn.status));
-        Ok(match status {
-            Ok(Some(TurnStatus::Failed)) => json!({"error": error.to_string()}),
-            Ok(Some(TurnStatus::Cancelled)) => json!({"cancelled": true}),
-            Ok(Some(TurnStatus::Pending) | None) if blocked => waiting(),
-            Ok(None) if matches!(error, NanocodeError::InvalidRequest(_)) => {
-                json!({"error": error.to_string()})
-            }
-            _ => json!({"retry": true}),
-        })
+                }}),
+                DurableOutcome::Failed(error) => json!({"error": error}),
+                DurableOutcome::Cancelled => json!({"cancelled": true}),
+                DurableOutcome::Waiting => waiting(),
+                DurableOutcome::Interrupted => json!({"retry": true}),
+            },
+        )
     }
 
     async fn run(
@@ -377,13 +369,8 @@ impl Session {
             return Ok(waiting());
         }
         let _busy = Busy(self);
-        let names = self.executors.names();
-        let hand = hand.map(Arc::from).or_else(|| match names.as_slice() {
-            [only] if self.executors.default_executor().is_none() => Some(Arc::clone(only)),
-            _ => None,
-        });
         self.executors
-            .select(self.root(), hand.map(ExecutorSelection::Executor));
+            .select_prompt_hand(self.root(), hand.as_deref());
         self.execute(request_id, prompt, false).await
     }
 
@@ -402,19 +389,10 @@ impl Session {
     }
 
     async fn stored(&self, request_id: &str) -> Result<Option<Prompt>, String> {
-        match self
-            .store
-            .turn(self.root(), request_id)
+        self.runtime
+            .durable_prompt(&self.agent, request_id)
             .await
-            .map_err(text)?
-        {
-            Some(turn) => self
-                .agent
-                .decode_durable_prompt(turn.input)
-                .map(Some)
-                .map_err(text),
-            None => Ok(None),
-        }
+            .map_err(text)
     }
 
     async fn resume(&self, request_id: &str, hand: Option<String>) -> Result<Value, String> {
@@ -458,14 +436,7 @@ impl Session {
     }
 
     async fn pending_ids(&self) -> Result<Vec<String>, String> {
-        Ok(self
-            .store
-            .pending_turns(self.root())
-            .await
-            .map_err(text)?
-            .into_iter()
-            .map(|turn| turn.id)
-            .collect())
+        self.runtime.pending_turns(self.root()).await.map_err(text)
     }
 
     async fn pending(&self) -> Result<Value, String> {
@@ -483,24 +454,16 @@ impl Session {
         }))
     }
 
-    async fn idle(&self, activity: &SubagentActivity) -> Result<bool, String> {
-        Ok(self.live.borrow().is_empty()
-            && !remote::busy()
-            && activity.is_quiescent()
-            && self.pending_ids().await?.is_empty())
+    fn host_idle(&self) -> bool {
+        self.live.borrow().is_empty() && !remote::busy()
     }
 
     async fn settle(&self) -> Result<bool, String> {
         self.events.drained().await?;
-        let before = self.activity().await;
-        if !self.idle(&before).await? {
+        if !self.host_idle() {
             return Ok(false);
         }
-        if let Some(control) = self.runtime.subagents() {
-            control.persist(self.root()).await.map_err(text)?;
-        }
-        let after = self.activity().await;
-        Ok(after.revision == before.revision && self.idle(&after).await?)
+        Ok(self.runtime.settle(self.root()).await.map_err(text)? && self.host_idle())
     }
 }
 

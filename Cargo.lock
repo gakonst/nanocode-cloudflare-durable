@@ -1068,6 +1068,8 @@ dependencies = [
 name = "nanocode-agent"
 version = "0.6.7"
 dependencies = [
+ "arc-swap",
+ "futures-util",
  "nanocode-agent-config",
  "nanocode-agent-core",
  "nanocode-durability",
@@ -1077,6 +1079,7 @@ dependencies = [
  "nanocode-subagents",
  "nanocode-tool-contracts",
  "nanocode-tool-host",
+ "serde_json",
  "tokio",
  "tracing",
 ]
@@ -1097,6 +1100,7 @@ dependencies = [
 name = "nanocode-agent-core"
 version = "0.6.7"
 dependencies = [
+ "arc-swap",
  "futures-util",
  "nanocode-agent-types",
  "nanocode-home",
@@ -1105,6 +1109,7 @@ dependencies = [
  "nanocode-types",
  "serde",
  "serde_json",
+ "tokio",
  "uuid",
 ]
 
@@ -1122,6 +1127,7 @@ dependencies = [
  "nanocode-process",
  "nanocode-process-contracts",
  "nanocode-store-jsonl",
+ "nanocode-sync",
  "nanocode-tool-contracts",
  "nanocode-tool-host",
  "nanocode-tool-runtime",
@@ -1145,6 +1151,7 @@ dependencies = [
 name = "nanocode-audio"
 version = "0.6.7"
 dependencies = [
+ "arc-swap",
  "base64 0.22.1",
  "base64-simd",
  "sha1",
@@ -1173,6 +1180,7 @@ dependencies = [
  "nanocode-platform",
  "nanocode-process",
  "nanocode-process-contracts",
+ "nanocode-sync",
  "nanocode-tool-contracts",
  "nanocode-tool-host",
  "nanocode-tools",
@@ -1188,6 +1196,7 @@ dependencies = [
 name = "nanocode-backend-claude-client"
 version = "0.6.7"
 dependencies = [
+ "arc-swap",
  "base64 0.22.1",
  "blake3",
  "futures-util",
@@ -1198,6 +1207,7 @@ dependencies = [
  "nanocode-home",
  "nanocode-http",
  "nanocode-platform",
+ "nanocode-sync",
  "nanocode-tls",
  "reqwest",
  "serde",
@@ -1219,6 +1229,7 @@ dependencies = [
  "base64 0.22.1",
  "image",
  "nanocode-home",
+ "nanocode-sync",
  "nanocode-tools",
  "nix 0.31.3",
  "schemars",
@@ -1232,6 +1243,7 @@ dependencies = [
 name = "nanocode-backend-codex"
 version = "0.6.7"
 dependencies = [
+ "arc-swap",
  "async-trait",
  "base64 0.22.1",
  "base64-simd",
@@ -1249,6 +1261,7 @@ dependencies = [
  "nanocode-platform",
  "nanocode-process",
  "nanocode-process-contracts",
+ "nanocode-sync",
  "nanocode-tls",
  "nanocode-tool-contracts",
  "nanocode-tool-host",
@@ -1273,6 +1286,7 @@ version = "0.6.7"
 dependencies = [
  "arc-swap",
  "base64 0.22.1",
+ "flate2",
  "futures-util",
  "getrandom 0.4.3",
  "http",
@@ -1282,7 +1296,9 @@ dependencies = [
  "nanocode-agent-types",
  "nanocode-audio",
  "nanocode-home",
+ "nanocode-http",
  "nanocode-platform",
+ "nanocode-sync",
  "nanocode-tls",
  "nanocode-types",
  "reqwest",
@@ -1291,6 +1307,7 @@ dependencies = [
  "sha2",
  "thiserror 2.0.21",
  "tokio",
+ "tokio-rustls",
  "tokio-tungstenite",
  "tower",
  "tracing",
@@ -1306,6 +1323,8 @@ dependencies = [
  "futures-util",
  "nanocode-code-mode-engine",
  "nanocode-media",
+ "nanocode-platform",
+ "nanocode-sync",
  "nanocode-tool-contracts",
  "nanocode-tools",
  "nanocode-types-core",
@@ -1348,6 +1367,8 @@ dependencies = [
 name = "nanocode-durability"
 version = "0.6.7"
 dependencies = [
+ "arc-swap",
+ "futures-util",
  "nanocode-agent-core",
  "nanocode-durability-core",
  "nanocode-platform",
@@ -1396,6 +1417,7 @@ dependencies = [
 name = "nanocode-image"
 version = "0.6.7"
 dependencies = [
+ "arc-swap",
  "base64 0.22.1",
  "base64-simd",
  "crc32fast",
@@ -1414,9 +1436,11 @@ dependencies = [
 name = "nanocode-mcp"
 version = "0.6.7"
 dependencies = [
+ "arc-swap",
  "base64 0.22.1",
  "futures-channel",
  "memchr",
+ "nanocode-sync",
  "serde",
  "serde_json",
  "sha2",
@@ -1428,12 +1452,14 @@ dependencies = [
 name = "nanocode-mcp-http"
 version = "0.6.7"
 dependencies = [
+ "arc-swap",
  "async-trait",
  "futures-util",
  "getrandom 0.4.3",
  "http",
  "nanocode-http",
  "nanocode-mcp",
+ "nanocode-sync",
  "nanocode-tls",
  "reqwest",
  "serde_json",
@@ -1453,6 +1479,7 @@ dependencies = [
  "nanocode-mcp",
  "nanocode-mcp-http",
  "nanocode-process",
+ "nanocode-sync",
  "nanocode-tls",
  "nanocode-tool-provider",
  "nanocode-tools",
@@ -1490,6 +1517,7 @@ dependencies = [
  "getrandom 0.4.3",
  "nanocode-home",
  "nanocode-process-contracts",
+ "nanocode-sync",
  "nix 0.31.3",
  "portable-pty",
  "rustix",
@@ -1547,6 +1575,7 @@ dependencies = [
  "nanocode-agent-core",
  "nanocode-platform",
  "nanocode-schema",
+ "nanocode-sync",
  "nanocode-tool-contracts",
  "serde",
  "serde_json",
@@ -1556,9 +1585,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "nanocode-sync"
+version = "0.6.7"
+dependencies = [
+ "arc-swap",
+ "futures-util",
+ "nanocode-platform",
+ "tokio",
+]
+
+[[package]]
 name = "nanocode-tls"
 version = "0.6.7"
 dependencies = [
+ "arc-swap",
+ "nanocode-sync",
  "rustls",
  "rustls-graviola",
  "rustls-native-certs",
@@ -1581,11 +1622,13 @@ dependencies = [
 name = "nanocode-tool-host"
 version = "0.6.7"
 dependencies = [
+ "arc-swap",
  "async-trait",
  "futures-util",
  "nanocode-code-mode",
  "nanocode-home",
  "nanocode-media",
+ "nanocode-sync",
  "nanocode-tool-contracts",
  "nanocode-tool-provider",
  "nanocode-tools",
@@ -1621,6 +1664,7 @@ dependencies = [
  "nanocode-mcp-tools",
  "nanocode-media",
  "nanocode-process",
+ "nanocode-sync",
  "nanocode-tls",
  "nanocode-tool-host",
  "nanocode-tool-provider",
@@ -1665,13 +1709,16 @@ dependencies = [
 name = "nanocode-types"
 version = "0.6.7"
 dependencies = [
+ "arc-swap",
  "futures-util",
  "nanocode-platform",
+ "nanocode-sync",
  "nanocode-types-core",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
