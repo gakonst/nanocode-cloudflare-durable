@@ -169,18 +169,25 @@ async fn open(config: Configuration) -> Result<Session, String> {
             }
             builder.claude(client)
         }
-        Provider::Codex => builder.openai(
-            OpenAi::builder(OpenAiAuth::host_managed_chatgpt())
-                .model(Model::Sol)
-                .transport(ResponsesTransport::WebSocket)
-                .raw_api_events(false)
-                .store(false)
-                .websocket_warmup(false)
-                .api_base_url(config.endpoint)
-                .host_transport(transport::WorkerTransport)
-                .build()
-                .map_err(text)?,
-        ),
+        Provider::Codex => {
+            let openai = if config.subscription {
+                OpenAi::builder(OpenAiAuth::host_managed_chatgpt())
+                    .transport(ResponsesTransport::WebSocket)
+                    .websocket_warmup(false)
+            } else {
+                OpenAi::builder(OpenAiAuth::gateway_managed()).transport(ResponsesTransport::Https)
+            };
+            builder.openai(
+                openai
+                    .model(Model::Sol)
+                    .raw_api_events(false)
+                    .store(false)
+                    .api_base_url(config.endpoint)
+                    .host_transport(transport::WorkerTransport)
+                    .build()
+                    .map_err(text)?,
+            )
+        }
     };
     let executors = CodeModeExecutors::new();
     builder = builder

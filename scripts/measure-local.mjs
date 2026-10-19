@@ -20,8 +20,29 @@ function stream(input, text = "durable wasm response") {
   return new Response(events.map(([event, data]) => `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`).join(""), { headers: { "content-type": "text/event-stream" } });
 }
 
+const codexRequests = [];
+
+function responses(id) {
+  const item = { type: "message", id: `msg_${id}`, role: "assistant", status: "completed", content: [{ type: "output_text", text: "codex gateway response" }] };
+  const events = [
+    { type: "response.created", response: { id, status: "in_progress" } },
+    { type: "response.output_item.added", output_index: 0, item: { ...item, status: "in_progress", content: [] } },
+    { type: "response.output_text.delta", output_index: 0, item_id: item.id, content_index: 0, delta: item.content[0].text },
+    { type: "response.output_item.done", output_index: 0, item },
+    { type: "response.completed", response: { id, status: "completed", model: "gpt-6.1-sol", output: [item], usage: { input_tokens: 8, output_tokens: 4, total_tokens: 12 } } },
+  ];
+  return new Response(events.map(event => `data: ${JSON.stringify(event)}\n\n`).join(""), { headers: { "content-type": "text/event-stream", "x-request-id": `req_${id}` } });
+}
+
 const provider = async request => {
   const url = new URL(request.url);
+  if (url.hostname === "provider.invalid" && url.pathname === "/openai/v1/responses") {
+    if (request.headers.get("authorization") !== `Bearer ${GATEWAY_KEY}`) throw new Error("Codex request escaped the gateway credential policy");
+    const text = await request.text();
+    const input = JSON.parse(text);
+    codexRequests.push({ model: input.model, store: input.store, stream: input.stream, input_items: Array.isArray(input.input) ? input.input.length : 0, previous: input.previous_response_id ?? null, credential_free: !text.includes(GATEWAY_KEY) });
+    return responses(`resp_${codexRequests.length}`);
+  }
   if (url.hostname !== "provider.invalid" || request.headers.get("x-api-key") !== GATEWAY_KEY) throw new Error("Provider request escaped the gateway credential policy");
   const input = await request.json();
   if (input.model !== "claude-opus-5-5" || JSON.stringify(input).includes(GATEWAY_KEY)) throw new Error("Invalid model or credentials entered model input");
@@ -148,10 +169,27 @@ try {
     const savedState = await restored.exec("SELECT payload FROM states UNION ALL SELECT value AS payload FROM records UNION ALL SELECT body AS payload FROM events UNION ALL SELECT result AS payload FROM jobs");
     if (JSON.stringify(savedState).includes(GATEWAY_KEY)) throw new Error("Provider credential appeared in agent persistence");
   }
+  const codexName = `codex-${Date.now()}`;
+  const codexTurn = async id => {
+    const started = performance.now();
+    const submitted = await request(`http://worker/sessions/${codexName}/turns`, { method: "POST", body: JSON.stringify({ request_id: id, prompt, provider: "codex" }) });
+    if (submitted.status !== 202) throw new Error(`Codex submit rejected: ${await submitted.text()}`);
+    let result;
+    await until(async () => {
+      result = await (await request(`http://worker/sessions/${codexName}/turns/${id}`)).json();
+      return ["failed", "completed", "cancelled"].includes(result.status);
+    }, `Codex turn ${id} stalled`);
+    measurements.push({ id: `codex-${id}`, milliseconds: performance.now() - started, result });
+    return result;
+  };
+  const codexFirst = await codexTurn("first");
+  const codexSecond = await codexTurn("second");
+  if (codexFirst.ok?.message !== "codex gateway response" || codexSecond.ok?.message !== "codex gateway response" || codexFirst.ok.model !== "gpt-6.1-sol") throw new Error(`Codex turns did not complete through AI Gateway: ${JSON.stringify([codexFirst, codexSecond])}`);
+  if (codexRequests.length !== 2 || !codexRequests.every(entry => entry.model === "gpt-6.1-sol" && entry.store === false && entry.stream && entry.previous === null && entry.credential_free) || codexRequests[1].input_items <= codexRequests[0].input_items) throw new Error(`Codex gateway requests were not stateless full replays: ${JSON.stringify(codexRequests)}`);
   const durable = await storage();
   const persisted = await durable.exec("SELECT (SELECT COUNT(*) FROM states) AS states, (SELECT COUNT(*) FROM records) AS records, (SELECT COUNT(*) FROM events) AS events, (SELECT COUNT(*) FROM jobs WHERE status = 'completed') AS completed, (SELECT COUNT(*) FROM jobs WHERE status IN ('queued', 'running')) AS unfinished");
   if (persisted[0].unfinished !== 0) throw new Error("Durable queue did not drain");
-  const report = { runtime: "local workerd with a mock AI Gateway binding", model: "mock Opus 5.5 SSE", warm, measurements, modelCalls, persisted };
+  const report = { runtime: "local workerd with a mock AI Gateway binding", model: "mock Opus 5.5 and Sol SSE", warm, measurements, modelCalls, codexRequests, persisted };
   writeFileSync("output/local-measurement.json", JSON.stringify(report, null, 2));
   console.log(JSON.stringify(report, null, 2));
 } finally { await mf.dispose(); }

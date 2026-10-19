@@ -12,11 +12,14 @@ function shim(entry) {
 function gateway(upstream) {
   return {
     async run(request, options) {
-      if (request.provider !== "anthropic" || request.endpoint !== "v1/messages") return Response.json({ error: "unsupported gateway route" }, { status: 400 });
+      const route = request.provider === "anthropic" && request.endpoint === "v1/messages" ? { url: "https://provider.invalid/v1/messages", header: ["x-api-key", "${GATEWAY_KEY}"] }
+        : request.provider === "openai" && request.endpoint === "responses" ? { url: "https://provider.invalid/openai/v1/responses", header: ["authorization", "Bearer ${GATEWAY_KEY}"] }
+        : null;
+      if (!route) return Response.json({ error: "unsupported gateway route" }, { status: 400 });
       const headers = new Headers(request.headers);
       if (headers.has("x-api-key") || headers.has("authorization")) return Response.json({ error: "the Worker sent a provider credential" }, { status: 400 });
-      headers.set("x-api-key", "${GATEWAY_KEY}");
-      return upstream.fetch(new Request("https://provider.invalid/v1/messages", { method: "POST", headers, body: JSON.stringify(request.query), signal: options?.signal }));
+      headers.set(...route.header);
+      return upstream.fetch(new Request(route.url, { method: "POST", headers, body: JSON.stringify(request.query), signal: options?.signal }));
     },
     async getUrl(provider) { return "https://gateway.invalid/local" + (provider ? "/" + provider : ""); },
   };

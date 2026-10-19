@@ -26,6 +26,7 @@ export type SessionDescriptor = SessionAuthority & {
   provider?: ModelProvider;
   session_name: string;
   subscription: boolean;
+  codex_subscription?: boolean;
   hand?: string;
 };
 

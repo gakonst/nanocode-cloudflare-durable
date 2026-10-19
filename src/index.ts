@@ -3,10 +3,10 @@ import { AgentRuntime } from "./host";
 import { CheckpointStore } from "./store";
 import { EventHub } from "./events";
 import { RemoteExecutor } from "./remote/host";
-import { DEFAULT_EXECUTOR, EXECUTOR_ID, RECENT_MODEL_LIMIT, headerJson, json, sessionUuid, type AgentResult, type ModelDispatch, type PrivateBinding, type SessionDescriptor } from "./contracts";
+import { DEFAULT_EXECUTOR, EXECUTOR_ID, RECENT_MODEL_LIMIT, headerJson, json, sessionUuid, type AgentResult, type ModelDispatch, type ModelProvider, type PrivateBinding, type SessionDescriptor } from "./contracts";
 import { Timings, timingDifference, type TimingSnapshot } from "./timing";
 
-export type { ModelDispatch, PrivateBinding, SessionAuthority, SessionDescriptor, SocketDispatch } from "./contracts";
+export type { ModelDispatch, ModelProvider, PrivateBinding, SessionAuthority, SessionDescriptor, SocketDispatch } from "./contracts";
 
 export interface NanocodeEnv {
   SESSIONS: DurableObjectNamespace;
@@ -26,7 +26,7 @@ export interface NanocodeEnv {
 export type NanocodeOptions<E extends NanocodeEnv> = {
   authenticate(request: Request, env: E): Promise<string | null> | string | null;
   egress(env: E): PrivateBinding;
-  subscription?(account: string, env: E): Promise<boolean> | boolean;
+  subscription?(account: string, env: E, provider: ModelProvider): Promise<boolean> | boolean;
 };
 
 type Job = { request_id: string; prompt: string; status: string; result: string | null; scope: string; descriptor: string; cancel_requested: number; first_seq: number | null; last_seq: number | null };
@@ -150,7 +150,7 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
         if (boundProvider && input.provider !== undefined && input.provider !== boundProvider) return json({ error: "session provider is immutable; create a new session" }, 409);
         descriptor.provider = input.provider ?? boundProvider ?? "claude";
         if (descriptor.provider === "codex" && descriptor.session_id && descriptor.session_id[14] !== "7") return json({ error: "Codex requires a new thread with a UUIDv7 session" }, 409);
-        if (descriptor.provider === "codex") descriptor.subscription = true;
+        if (descriptor.provider === "codex") descriptor.subscription = descriptor.codex_subscription ?? true;
         const existing = this.job(input.request_id);
         if (existing && (existing.prompt !== input.prompt || existing.scope !== scope || this.descriptor(existing).hand !== input.hand)) return json({ error: "request_id already belongs to different input or authority" }, 409);
         if (!existing) {
@@ -346,7 +346,7 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
             : undefined;
           void connecting?.catch(() => {});
           try {
-            const created = await AgentRuntime.create({ session_id: sessionId, provider: descriptor.provider ?? "claude", subscription: descriptor.subscription, endpoint: descriptor.provider === "codex" ? "https://chatgpt.com/backend-api/codex" : `https://api.anthropic.com/v1/messages${descriptor.subscription ? "?beta=true" : ""}`, remote: enabled, executor: descriptor.executor_id, hands: this.handsMode(scope, descriptor), event_coalesce_ms: duration(this.env.EVENT_COALESCE_MS, "EVENT_COALESCE_MS") }, this.store, {
+            const created = await AgentRuntime.create({ session_id: sessionId, provider: descriptor.provider ?? "claude", subscription: descriptor.subscription, endpoint: descriptor.provider === "codex" ? (descriptor.subscription ? "https://chatgpt.com/backend-api/codex" : "https://api.openai.com/v1") : `https://api.anthropic.com/v1/messages${descriptor.subscription ? "?beta=true" : ""}`, remote: enabled, executor: descriptor.executor_id, hands: this.handsMode(scope, descriptor), event_coalesce_ms: duration(this.env.EVENT_COALESCE_MS, "EVENT_COALESCE_MS") }, this.store, {
           remote: {
             failed: () => remoteFailed || remote?.failure !== undefined,
             execute: async (request: any, id: number) => {
@@ -802,8 +802,9 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
     let name: string;
     try { name = decodeURIComponent(match[1]); } catch { return json({ error: "invalid session encoding" }, 400); }
     if (!name || name.includes("\0")) return json({ error: "invalid session name" }, 400);
-    const subscription = options.subscription ? await options.subscription(account, env) : env.MODEL_AUTH === "subscription";
-    const descriptor: SessionDescriptor = { account_id: account, session_id: "", session_name: name, subscription };
+    const mode = (provider: ModelProvider) => options.subscription ? options.subscription(account, env, provider) : env.MODEL_AUTH === "subscription";
+    const [subscription, codex_subscription] = await Promise.all([mode("claude"), mode("codex")]);
+    const descriptor: SessionDescriptor = { account_id: account, session_id: "", session_name: name, subscription, codex_subscription };
     let path = `/internal/${match[2] ?? "metrics"}`;
     if (match[4]) path = `/internal/cancel/${match[3]}`;
     else if (match[3]) path += `/${match[3]}`;
