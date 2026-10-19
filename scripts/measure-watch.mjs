@@ -188,7 +188,11 @@ try {
   const restored = await metrics(name);
   check(woken.status === "completed" && startsBefore > 1 && restored.direct_starts === 1 && restored.runtime_initializations === 1 && [primary, backlog, tail].every(contiguous) && primary.events.find(entry => entry.seq > seen).seq === seen + 1, "A turn sent over a hibernated socket wakes the session and every watcher resumes at its cursor");
 
+  const closing = performance.now();
   tail.socket.close(1000, "done");
+  await until(async () => tail.closed, "The session did not answer the close handshake", 5000);
+  const closeMs = performance.now() - closing;
+  check(tail.closed.code === 1000, "The session answers a client close handshake");
   const resumed = await attach(name, seen);
   await until(async () => result(resumed, "after-eviction"), "Resumed watcher missed events");
   check(resumed.events[0].seq === seen + 1 && resumed.events.at(-1).seq === primary.events.at(-1).seq && contiguous(resumed), "Reconnecting with after resumes exactly after the last seen event");
@@ -210,6 +214,7 @@ try {
       warm_turn_ms: { samples: warm.length, median: round(median(warm.map(entry => entry.milliseconds))), max: round(Math.max(...warm.map(entry => entry.milliseconds))) },
       warm_to_open_ms: { median: round(median(warmHandshake)) },
       eviction_wake_turn_ms: round(woken.milliseconds),
+      close_handshake_ms: round(closeMs),
     },
   };
   writeFileSync("output/watch-measurement.json", JSON.stringify(report, null, 2));

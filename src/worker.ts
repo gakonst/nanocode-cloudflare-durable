@@ -577,6 +577,7 @@ export class AgentSession extends DurableObject<Env> {
     this.handSockets.get(socket)?.disconnected();
     this.handSockets.delete(socket);
     this.forgetWatcher(socket);
+    try { socket.close(1000, "closed"); } catch {}
   }
 
   async webSocketError(socket: WebSocket): Promise<void> {
