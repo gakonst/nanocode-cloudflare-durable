@@ -67,7 +67,7 @@ export class RemoteExecutor {
     }, policy.timeout_ms);
     let executor: RemoteExecutor | undefined;
     try {
-      const response = await Promise.race([binding.fetch(new Request("https://remote.internal/", { headers: { upgrade: "websocket", "x-nanocode-authority": headerJson(authority) }, signal: controller.signal })), deadline]);
+      const response = await Promise.race([binding.fetch(new Request("https://egress.internal/remote", { headers: { upgrade: "websocket", "x-nanocode-authority": headerJson(authority) }, signal: controller.signal })), deadline]);
       const socket = response.webSocket;
       if (response.status !== 101 || !socket) {
         const detail = await response.json<{ error?: string }>().then(body => body.error, () => undefined);

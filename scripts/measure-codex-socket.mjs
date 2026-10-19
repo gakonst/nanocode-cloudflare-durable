@@ -36,7 +36,7 @@ function reply(body, id, entry) {
   let output;
   if (last?.type === "function_call_output") {
     entry.tool_call_known = state.calls.has(last.call_id);
-    entry.tool_output_ok = /ok\\W+true/.test(JSON.stringify(last.output));
+    entry.tool_output_ok = /agents/.test(JSON.stringify(last.output));
     output = [{ type: "message", id: "msg_" + id, role: "assistant", status: "completed", content: [{ type: "output_text", text: entry.tool_call_known && entry.tool_output_ok ? "tool-ok" : "tool-mismatch" }] }];
   } else if (last && JSON.stringify(last.content).includes("then close the socket")) {
     entry.close_after = true;
@@ -50,7 +50,7 @@ function reply(body, id, entry) {
     return [];
   } else if (last && JSON.stringify(last.content).includes("use a tool")) {
     state.calls.add("call_" + id);
-    output = [{ type: "function_call", id: "fc_" + id, call_id: "call_" + id, name: "list_connections", arguments: "{}", status: "completed" }];
+    output = [{ type: "function_call", id: "fc_" + id, call_id: "call_" + id, name: "list_agents", arguments: "{}", status: "completed" }];
   } else {
     output = [{ type: "message", id: "msg_" + id, role: "assistant", status: "completed", content: [{ type: "output_text", text: "socket-ok" }] }];
   }
@@ -257,7 +257,7 @@ try {
   const name = `codex-socket-${stamp}`;
   const closedByClient = async session => (await stats()).closed.filter(entry => entry.session === session && entry.by === "client").length;
   const released = async () => until(async () => (await stats()).open === 0, "The idle session kept its socket open");
-  const turns = [await turn(name, "first", "Say hello"), await turn(name, "tool", "Please use a tool to list connections")];
+  const turns = [await turn(name, "first", "Say hello"), await turn(name, "tool", "Please use a tool to list agents")];
   for (let index = 0; index < SAMPLES; index++) turns.push(await turn(name, `warm-${index}`, "Say hello again"));
   const session = turns[0].session;
   await released();
@@ -273,7 +273,7 @@ try {
   const connected = kinds(list, "model.connection.completed");
   check(connected.length === turns.length && connected.every(entry => entry.payload.http_status === 101 && entry.payload.server_model === "gpt-6.1-sol") && connected[0].payload.request_id === "req_ws_1", "Handshake metadata from each projected 101 response reached the SDK");
   const toolRequest = requests.find(entry => entry.last === "tool_output");
-  check(turns[1].message === "tool-ok" && toolRequest?.tool_call_known && toolRequest.tool_output_ok && toolRequest.continued && kinds(list, "tool.result", "tool").length === 1, "A list_connections tool-call loop completed over the socket with incremental tool output");
+  check(turns[1].message === "tool-ok" && toolRequest?.tool_call_known && toolRequest.tool_output_ok && toolRequest.continued && kinds(list, "tool.result", "tool").length === 1, "A list_agents tool-call loop completed over the socket with incremental tool output");
   check(socketMetrics.runtime.model_sockets === turns.length && socketMetrics.runtime.model_requests === 0 && socketMetrics.runtime.socket_sends === requests.length, "The resident runtime opened one socket per turn and sent no HTTPS model requests");
   check(socketMetrics.model_diagnostics.length === turns.length && socketMetrics.model_diagnostics.every(entry => entry.websocket && entry.status === 101 && entry.transport === "fixed_binding"), "Each handshake recorded one safe websocket diagnostic through the fixed binding");
   check(await closedByClient(session) === turns.length, "The session closed its socket each time it went idle");

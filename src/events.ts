@@ -22,7 +22,7 @@ export class EventHub {
     try { await ready; } finally { clearTimeout(timer); this.listeners.delete(finish); }
   }
 
-  stream(after: number, interval: number, read: (after: number) => Page, allowed: () => boolean, finished?: (event: Page["events"][number]) => boolean): Response {
+  stream(after: number, interval: number, read: (after: number) => Page, finished?: (event: Page["events"][number]) => boolean): Response {
     let cursor = after;
     let closed = false;
     let complete = false;
@@ -33,7 +33,6 @@ export class EventHub {
         try {
           if (complete) { controller.close(); closed = true; return; }
           while (!closed) {
-            if (!allowed()) { controller.close(); closed = true; return; }
             let timedOut = false;
             let finish!: () => void;
             const ready = new Promise<void>(resolve => { finish = resolve; });

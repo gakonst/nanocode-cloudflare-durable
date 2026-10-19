@@ -1,7 +1,7 @@
 import { DurableObject, WorkerEntrypoint } from "cloudflare:workers";
 import { EXECUTOR_ID, json, type ModelProvider } from "../contracts";
 import { ACCOUNT_PATTERN, Failure, modelAccount, modelProvider, readLimited, sha256hex } from "../egress/common";
-import { CODEX, CODEX_ACCOUNT, codexPolicy, codexSeed, connectionCredential, oauthError, open, seal, SECRET_PATTERN, SUBSCRIPTION, subscriptionSeed, type ConnectionCredential, type StoredToken, type TokenPolicy } from "./credentials";
+import { CODEX, CODEX_ACCOUNT, codexPolicy, codexSeed, oauthError, open, seal, SECRET_PATTERN, SUBSCRIPTION, subscriptionSeed, type StoredToken, type TokenPolicy } from "./credentials";
 
 export interface VaultEnv {
   CREDENTIALS: DurableObjectNamespace<CredentialVault>;
@@ -12,22 +12,19 @@ export interface VaultEnv {
   CODEX_OAUTH_JSON?: string;
   ANTHROPIC_API_KEY?: string;
   RUNNER_TOKENS_JSON?: string;
-  CONNECTION_CREDENTIALS_JSON?: string;
 }
 
 export type Denied = { ok: false; status: number; error: string };
 export type ModelAccess = { ok: true; generation: number; expires_at: number | null; headers: [string, string][]; subscription: boolean } | Denied;
-export type SecretAccess = { ok: true; generation: number; expires_at: number | null; refreshable: boolean; secret: string } | Denied;
 export type RunnerAccess = { ok: true; token: string } | Denied;
 export type CredentialState = { state: string; generation: number; expires_at: number | null };
-export type VaultStatus = { ok: true; encryption: boolean; claude: "subscription" | "api_key" | "unconfigured"; model: CredentialState | null; codex: CredentialState | null; connections: Record<string, string | null>; runners: string[]; counters: Record<string, number> } | Denied;
+export type VaultStatus = { ok: true; encryption: boolean; claude: "subscription" | "api_key" | "unconfigured"; model: CredentialState | null; codex: CredentialState | null; runners: string[]; counters: Record<string, number> } | Denied;
 
 type CredentialRow = { name: string; seed: string; envelope: string; generation: number; state: string; forced: number; expires_at: number | null; updated_at: number };
 type Granted = Extract<ModelAccess, { ok: true }>;
 
 const SCHEMA = "CREATE TABLE IF NOT EXISTS credentials (name TEXT PRIMARY KEY, seed TEXT NOT NULL, envelope TEXT NOT NULL, generation INTEGER NOT NULL, state TEXT NOT NULL, forced INTEGER NOT NULL, expires_at INTEGER, updated_at INTEGER NOT NULL)";
 const CODEX_CREDENTIAL = "model:codex";
-const CONNECTION_ID = /^[A-Za-z0-9_-]{1,64}$/;
 const RUNNER_TOKEN = /^[\x21-\x7e]{1,4096}$/;
 
 function denied(error: unknown): Denied {
@@ -39,27 +36,6 @@ function margin(env: VaultEnv): number {
   const value = Number(env.REFRESH_MARGIN_MS);
   if (!Number.isSafeInteger(value) || value <= 0) throw new Failure(500, "configuration_error");
   return value;
-}
-
-let connectionSource: string | undefined;
-let parsedConnections = new Map<string, ConnectionCredential>();
-
-function connectionCredentials(env: VaultEnv): Map<string, ConnectionCredential> {
-  const source = env.CONNECTION_CREDENTIALS_JSON ?? "";
-  if (source === connectionSource) return parsedConnections;
-  const result = new Map<string, ConnectionCredential>();
-  if (source) {
-    let document: unknown;
-    try { document = JSON.parse(source); } catch { throw new Failure(500, "configuration_error"); }
-    if (!document || typeof document !== "object" || Array.isArray(document)) throw new Failure(500, "configuration_error");
-    for (const [id, value] of Object.entries(document)) {
-      if (!CONNECTION_ID.test(id)) throw new Failure(500, "configuration_error");
-      result.set(id, connectionCredential(value));
-    }
-  }
-  connectionSource = source;
-  parsedConnections = result;
-  return result;
 }
 
 let runnerSource: string | undefined;
@@ -108,30 +84,14 @@ export class CredentialVault extends DurableObject<VaultEnv> {
     }
   }
 
-  async connection(id: string, rejected?: number): Promise<SecretAccess> {
-    try {
-      const credential = connectionCredentials(this.env).get(id);
-      if (!credential) throw new Failure(404, "not_found");
-      if (credential.type !== "oauth") throw new Failure(500, "internal_error");
-      if (rejected !== undefined && !Number.isSafeInteger(rejected)) throw new Failure(400, "invalid_request");
-      const resolved = await this.gate(`connection:${id}`, () => this.connectionAccess(id, credential, rejected));
-      return { ok: true, generation: resolved.generation, expires_at: resolved.expires_at, refreshable: true, secret: resolved.access };
-    } catch (error) {
-      return denied(error);
-    }
-  }
-
   async status(): Promise<VaultStatus> {
     try {
-      const connections: Record<string, string | null> = {};
-      for (const [id, credential] of connectionCredentials(this.env)) connections[id] = credential.type === "static" ? "static" : (await this.state(`connection:${id}`, JSON.stringify(credential)))?.state ?? null;
       return {
         ok: true,
         encryption: !!this.env.VAULT_KEY,
         claude: this.claude(),
         model: await this.state("model", this.env.OAUTH_JSON),
         codex: await this.state(CODEX_CREDENTIAL, this.env.CODEX_OAUTH_JSON),
-        connections,
         runners: [...runnerTokens(this.env).keys()],
         counters: { ...this.counters },
       };
@@ -233,24 +193,6 @@ export class CredentialVault extends DurableObject<VaultEnv> {
     return { ok: true, generation: row.generation, expires_at: token.expires_at, headers, subscription: true };
   }
 
-  private async connectionAccess(id: string, credential: Extract<ConnectionCredential, { type: "oauth" }>, rejected?: number): Promise<{ generation: number; access: string; expires_at: number | null }> {
-    const name = `connection:${id}`;
-    let { row, token } = await this.load(name, JSON.stringify(credential), () => ({ access: credential.access, refresh: credential.refresh, expires_at: credential.expires_at, scopes: credential.scope ? credential.scope.split(/\s+/).filter(Boolean) : [], refresh_expires_at: null }));
-    if (row.state !== "ready") throw new Failure(401, row.state === "exchanging" ? "refresh_uncertain" : row.state);
-    const force = rejected !== undefined && rejected === row.generation;
-    if (force && row.forced) throw new Failure(401, "credential_rejected");
-    if (force || (token.expires_at !== null && token.expires_at - Date.now() <= margin(this.env))) {
-      const current = token;
-      ({ row, token } = await this.exchange(name, row, token, force, 0, scope => {
-        const form = new URLSearchParams({ grant_type: "refresh_token", refresh_token: current.refresh, client_id: credential.client_id });
-        if (credential.client_secret) form.set("client_secret", credential.client_secret);
-        if (scope) form.set("scope", scope);
-        return fetch(credential.token_url, { method: "POST", headers: { "content-type": "application/x-www-form-urlencoded", accept: "application/json" }, body: form, redirect: "manual", signal: AbortSignal.timeout(30_000) });
-      }, credential.scope, undefined));
-    }
-    return { generation: row.generation, access: token.access, expires_at: token.expires_at };
-  }
-
   private async exchange(name: string, row: CredentialRow, token: StoredToken, forced: boolean, minimumLifetime: number, send: (scope?: string) => Promise<Response>, scope: string | undefined, fallback: string | undefined, policy?: TokenPolicy): Promise<{ row: CredentialRow; token: StoredToken }> {
     const subscription = name === "model";
     if (token.refresh_expires_at !== null && Date.now() >= token.refresh_expires_at) {
@@ -340,21 +282,6 @@ export class CredentialBroker extends WorkerEntrypoint<VaultEnv> {
     try {
       this.owner(input?.account_id);
       return await this.vault().model(modelProvider(input.provider), input.rejected_generation) as ModelAccess;
-    } catch (error) {
-      return denied(error);
-    }
-  }
-
-  async connection(input: { account_id: string; connection_id: string; rejected_generation?: number }): Promise<SecretAccess> {
-    try {
-      if (typeof input?.account_id !== "string" || !ACCOUNT_PATTERN.test(input.account_id) || typeof input.connection_id !== "string" || !CONNECTION_ID.test(input.connection_id)) throw new Failure(400, "invalid_request");
-      const credential = connectionCredentials(this.env).get(input.connection_id);
-      if (!credential) throw new Failure(404, "not_found");
-      if (credential.type === "static") {
-        if (input.rejected_generation !== undefined) throw new Failure(401, "credential_rejected");
-        return { ok: true, generation: 0, expires_at: null, refreshable: false, secret: credential.value };
-      }
-      return await this.vault().connection(input.connection_id, input.rejected_generation) as SecretAccess;
     } catch (error) {
       return denied(error);
     }

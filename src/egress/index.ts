@@ -1,15 +1,12 @@
 import { WorkerEntrypoint } from "cloudflare:workers";
-import { json, sessionUuid, type AuthorityCommand, type AuthorityResult, type ModelDispatch, type ModelProvider, type SessionAuthority, type SocketDispatch } from "../contracts";
-import type { ModelAccess, SecretAccess } from "../vault";
-import { AccountAuthority, type Authorized, type ServiceAccess, type ServiceRequest } from "./account";
+import { json, sessionUuid, type ModelDispatch, type ModelProvider, type SessionAuthority, type SocketDispatch } from "../contracts";
+import type { ModelAccess } from "../vault";
+import { remoteExecutor } from "../remote/egress";
 import { modelFetch, socketFetch } from "./model-transport";
-import { AccessCache, ACCOUNT_PATTERN, CODEX, connections, encoder, Failure, FORBIDDEN_HEADERS, modelAccount, modelEndpoint, modelProvider, placeCredential, readLimited, setting, SUBSCRIPTION, type CacheOutcome, type Connection, type EgressEnv } from "./common";
+import { AccessCache, ACCOUNT_PATTERN, CODEX, Failure, modelAccount, modelEndpoint, modelProvider, readLimited, setting, SUBSCRIPTION, type CacheOutcome, type EgressEnv } from "./common";
 
-export { AccountAuthority };
-export { RemoteExecutorEgress } from "../remote/egress";
 export type { EgressEnv };
 
-const PUBLIC_OPS = new Set(["health", "register_client", "create_grant", "authorize_code", "exchange_code", "refresh", "authorize", "revoke", "inspect", "list_connections"]);
 const MODEL_REQUEST_HEADER = /^(accept|content-type|anthropic-version|anthropic-beta|anthropic-dangerous-direct-browser-access|user-agent|x-app|x-claude-code-session-id|x-stainless-[a-z0-9-]{1,64})$/;
 const MODEL_RESPONSE_HEADER = /^(content-type|request-id|retry-after|x-should-retry|anthropic-ratelimit-[a-z0-9-]{1,64})$/;
 const CODEX_REQUEST_HEADER = /^(accept|content-type|user-agent|originator|version|openai-beta|session-id|thread-id|x-client-request-id|x-codex-turn-state|x-codex-turn-metadata|x-openai-internal-codex-responses-lite)$/;
@@ -24,8 +21,6 @@ const GZIP_PADDING_LENGTHS = 257;
 const GZIP_REJECTIONS = new Set([400, 403, 415]);
 const INVALID_JSON_MESSAGES = ["The request body is not valid JSON", "Failed to parse request: could not parse request body as JSON"];
 const BAD_JSON_DETAILS = new Set(["unexpected EOF", "unexpected end of JSON input", "EOF"]);
-const AUTHORITY_BODY_LIMIT = 256 * 1024;
-const SERVICE_BODY_LIMIT = 33 << 20;
 const DIAGNOSTIC_LIMIT = 64;
 const DIAGNOSTIC_MAX_MS = 3_600_000;
 const DIAGNOSTIC_ERRORS = new Set(["none", "other", "credential_unchanged", "invalid_request", "unsupported_provider", "subscription_mismatch", "configuration_error", "internal_error", "credential_rejected", "invalid_token", "login_required", "refresh_uncertain", "forbidden", "grant_expired", "grant_revoked", "insufficient_scope", "origin_mismatch", "account_mismatch", "catalog_mismatch", "not_found", "vault_key_mismatch", "vault_key_required", "credential_missing", "vault_unavailable", "upstream_cancelled", "upstream_unavailable", "upstream_timeout"]);
@@ -33,7 +28,6 @@ const CREDENTIAL_OUTCOMES = new Set<CredentialOutcome>(["none", "hit", "miss", "
 const clock: () => number = typeof performance === "object" && performance !== null && typeof performance.now === "function" ? () => performance.now() : () => Date.now();
 
 type Granted = Extract<ModelAccess, { ok: true }>;
-type Secret = Extract<SecretAccess, { ok: true }>;
 type DiagnosticOrigin = "local_validation" | "authority" | "provider_http" | "transport" | "projection";
 type DiagnosticMime = "json" | "html" | "event_stream" | "other" | "missing";
 type CredentialOutcome = "none" | CacheOutcome;
@@ -49,16 +43,10 @@ const metrics = {
   model_cache_hits: 0,
   model_cache_misses: 0,
   model_coalesced: 0,
-  model_authority_rpcs: 0,
   vault_rpcs: 0,
   model_unauthorized: 0,
   model_recoveries: 0,
   model_provider_errors: 0,
-  service_requests: 0,
-  service_authority_rpcs: 0,
-  service_denied: 0,
-  service_recoveries: 0,
-  service_redacted: 0,
   redirects_rejected: 0,
   upstream_failures: 0,
   model_timeouts: 0,
@@ -68,12 +56,11 @@ const metrics = {
   model_gzip_output_bytes: 0,
 };
 const models = new AccessCache<Granted>(CACHE_LIMIT);
-const secrets = new AccessCache<Secret>(CACHE_LIMIT);
 const diagnostics: ModelDiagnostic[] = [];
 let gzipRejected = false;
 
 function snapshot() {
-  return { ...metrics, cache_entries: models.size + secrets.size, inflight: models.pending + secrets.pending };
+  return { ...metrics, cache_entries: models.size, inflight: models.pending };
 }
 
 function attemptDiagnostic(attempt: 1 | 2, origin: DiagnosticOrigin, transport: TransportKind): AttemptDiagnostic {
@@ -135,10 +122,6 @@ function modelResponse(response: Response, trace: ModelDiagnostic): Response {
   return new Response(response.body, { status: response.status, statusText: response.statusText, headers, webSocket: response.webSocket });
 }
 
-function account(env: EgressEnv, id: string) {
-  return env.ACCOUNTS.get(env.ACCOUNTS.idFromName(id));
-}
-
 function denial(error: unknown): { status: number; error: string } {
   if (error instanceof Failure) return { status: error.status, error: error.code };
   metrics.upstream_failures++;
@@ -165,37 +148,15 @@ function egressError(failure: { status: number; error: string }, provider: Model
 
 function authorityOf(value: any): SessionAuthority {
   if (!value || typeof value !== "object" || typeof value.account_id !== "string" || !ACCOUNT_PATTERN.test(value.account_id) || typeof value.session_id !== "string" || !value.session_id || value.session_id.length > 128) throw new Failure(400, "invalid_request");
-  const authority: SessionAuthority = { account_id: value.account_id, session_id: value.session_id };
-  if (value.grant_id !== undefined && value.grant_id !== null) {
-    if (typeof value.grant_id !== "string" || value.grant_id.length > 64 || !Number.isSafeInteger(value.grant_revision)) throw new Failure(400, "invalid_request");
-    authority.grant_id = value.grant_id;
-    authority.grant_revision = value.grant_revision;
-    if (value.grant_expires_at !== undefined) {
-      if (!Number.isSafeInteger(value.grant_expires_at)) throw new Failure(400, "invalid_request");
-      authority.grant_expires_at = value.grant_expires_at;
-      if (value.grant_expires_at <= Date.now()) throw new Failure(403, "grant_expired");
-    }
-  }
-  return authority;
+  return { account_id: value.account_id, session_id: value.session_id };
 }
 
 function cacheKey(authority: SessionAuthority, provider: ModelProvider): string {
-  return [provider, authority.account_id, authority.grant_id ?? "", authority.grant_revision ?? "", authority.grant_id ? authority.session_id : ""].join("\u0000");
-}
-
-function cachePolicy(env: EgressEnv, horizon?: number): { ttl: number; margin: number; horizon?: number } {
-  return { ttl: setting(env, "CREDENTIAL_CACHE_TTL_MS"), margin: setting(env, "REFRESH_MARGIN_MS"), horizon };
+  return `${provider}\u0000${authority.account_id}`;
 }
 
 function resolveModel(env: EgressEnv, authority: SessionAuthority, provider: ModelProvider, rejected?: number, observe?: (outcome: CredentialOutcome) => void): Promise<ModelAccess> {
-  return models.get(cacheKey(authority, provider), rejected, cachePolicy(env, authority.grant_expires_at), async () => {
-    if (authority.grant_id !== undefined) {
-      metrics.model_authority_rpcs++;
-      const authorized = await account(env, authority.account_id).authorizeModel({ account_id: authority.account_id, authority }) as Authorized;
-      if (!authorized.ok) return authorized;
-    }
-    return await vaultModel(env, authority.account_id, provider, rejected);
-  }, outcome => {
+  return models.get(cacheKey(authority, provider), rejected, { ttl: setting(env, "CREDENTIAL_CACHE_TTL_MS"), margin: setting(env, "REFRESH_MARGIN_MS") }, () => vaultModel(env, authority.account_id, provider, rejected), outcome => {
     if (outcome === "hit") metrics.model_cache_hits++;
     else if (outcome === "miss") metrics.model_cache_misses++;
     else if (outcome !== "refresh") metrics.model_coalesced++;
@@ -206,15 +167,6 @@ function resolveModel(env: EgressEnv, authority: SessionAuthority, provider: Mod
 async function vaultModel(env: EgressEnv, account_id: string, provider: ModelProvider, rejected?: number): Promise<ModelAccess> {
   metrics.vault_rpcs++;
   return await env.VAULT.model({ account_id, provider, rejected_generation: rejected }) as ModelAccess;
-}
-
-function connectionSecret(env: EgressEnv, account_id: string, connection: Connection, rejected?: number): Promise<SecretAccess> {
-  return secrets.get(connection.id, rejected, cachePolicy(env), async () => {
-    metrics.vault_rpcs++;
-    const access = await env.VAULT.connection({ account_id, connection_id: connection.id, rejected_generation: rejected }) as SecretAccess;
-    if (access.ok && access.refreshable && connection.auth.type === "basic") return { ok: false, status: 500, error: "configuration_error" };
-    return access;
-  });
 }
 
 function modelHeaders(input: unknown): Headers {
@@ -463,6 +415,7 @@ export class SessionEgress extends WorkerEntrypoint<EgressEnv> {
   async fetch(request: Request): Promise<Response> {
     if (request.method === "GET") {
       if (new URL(request.url).pathname === "/socket") return openSocket(this.env, request);
+      if (new URL(request.url).pathname === "/remote") return remoteExecutor(this.env, request);
       if (new URL(request.url).pathname === "/probe/codex") {
         const id = sessionUuid();
         const access = await resolveModel(this.env, { account_id: modelAccount(this.env), session_id: id }, "codex");
@@ -484,22 +437,6 @@ export class SessionEgress extends WorkerEntrypoint<EgressEnv> {
     }
     if (request.method !== "POST") return json({ error: "method_not_allowed" }, 405);
     const path = new URL(request.url).pathname;
-    if (path === "/connections" || path === "/connector") {
-      try {
-        const input = await readService(request);
-        const authority = authorityOf(input.authority);
-        const target = account(this.env, authority.account_id);
-        if (path === "/connections") {
-          const result = await target.sessionCatalog({ account_id: authority.account_id, authority }) as AuthorityResult;
-          return json(result, result.status ?? (result.ok ? 200 : 400));
-        }
-        metrics.service_requests++;
-        return await dispatchConnector(this.env, request, input, authority.account_id, () => target.sessionServiceAccess({ account_id: authority.account_id, authority, connection_id: input.connection_id, kind: input.kind ?? "connector" }) as Promise<ServiceAccess>);
-      } catch (error) {
-        const failure = denial(error);
-        return json({ ok: false, error: failure.error }, failure.status);
-      }
-    }
     if (path !== "/model") return json({ error: "not_found" }, 404);
     const entered = clock();
     metrics.model_requests++;
@@ -625,188 +562,6 @@ export class SessionEgress extends WorkerEntrypoint<EgressEnv> {
         attempts.push(local);
       }
       return finish(egressError(failure, provider));
-    }
-  }
-}
-
-export class ConnectAuthority extends WorkerEntrypoint<EgressEnv> {
-  async fetch(request: Request): Promise<Response> {
-    if (request.method !== "POST") return json({ ok: false, status: 405, error: "method_not_allowed" }, 405);
-    let command: AuthorityCommand;
-    try {
-      const text = await request.text();
-      if (text.length > AUTHORITY_BODY_LIMIT) throw new Error();
-      command = JSON.parse(text);
-    } catch {
-      return json({ ok: false, status: 400, error: "invalid_request" }, 400);
-    }
-    if (!command || typeof command !== "object" || typeof command.op !== "string" || !PUBLIC_OPS.has(command.op) || typeof command.account_id !== "string" || !ACCOUNT_PATTERN.test(command.account_id)) {
-      return json({ ok: false, status: 400, error: "invalid_request" }, 400);
-    }
-    let result: AuthorityResult;
-    try {
-      result = await account(this.env, command.account_id).command(command) as AuthorityResult;
-    } catch {
-      result = { ok: false, status: 503, error: "authority_unavailable" };
-    }
-    if (command.op === "health" && result.ok) result.metrics = snapshot();
-    return json(result, result.status ?? (result.ok ? 200 : 400));
-  }
-}
-
-function connectorUrl(connection: Connection, path: string): URL {
-  if (!path.startsWith("/") || path.startsWith("//") || path.length > 4096 || /[\\#\u0000- \u007f]/.test(path)) throw new Failure(400, "invalid_request");
-  const index = path.indexOf("?");
-  const pathname = index < 0 ? path : path.slice(0, index);
-  const query = index < 0 ? "" : path.slice(index);
-  if (/%(2e|2f|5c|00)/i.test(pathname) || pathname.split("/").some(segment => segment === "." || segment === "..")) throw new Failure(400, "invalid_request");
-  if (!connection.paths.some(prefix => pathname.startsWith(prefix))) throw new Failure(403, "forbidden");
-  const basePath = connection.base.pathname.replace(/\/+$/, "");
-  const url = new URL(`${connection.base.origin}${basePath}${pathname}${query}`);
-  if (url.origin !== connection.base.origin || !(url.pathname === basePath || url.pathname.startsWith(`${basePath}/`))) throw new Failure(400, "invalid_request");
-  return url;
-}
-
-function connectorHeaders(connection: Connection, input: unknown): Headers {
-  const headers = new Headers();
-  if (input === undefined || input === null) return headers;
-  const entries = Array.isArray(input) ? input : typeof input === "object" ? Object.entries(input as Record<string, unknown>) : null;
-  if (!entries || entries.length > 64) throw new Failure(400, "invalid_request");
-  const credentialHeader = connection.auth.type === "header" ? connection.auth.name : "authorization";
-  for (const pair of entries) {
-    if (!Array.isArray(pair) || pair.length !== 2 || typeof pair[0] !== "string" || typeof pair[1] !== "string") throw new Failure(400, "invalid_request");
-    const name = pair[0].toLowerCase();
-    if (FORBIDDEN_HEADERS.has(name) || name === credentialHeader || !connection.request_headers.includes(name)) continue;
-    try { headers.set(name, pair[1]); } catch { throw new Failure(400, "invalid_request"); }
-  }
-  return headers;
-}
-
-function sendConnector(url: URL, method: string, headers: Headers, connection: Connection, access: Secret, body: string | undefined, signal: AbortSignal): Promise<Response> {
-  const outgoing = new Headers(headers);
-  const [name, value] = placeCredential(connection.auth, access.secret);
-  outgoing.set(name, value);
-  return fetch(url, { method, headers: outgoing, body, redirect: "manual", signal });
-}
-
-function secretsOf(connection: Connection, access: Secret): string[] {
-  const [, value] = placeCredential(connection.auth, access.secret);
-  const values = new Set([access.secret, value]);
-  const space = value.indexOf(" ");
-  if (space > 0) values.add(value.slice(space + 1));
-  return [...values].filter(value => value.length >= 8);
-}
-
-function pick(value: unknown, fields: string[]): unknown {
-  const select = (item: unknown) => {
-    if (!item || typeof item !== "object" || Array.isArray(item)) return undefined;
-    const record = item as Record<string, unknown>;
-    return Object.fromEntries(fields.filter(field => Object.hasOwn(record, field)).map(field => [field, record[field]]));
-  };
-  return Array.isArray(value) ? value.slice(0, 1000).map(select) : select(value);
-}
-
-async function projectConnector(connection: Connection, response: Response, secrets: string[]): Promise<Response> {
-  const result: Record<string, unknown> = { ok: true, status: response.status };
-  const headers: Record<string, string> = {};
-  for (const name of connection.response_headers) {
-    const value = response.headers.get(name);
-    if (value !== null) headers[name] = value;
-  }
-  if (Object.keys(headers).length) result.headers = headers;
-  const type = response.headers.get("content-type") ?? "";
-  if (connection.response_fields.length && /^application\/([a-z0-9.+-]*\+)?json\s*(;|$)/i.test(type)) {
-    const text = await readLimited(response, connection.max_response_bytes);
-    if (text === null) result.truncated = true;
-    else {
-      try { result.data = pick(JSON.parse(text), connection.response_fields); } catch { result.invalid_json = true; }
-    }
-  } else {
-    await response.body?.cancel();
-  }
-  const serialized = JSON.stringify(result);
-  if (secrets.some(secret => serialized.includes(secret))) {
-    metrics.service_redacted++;
-    return json({ ok: true, status: response.status, redacted: true });
-  }
-  return new Response(serialized, { status: 200, headers: { "content-type": "application/json", "cache-control": "no-store" } });
-}
-
-async function readService(request: Request): Promise<any> {
-  try {
-    const text = await request.text();
-    if (text.length > SERVICE_BODY_LIMIT) throw new Error();
-    const input = JSON.parse(text);
-    if (!input || typeof input !== "object") throw new Error();
-    return input;
-  } catch { throw new Failure(400, "invalid_request"); }
-}
-
-async function dispatchConnector(env: EgressEnv, request: Request, input: any, account_id: string, authorize: () => Promise<ServiceAccess>): Promise<Response> {
-  const method = input.method === undefined ? "GET" : typeof input.method === "string" ? input.method.toUpperCase() : "";
-  const path = input.path ?? "/";
-  const kind = input.kind ?? "connector";
-  if (typeof input.connection_id !== "string" || typeof path !== "string" || (kind !== "connector" && kind !== "vault") || (input.body !== undefined && typeof input.body !== "string")) throw new Failure(400, "invalid_request");
-  const connection = connections(env).get(input.connection_id);
-  if (!connection) throw new Failure(404, "not_found");
-  if (!connection.methods.includes(method)) throw new Failure(403, "forbidden");
-  const url = connectorUrl(connection, path);
-  const headers = connectorHeaders(connection, input.headers);
-  const body = input.body as string | undefined;
-  if (body !== undefined && (method === "GET" || method === "HEAD")) throw new Failure(400, "invalid_request");
-  if (body !== undefined && encoder.encode(body).byteLength > connection.max_body_bytes) throw new Failure(413, "body_too_large");
-  metrics.service_authority_rpcs++;
-  const authorized = await authorize();
-  if (!authorized.ok) {
-    metrics.service_denied++;
-    return json({ ok: false, error: authorized.error }, authorized.status);
-  }
-  let access = await connectionSecret(env, account_id, connection);
-  if (!access.ok) {
-    metrics.service_denied++;
-    return json({ ok: false, error: access.error }, access.status);
-  }
-  const vault = kind === "vault" || connection.kind === "vault";
-  let response = await sendConnector(url, method, headers, connection, access, body, request.signal);
-  if (response.status === 401 && access.refreshable) {
-    await response.body?.cancel();
-    const next = await connectionSecret(env, account_id, connection, access.generation);
-    if (!next.ok) {
-      metrics.service_denied++;
-      return json({ ok: false, error: next.error }, next.status);
-    }
-    if (next.generation !== access.generation) {
-      metrics.service_recoveries++;
-      access = next;
-      response = await sendConnector(url, method, headers, connection, access, body, request.signal);
-    } else return json({ ok: false, status: 401 });
-  }
-  if (response.status >= 300 && response.status < 400) {
-    metrics.redirects_rejected++;
-    await response.body?.cancel();
-    return json({ ok: false, error: "upstream_redirect" }, 502);
-  }
-  if (vault || !response.ok) {
-    await response.body?.cancel();
-    return json({ ok: response.ok, status: response.status });
-  }
-  return projectConnector(connection, response, secretsOf(connection, access));
-}
-
-export class ConnectServiceEgress extends WorkerEntrypoint<EgressEnv> {
-  async fetch(request: Request): Promise<Response> {
-    if (request.method !== "POST") return json({ ok: false, error: "method_not_allowed" }, 405);
-    metrics.service_requests++;
-    try {
-      const input = await readService(request);
-      if (typeof input.account_id !== "string" || !ACCOUNT_PATTERN.test(input.account_id) || typeof input.token !== "string" || input.token.length > 512 || typeof input.origin !== "string" || (input.app_id !== undefined && typeof input.app_id !== "string")) throw new Failure(400, "invalid_request");
-      const authority = account(this.env, input.account_id);
-      const command: ServiceRequest = { account_id: input.account_id, token: input.token, origin: input.origin, app_id: input.app_id, connection_id: input.connection_id, kind: input.kind ?? "connector" };
-      return await dispatchConnector(this.env, request, input, input.account_id, () => authority.serviceAccess(command) as Promise<ServiceAccess>);
-    } catch (error) {
-      const failure = denial(error);
-      if (failure.status < 500) metrics.service_denied++;
-      return json({ ok: false, error: failure.error }, failure.status);
     }
   }
 }

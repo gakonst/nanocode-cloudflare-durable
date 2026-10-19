@@ -4,12 +4,11 @@
   "compatibility_date": "2026-10-16",
   "workers_dev": false,
   "preview_urls": false,
-  "durable_objects": {
-    "bindings": [{ "name": "ACCOUNTS", "class_name": "AccountAuthority" }]
-  },
-  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["AccountAuthority"] }],
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["AccountAuthority"] },
+    { "tag": "v2", "deleted_classes": ["AccountAuthority"] }
+  ],
   "services": [
-    { "binding": "SESSION_FENCES", "service": "nanocode-worker", "entrypoint": "SessionControl" },
     { "binding": "VAULT", "service": "nanocode-vault", "entrypoint": "CredentialBroker" }
   ],
   "vpc_services": [
@@ -21,10 +20,6 @@
     "ACCOUNT_ID": "default",
     "CREDENTIAL_CACHE_TTL_MS": "600000",
     "REFRESH_MARGIN_MS": "60000",
-    "CONNECT_TOKEN_TTL_MS": "3600000",
-    "CONNECT_REFRESH_TTL_MS": "2592000000",
-    "CONNECT_CODE_TTL_MS": "300000",
-    "RECOVERY_DELAY_MS": "30000",
     "MODEL_RESPONSE_HEADERS_TIMEOUT_MS": "120000",
     "MODEL_STREAM_IDLE_TIMEOUT_MS": "120000",
     "RUNNERS_JSON": "[{\"id\":\"paradigm-a\",\"url\":\"http://127.0.0.1:19081/\",\"binding\":\"RUNNER_VPC_PARADIGM_A\"},{\"id\":\"paradigm-b\",\"url\":\"http://127.0.0.1:19082/\",\"binding\":\"RUNNER_VPC_PARADIGM_B\"}]"

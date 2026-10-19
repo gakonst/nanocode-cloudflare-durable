@@ -15,10 +15,7 @@
     { "tag": "v1", "new_sqlite_classes": ["AgentSession", "SubscriptionAuth"] }
   ],
   "services": [
-    { "binding": "EGRESS", "service": "nanocode-egress", "entrypoint": "SessionEgress" },
-    { "binding": "AUTHORITY", "service": "nanocode-egress", "entrypoint": "ConnectAuthority" },
-    { "binding": "SERVICE_EGRESS", "service": "nanocode-egress", "entrypoint": "ConnectServiceEgress" },
-    { "binding": "REMOTE", "service": "nanocode-egress", "entrypoint": "RemoteExecutorEgress" }
+    { "binding": "EGRESS", "service": "nanocode-egress", "entrypoint": "SessionEgress" }
   ],
   "vars": {
     "ACCOUNT_ID": "default",
@@ -26,7 +23,7 @@
     "SESSION_LOCATION_HINT": "enam",
     "MODEL_AUTH": "subscription",
     "RECOVERY_DELAY_MS": "30000",
-    "CONNECT_STREAM_REVALIDATE_MS": "5000",
+    "EVENT_STREAM_KEEPALIVE_MS": "5000",
     "EVENT_PAGE_SIZE": "128",
     "EVENT_COALESCE_MS": "100",
     "MODEL_SOCKET_LINGER_MS": "30000",

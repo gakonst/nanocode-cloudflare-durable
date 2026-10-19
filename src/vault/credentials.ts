@@ -2,9 +2,6 @@ import { base64url, encoder, Failure, sha256hex, unbase64url } from "../egress/c
 
 export type StoredToken = { access: string; refresh: string; expires_at: number | null; scopes: string[]; refresh_expires_at: number | null; account_id?: string; fedramp?: boolean };
 export type TokenPolicy = { rejected(status: number, body: string): string | undefined; accept(body: Record<string, unknown>, now: number): StoredToken | string | null };
-export type ConnectionCredential =
-  | { type: "static"; value: string }
-  | { type: "oauth"; access: string; refresh: string; expires_at: number; token_url: string; client_id: string; client_secret?: string; scope?: string };
 type Identity = { account_id?: string; fedramp?: boolean };
 
 export const SUBSCRIPTION = {
@@ -130,18 +127,6 @@ export function codexPolicy(current: StoredToken, minimumLifetime: number): Toke
       };
     },
   };
-}
-
-export function connectionCredential(value: any): ConnectionCredential {
-  const fail = (): never => { throw new Failure(500, "configuration_error"); };
-  if (value?.type === "static" && typeof value.value === "string" && /^[\x21-\x7e]{1,16384}$/.test(value.value)) return { type: "static", value: value.value };
-  if (value?.type !== "oauth") return fail();
-  let url: URL;
-  try { url = new URL(value.token_url); } catch { return fail(); }
-  if (url.protocol !== "https:" || url.username || url.password || url.hash) fail();
-  if (typeof value.access !== "string" || !SECRET_PATTERN.test(value.access) || typeof value.refresh !== "string" || !SECRET_PATTERN.test(value.refresh) || !Number.isSafeInteger(value.expires_at) || typeof value.client_id !== "string" || !value.client_id) fail();
-  if ((value.client_secret !== undefined && typeof value.client_secret !== "string") || (value.scope !== undefined && typeof value.scope !== "string")) fail();
-  return { type: "oauth", access: value.access, refresh: value.refresh, expires_at: value.expires_at, token_url: url.toString(), client_id: value.client_id, client_secret: value.client_secret, scope: value.scope };
 }
 
 type Key = { kid: string; key: CryptoKey };

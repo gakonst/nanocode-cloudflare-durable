@@ -2,11 +2,6 @@ export type ModelProvider = "claude" | "codex";
 
 export const EXECUTOR_ID = /^[a-z0-9][a-z0-9_-]{0,47}$/;
 export const DEFAULT_EXECUTOR = "default";
-export const LEGACY_RUNNER = "runner";
-
-export function runnerConnection(executor: string): string {
-  return `${LEGACY_RUNNER}:${executor}`;
-}
 
 export function sessionUuid(): string {
   const bytes = crypto.getRandomValues(new Uint8Array(16));
@@ -24,21 +19,12 @@ export function sessionUuid(): string {
 export type SessionAuthority = {
   account_id: string;
   session_id: string;
-  grant_id?: string;
-  grant_revision?: number;
-  app_id?: string;
-  origin?: string;
-  principal?: string;
-  connections?: string[];
-  catalog_digest?: string;
-  grant_expires_at?: number;
   executor_id?: string;
 };
 
 export type SessionDescriptor = SessionAuthority & {
   provider?: ModelProvider;
   session_name: string;
-  thread_id?: string;
   subscription: boolean;
   hand?: string;
 };
@@ -52,20 +38,6 @@ export type ModelDispatch = {
 };
 
 export type SocketDispatch = Pick<ModelDispatch, "provider" | "authority" | "headers">;
-
-export type AuthorityCommand = {
-  op: string;
-  account_id: string;
-  [key: string]: unknown;
-};
-
-export type AuthorityResult = {
-  ok: boolean;
-  status?: number;
-  error?: string;
-  descriptor?: SessionDescriptor;
-  [key: string]: unknown;
-};
 
 export interface PrivateBinding {
   fetch(request: Request): Promise<Response>;
@@ -117,7 +89,6 @@ export type RuntimeOptions = {
   wake?(): void;
   event(value: unknown): Promise<void>;
   events?(values: unknown[]): Promise<void>;
-  connection?(request: { kind?: string; input?: unknown; op: string }): Promise<unknown>;
   socket?: {
     open(request: { headers: [string, string][] }, signal: AbortSignal, timing: ModelTiming & { runtime_id: string }): Promise<Response>;
     admit(): Promise<void>;
@@ -139,9 +110,4 @@ export function json(value: unknown, status = 200, headers?: HeadersInit): Respo
 
 export function headerJson(value: unknown): string {
   return JSON.stringify(value).replace(/[\u007f-\uffff]/g, character => `\\u${character.charCodeAt(0).toString(16).padStart(4, "0")}`);
-}
-
-export async function authorityCall(binding: PrivateBinding, command: AuthorityCommand): Promise<AuthorityResult> {
-  const response = await binding.fetch(new Request("https://authority.internal/", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(command) }));
-  return response.json<AuthorityResult>();
 }

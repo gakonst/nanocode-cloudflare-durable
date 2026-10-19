@@ -1,7 +1,5 @@
 mod auth;
 mod bridge;
-#[path = "capabilities.rs"]
-mod capabilities;
 mod events;
 #[path = "remote/runtime.rs"]
 mod remote;
@@ -96,7 +94,6 @@ enum Command {
         request_id: Option<String>,
     },
     Settle,
-    Revoke,
     Preconnect,
     Dispose,
 }
@@ -190,9 +187,6 @@ async fn open(config: Configuration) -> Result<Session, String> {
         .tools(
             Tools::builder()
                 .without_defaults()
-                .tool(capabilities::Connections)
-                .tool(capabilities::ConnectionRequest("connector"))
-                .tool(capabilities::ConnectionRequest("vault"))
                 .tool(executors.tool())
                 .build()
                 .map_err(text)?,
@@ -508,23 +502,6 @@ impl Session {
         let after = self.activity().await;
         Ok(after.revision == before.revision && self.idle(&after).await?)
     }
-
-    async fn revoke(&self) -> Result<(), String> {
-        if let Some(control) = self.runtime.subagents() {
-            control.close_all(self.root()).await.map_err(text)?;
-        }
-        for request_id in self.pending_ids().await? {
-            let ours = self.live.borrow().contains_key(&request_id);
-            let outcome = self.cancel(Some(request_id)).await?;
-            if outcome.get("waiting") == Some(&Value::Bool(true)) {
-                if !ours {
-                    ignore_inactive(self.agent.cancel_active_turn().await).map_err(text)?;
-                }
-                break;
-            }
-        }
-        Ok(())
-    }
 }
 
 fn ignore_inactive(result: Result<(), NanocodeError>) -> Result<(), NanocodeError> {
@@ -579,7 +556,6 @@ async fn execute(command: Command) -> Result<Value, String> {
             None => Ok(Value::Null),
         },
         Command::Settle => ready()?.settle().await.map(Value::Bool),
-        Command::Revoke => ready()?.revoke().await.map(|()| Value::Null),
         Command::Preconnect => ready()?
             .agent
             .preconnect()

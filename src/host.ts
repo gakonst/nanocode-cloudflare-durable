@@ -172,11 +172,6 @@ export class AgentRuntime {
     await this.command({ op: "preconnect" });
   }
 
-  async revoke(): Promise<void> {
-    try { await this.command({ op: "revoke" }); }
-    finally { this.closeSockets("runtime revoked", "cancelled"); }
-  }
-
   changed(signal?: AbortSignal): Promise<void> {
     if (this.stopped || signal?.aborted) return Promise.resolve();
     return new Promise(resolve => {
@@ -461,11 +456,6 @@ export class AgentRuntime {
         }
         this.notify();
         return null;
-      }
-      case "connection_catalog":
-      case "connection_request": {
-        if (!this.options.connection) throw new Error("account connections are not configured");
-        return this.options.connection(request);
       }
       default: {
         if (!STORE_OPERATIONS.has(request.op)) throw new Error("unsupported host operation");

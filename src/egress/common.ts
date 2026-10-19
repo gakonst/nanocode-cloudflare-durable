@@ -1,22 +1,14 @@
-import { DEFAULT_EXECUTOR, EXECUTOR_ID, LEGACY_RUNNER, runnerConnection, type AuthorityResult, type ModelProvider, type PrivateBinding } from "../contracts";
+import { DEFAULT_EXECUTOR, EXECUTOR_ID, type ModelProvider, type PrivateBinding } from "../contracts";
 import type { CredentialBroker } from "../vault";
-import type { AccountAuthority } from "./account";
 
 export interface EgressEnv {
-  ACCOUNTS: DurableObjectNamespace<AccountAuthority>;
   VAULT: Service<CredentialBroker>;
   ANTHROPIC_ENDPOINT?: string;
   ACCOUNT_ID?: string;
   CREDENTIAL_CACHE_TTL_MS: string;
   REFRESH_MARGIN_MS: string;
-  CONNECT_TOKEN_TTL_MS: string;
-  CONNECT_REFRESH_TTL_MS: string;
-  CONNECT_CODE_TTL_MS: string;
-  RECOVERY_DELAY_MS: string;
   MODEL_RESPONSE_HEADERS_TIMEOUT_MS: string;
   MODEL_STREAM_IDLE_TIMEOUT_MS: string;
-  CONNECTIONS_JSON?: string;
-  SESSION_FENCES?: PrivateBinding;
   RUNNER_URL?: string;
   RUNNERS_JSON?: string;
   CODEX_TRANSPORT?: PrivateBinding;
@@ -34,13 +26,9 @@ export class Failure extends Error {
   constructor(readonly status: number, readonly code: string) {
     super(code);
   }
-
-  result(): AuthorityResult {
-    return { ok: false, status: this.status, error: this.code };
-  }
 }
 
-export function setting(env: EgressEnv, name: "CREDENTIAL_CACHE_TTL_MS" | "REFRESH_MARGIN_MS" | "CONNECT_TOKEN_TTL_MS" | "CONNECT_REFRESH_TTL_MS" | "CONNECT_CODE_TTL_MS" | "RECOVERY_DELAY_MS" | "MODEL_RESPONSE_HEADERS_TIMEOUT_MS" | "MODEL_STREAM_IDLE_TIMEOUT_MS"): number {
+export function setting(env: EgressEnv, name: "CREDENTIAL_CACHE_TTL_MS" | "REFRESH_MARGIN_MS" | "MODEL_RESPONSE_HEADERS_TIMEOUT_MS" | "MODEL_STREAM_IDLE_TIMEOUT_MS"): number {
   const value = Number(env[name]);
   if (!Number.isSafeInteger(value) || value <= 0) throw new Failure(500, "configuration_error");
   return value;
@@ -74,14 +62,6 @@ function loopback(host: string): boolean {
   return host === "localhost" || host === "127.0.0.1" || host === "[::1]";
 }
 
-export function exactOrigin(value: unknown): string {
-  if (typeof value !== "string" || value.length > 512) throw new Failure(400, "invalid_request");
-  let url: URL;
-  try { url = new URL(value); } catch { throw new Failure(400, "invalid_request"); }
-  if (url.origin !== value || !secureUrl(url)) throw new Failure(400, "invalid_request");
-  return value;
-}
-
 export function base64url(bytes: Uint8Array): string {
   let text = "";
   for (const byte of bytes) text += String.fromCharCode(byte);
@@ -93,114 +73,12 @@ export function unbase64url(value: string): Uint8Array {
   return Uint8Array.from(text, character => character.charCodeAt(0));
 }
 
-export function random(bytes = 32): string {
-  return base64url(crypto.getRandomValues(new Uint8Array(bytes)));
-}
-
 export async function sha256(value: string): Promise<Uint8Array> {
   return new Uint8Array(await crypto.subtle.digest("SHA-256", encoder.encode(value)));
 }
 
 export async function sha256hex(value: string): Promise<string> {
   return Array.from(await sha256(value), byte => byte.toString(16).padStart(2, "0")).join("");
-}
-
-export type Placement = { type: "bearer" } | { type: "header"; name: string; prefix: string } | { type: "basic" };
-
-export type Connection = {
-  id: string;
-  kind: "connector" | "vault";
-  base: URL;
-  accounts: string[];
-  methods: string[];
-  paths: string[];
-  request_headers: string[];
-  response_headers: string[];
-  response_fields: string[];
-  max_body_bytes: number;
-  max_response_bytes: number;
-  auth: Placement;
-};
-
-export const FORBIDDEN_HEADERS = new Set(["authorization", "proxy-authorization", "cookie", "set-cookie", "host", "x-api-key", "content-length", "transfer-encoding", "connection", "keep-alive", "upgrade", "te", "trailer", "forwarded", "x-forwarded-for", "x-forwarded-host", "x-real-ip", "cf-connecting-ip", "accept-encoding"]);
-const HEADER_NAME = /^[!#$%&'*+.^_`|~0-9a-z-]{1,128}$/;
-const METHODS = new Set(["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"]);
-const IDENTIFIER = /^[A-Za-z0-9_-]{1,64}$/;
-
-let parsedSource: string | undefined;
-let parsedConnections = new Map<string, Connection>();
-
-export function connections(env: EgressEnv): Map<string, Connection> {
-  const source = env.CONNECTIONS_JSON ?? "";
-  if (source === parsedSource) return parsedConnections;
-  const result = new Map<string, Connection>();
-  if (source) {
-    let document: any;
-    try { document = JSON.parse(source); } catch { throw new Failure(500, "configuration_error"); }
-    if (!document || typeof document !== "object" || Array.isArray(document)) throw new Failure(500, "configuration_error");
-    for (const [id, value] of Object.entries<any>(document)) result.set(id, connection(env, id, value));
-  }
-  parsedSource = source;
-  parsedConnections = result;
-  return result;
-}
-
-function connection(env: EgressEnv, id: string, value: any): Connection {
-  const fail = () => { throw new Failure(500, "configuration_error"); };
-  if (!IDENTIFIER.test(id) || !value || typeof value !== "object" || "credential" in value) fail();
-  const kind = value.kind ?? "connector";
-  if (kind !== "connector" && kind !== "vault") fail();
-  let base: URL;
-  try { base = new URL(value.base_url); } catch { return fail(); }
-  if (!secureUrl(base) || base.search || base.hash) fail();
-  const strings = (input: unknown, fallback: string[], test: (item: string) => boolean) => {
-    if (input === undefined) return fallback;
-    if (!Array.isArray(input) || input.length > 64 || !input.every(item => typeof item === "string" && test(item))) fail();
-    return input as string[];
-  };
-  const accounts = strings(value.accounts, [modelAccount(env)], item => ACCOUNT_PATTERN.test(item));
-  const methods = strings(value.methods, ["GET"], item => METHODS.has(item));
-  const paths = strings(value.paths, ["/"], item => item.startsWith("/") && !/[?#\\\s]/.test(item));
-  const auth = placement(value.auth, fail);
-  const request_headers = strings(value.request_headers, ["accept", "content-type"], item => HEADER_NAME.test(item) && !FORBIDDEN_HEADERS.has(item) && (auth.type !== "header" || item !== auth.name));
-  const response_headers = strings(value.response_headers, [], item => HEADER_NAME.test(item) && !FORBIDDEN_HEADERS.has(item) && !/auth|token|secret|cookie|key/.test(item));
-  const response_fields = strings(value.response_fields, [], item => /^[A-Za-z0-9_.:-]{1,128}$/.test(item));
-  const limit = (input: unknown, fallback: number) => {
-    if (input === undefined) return fallback;
-    if (!Number.isSafeInteger(input) || (input as number) <= 0 || (input as number) > 32 << 20) fail();
-    return input as number;
-  };
-  return {
-    id,
-    kind,
-    base,
-    accounts,
-    methods,
-    paths,
-    request_headers,
-    response_headers,
-    response_fields,
-    max_body_bytes: limit(value.max_body_bytes, 1 << 20),
-    max_response_bytes: limit(value.max_response_bytes, 4 << 20),
-    auth,
-  };
-}
-
-function placement(value: any, fail: () => never): Placement {
-  if (value === undefined || value?.type === "bearer") return { type: "bearer" };
-  if (value?.type === "basic") return { type: "basic" };
-  if (value?.type === "header" && typeof value.name === "string" && HEADER_NAME.test(value.name) && !FORBIDDEN_HEADERS.has(value.name)) {
-    const prefix = value.prefix ?? "";
-    if (typeof prefix !== "string" || !/^[\x20-\x7e]{0,64}$/.test(prefix)) fail();
-    return { type: "header", name: value.name, prefix };
-  }
-  return fail();
-}
-
-export function placeCredential(auth: Placement, secret: string): [string, string] {
-  if (auth.type === "bearer") return ["authorization", `Bearer ${secret}`];
-  if (auth.type === "basic") return ["authorization", `Basic ${btoa(secret)}`];
-  return [auth.name, `${auth.prefix}${secret}`];
 }
 
 export type Executor = { id: string; url: string; binding?: string };
@@ -272,18 +150,6 @@ export function executorId(value: unknown): string {
   if (value === undefined || value === null) return DEFAULT_EXECUTOR;
   if (typeof value !== "string" || !EXECUTOR_ID.test(value)) throw new Failure(400, "invalid_request");
   return value;
-}
-
-export function executorConnection(value: string): string | undefined {
-  if (value === LEGACY_RUNNER) return DEFAULT_EXECUTOR;
-  const prefix = `${LEGACY_RUNNER}:`;
-  if (!value.startsWith(prefix)) return undefined;
-  const id = value.slice(prefix.length);
-  return EXECUTOR_ID.test(id) ? id : undefined;
-}
-
-export function executorSelected(selected: string[], id: string): boolean {
-  return selected.includes(runnerConnection(id)) || (id === DEFAULT_EXECUTOR && selected.includes(LEGACY_RUNNER));
 }
 
 export type Denied = { ok: false; status: number; error: string };

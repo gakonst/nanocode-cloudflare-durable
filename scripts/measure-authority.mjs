@@ -62,10 +62,10 @@ try {
   check(encrypted[0].state === "ready" && encrypted[0].generation === 2 && encrypted[0].format === "v1.", "Rotated credentials are encrypted and committed before release");
   const bindings = await mf.getBindings("nanocode-worker");
   const metrics = await (await bindings.EGRESS.fetch(new Request("https://egress.internal/metrics"))).json();
-  const before = metrics.metrics.model_authority_rpcs + metrics.metrics.vault_rpcs;
+  const before = metrics.metrics.vault_rpcs;
   await (await dispatch()).text();
   const warm = await (await bindings.EGRESS.fetch(new Request("https://egress.internal/metrics"))).json();
-  check(warm.metrics.model_authority_rpcs + warm.metrics.vault_rpcs === before, "Warm model dispatch makes zero authority or vault RPCs");
+  check(warm.metrics.vault_rpcs === before, "Warm model dispatch makes zero vault RPCs");
   await mf.dispose();
   await launch();
   check((await dispatch()).status === 200 && refreshes === 1, "Cold egress restoration reuses the committed rotated credential");
