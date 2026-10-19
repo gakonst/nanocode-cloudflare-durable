@@ -37,8 +37,9 @@ const provider = async request => {
   ], "tool_use");
   return response(input, [{ type: "text", text: "capabilities-ok" }], "end_turn");
 };
-const connections = Object.fromEntries(Object.entries(credentials).map(([id, value]) => [id, { kind: id === "vault" ? "vault" : "connector", base_url: id === "demo" ? "https://connector.invalid" : "https://vault.invalid", methods: ["GET"], paths: ["/safe"], response_fields: ["answer"], credential: { type: "static", value } }]));
-const mf = new Miniflare(convertV4MiniflareOptions(localOptions({ provider, egress: { CONNECTIONS_JSON: JSON.stringify(connections) } })));
+const connections = Object.fromEntries(Object.keys(credentials).map(id => [id, { kind: id === "vault" ? "vault" : "connector", base_url: id === "demo" ? "https://connector.invalid" : "https://vault.invalid", methods: ["GET"], paths: ["/safe"], response_fields: ["answer"] }]));
+const connectionCredentials = Object.fromEntries(Object.entries(credentials).map(([id, value]) => [id, { type: "static", value }]));
+const mf = new Miniflare(convertV4MiniflareOptions(localOptions({ provider, egress: { CONNECTIONS_JSON: JSON.stringify(connections) }, vault: { CONNECTION_CREDENTIALS_JSON: JSON.stringify(connectionCredentials) } })));
 const headers = { authorization: "Bearer local-measurement", "content-type": "application/json" };
 const base = "https://worker/sessions/capabilities/turns";
 try {

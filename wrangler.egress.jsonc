@@ -8,7 +8,10 @@
     "bindings": [{ "name": "ACCOUNTS", "class_name": "AccountAuthority" }]
   },
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["AccountAuthority"] }],
-  "services": [{ "binding": "SESSION_FENCES", "service": "nanocode-worker", "entrypoint": "SessionControl" }],
+  "services": [
+    { "binding": "SESSION_FENCES", "service": "nanocode-worker", "entrypoint": "SessionControl" },
+    { "binding": "VAULT", "service": "nanocode-vault", "entrypoint": "CredentialBroker" }
+  ],
   "vpc_services": [
     { "binding": "RUNNER_VPC_PARADIGM_A", "service_id": "01a14e2c-a47e-7160-90dc-146bb38585ea" },
     { "binding": "RUNNER_VPC_PARADIGM_B", "service_id": "01a14e2c-a87a-7a93-9ac6-34a506f79763" },
@@ -23,7 +26,8 @@
     "CONNECT_CODE_TTL_MS": "300000",
     "RECOVERY_DELAY_MS": "30000",
     "MODEL_RESPONSE_HEADERS_TIMEOUT_MS": "120000",
-    "MODEL_STREAM_IDLE_TIMEOUT_MS": "120000"
+    "MODEL_STREAM_IDLE_TIMEOUT_MS": "120000",
+    "RUNNERS_JSON": "[{\"id\":\"paradigm-a\",\"url\":\"http://127.0.0.1:19081/\",\"binding\":\"RUNNER_VPC_PARADIGM_A\"},{\"id\":\"paradigm-b\",\"url\":\"http://127.0.0.1:19082/\",\"binding\":\"RUNNER_VPC_PARADIGM_B\"}]"
   },
   "observability": { "enabled": true }
 }

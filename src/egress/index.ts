@@ -1,8 +1,9 @@
 import { WorkerEntrypoint } from "cloudflare:workers";
 import { json, sessionUuid, type AuthorityCommand, type AuthorityResult, type ModelDispatch, type ModelProvider, type SessionAuthority, type SocketDispatch } from "../contracts";
-import { AccountAuthority, type Access, type ServiceAccess, type ServiceRequest } from "./account";
+import type { ImportResult, ModelAccess, SecretAccess } from "../vault";
+import { AccountAuthority, type Authorized, type ServiceAccess, type ServiceRequest } from "./account";
 import { modelFetch, socketFetch } from "./model-transport";
-import { ACCOUNT_PATTERN, CODEX, connections, encoder, Failure, FORBIDDEN_HEADERS, mode, modelAccount, modelEndpoint, modelProvider, readLimited, setting, SUBSCRIPTION, type Connection, type EgressEnv } from "./common";
+import { AccessCache, ACCOUNT_PATTERN, CODEX, connections, encoder, Failure, FORBIDDEN_HEADERS, modelAccount, modelEndpoint, modelProvider, placeCredential, readLimited, setting, SUBSCRIPTION, type CacheOutcome, type Connection, type EgressEnv } from "./common";
 
 export { AccountAuthority };
 export { RemoteExecutorEgress } from "../remote/egress";
@@ -17,19 +18,25 @@ const CODEX_RESPONSE_HEADER = /^(content-type|retry-after|x-request-id|x-oai-req
 const PROVIDER_ERRORS = new Set(["invalid_request_error", "authentication_error", "permission_error", "not_found_error", "request_too_large", "rate_limit_error", "api_error", "overloaded_error", "timeout_error", "billing_error"]);
 const CODEX_ERROR_CODES = new Set(["context_length_exceeded", "insufficient_quota", "usage_not_included", "cyber_policy", "misalignment_policy_violation", "invalid_prompt", "bio_policy", "usage_limit_reached", "rate_limit_exceeded", "invalid_function_parameters", "previous_response_not_found", "invalid_encrypted_content", "server_error", "server_is_overloaded", "slow_down", "websocket_connection_limit_reached", "temporarily_unavailable", "model_not_found"]);
 const CACHE_LIMIT = 1024;
+const GZIP_HOST = "api.anthropic.com";
+const GZIP_MIN_BODY_BYTES = 4096;
+const GZIP_PADDING_LENGTHS = 257;
+const GZIP_REJECTIONS = new Set([400, 403, 415]);
+const INVALID_JSON_MESSAGES = ["The request body is not valid JSON", "Failed to parse request: could not parse request body as JSON"];
+const BAD_JSON_DETAILS = new Set(["unexpected EOF", "unexpected end of JSON input", "EOF"]);
 const AUTHORITY_BODY_LIMIT = 256 * 1024;
 const SERVICE_BODY_LIMIT = 33 << 20;
 const DIAGNOSTIC_LIMIT = 64;
 const DIAGNOSTIC_MAX_MS = 3_600_000;
-const DIAGNOSTIC_ERRORS = new Set(["none", "other", "credential_unchanged", "invalid_request", "unsupported_provider", "subscription_mismatch", "configuration_error", "internal_error", "credential_rejected", "invalid_token", "login_required", "refresh_uncertain", "forbidden", "grant_expired", "grant_revoked", "insufficient_scope", "origin_mismatch", "account_mismatch", "catalog_mismatch", "not_found", "vault_key_mismatch", "vault_key_required", "upstream_cancelled", "upstream_unavailable", "upstream_timeout"]);
+const DIAGNOSTIC_ERRORS = new Set(["none", "other", "credential_unchanged", "invalid_request", "unsupported_provider", "subscription_mismatch", "configuration_error", "internal_error", "credential_rejected", "invalid_token", "login_required", "refresh_uncertain", "forbidden", "grant_expired", "grant_revoked", "insufficient_scope", "origin_mismatch", "account_mismatch", "catalog_mismatch", "not_found", "vault_key_mismatch", "vault_key_required", "credential_missing", "vault_unavailable", "upstream_cancelled", "upstream_unavailable", "upstream_timeout"]);
 const CREDENTIAL_OUTCOMES = new Set<CredentialOutcome>(["none", "hit", "miss", "coalesced", "refresh", "refresh_coalesced"]);
 const clock: () => number = typeof performance === "object" && performance !== null && typeof performance.now === "function" ? () => performance.now() : () => Date.now();
 
-type Granted = Extract<Access, { ok: true }>;
-type Entry = { access: Granted; until: number };
+type Granted = Extract<ModelAccess, { ok: true }>;
+type Secret = Extract<SecretAccess, { ok: true }>;
 type DiagnosticOrigin = "local_validation" | "authority" | "provider_http" | "transport" | "projection";
 type DiagnosticMime = "json" | "html" | "event_stream" | "other" | "missing";
-type CredentialOutcome = "none" | "hit" | "miss" | "coalesced" | "refresh" | "refresh_coalesced";
+type CredentialOutcome = "none" | CacheOutcome;
 type TransportKind = "direct" | "fixed_binding";
 type AttemptPhase = "authority" | "transport" | "discard" | "projection";
 type AttemptDiagnostic = { attempt: 1 | 2; status: number; origin: DiagnosticOrigin; credential: CredentialOutcome; transport: TransportKind; auth_lookup_ms: number; fetch_header_ms: number; discard_ms: number; error_projection_ms: number; mime: DiagnosticMime; mitigated: boolean; auth_error: boolean; request_id: boolean; error: string };
@@ -42,6 +49,8 @@ const metrics = {
   model_cache_misses: 0,
   model_coalesced: 0,
   model_authority_rpcs: 0,
+  vault_rpcs: 0,
+  vault_migrations: 0,
   model_unauthorized: 0,
   model_recoveries: 0,
   model_provider_errors: 0,
@@ -53,13 +62,18 @@ const metrics = {
   redirects_rejected: 0,
   upstream_failures: 0,
   model_timeouts: 0,
+  model_gzip_requests: 0,
+  model_gzip_rejections: 0,
+  model_gzip_input_bytes: 0,
+  model_gzip_output_bytes: 0,
 };
-const cache = new Map<string, Entry>();
-const inflight = new Map<string, Promise<Access>>();
+const models = new AccessCache<Granted>(CACHE_LIMIT);
+const secrets = new AccessCache<Secret>(CACHE_LIMIT);
 const diagnostics: ModelDiagnostic[] = [];
+let gzipRejected = false;
 
 function snapshot() {
-  return { ...metrics, cache_entries: cache.size, inflight: inflight.size };
+  return { ...metrics, cache_entries: models.size + secrets.size, inflight: models.pending + secrets.pending };
 }
 
 function attemptDiagnostic(attempt: 1 | 2, origin: DiagnosticOrigin, transport: TransportKind): AttemptDiagnostic {
@@ -165,51 +179,47 @@ function cacheKey(authority: SessionAuthority, provider: ModelProvider): string 
   return [provider, authority.account_id, authority.grant_id ?? "", authority.grant_revision ?? "", authority.grant_id ? authority.session_id : ""].join("\u0000");
 }
 
-async function resolveModel(env: EgressEnv, authority: SessionAuthority, provider: ModelProvider, rejected?: number, observe?: (outcome: CredentialOutcome) => void): Promise<Access> {
-  const key = cacheKey(authority, provider);
-  const entry = cache.get(key);
-  if (rejected === undefined) {
-    if (entry && entry.until > Date.now()) {
-      metrics.model_cache_hits++;
-      observe?.("hit");
-      return entry.access;
-    }
-  }
-  if (entry && (rejected === undefined || entry.access.generation === rejected)) cache.delete(key);
-  const flight = rejected === undefined ? key : `${key}\u0001${rejected}`;
-  const existing = inflight.get(flight);
-  if (existing) {
-    metrics.model_coalesced++;
-    observe?.(rejected === undefined ? "coalesced" : "refresh_coalesced");
-    return existing;
-  }
-  if (rejected === undefined) metrics.model_cache_misses++;
-  const ttl = setting(env, "CREDENTIAL_CACHE_TTL_MS");
-  const margin = setting(env, "REFRESH_MARGIN_MS");
-  observe?.(rejected === undefined ? "miss" : "refresh");
-  const pending = (async (): Promise<Access> => {
-    metrics.model_authority_rpcs++;
-    const access = await account(env, authority.account_id).modelAccess({ account_id: authority.account_id, authority, rejected_generation: rejected, provider }) as Access;
-    if (access.ok) {
-      const now = Date.now();
-      const until = Math.min(now + ttl, access.expires_at === null ? Number.MAX_SAFE_INTEGER : access.expires_at - margin, authority.grant_expires_at ?? Number.MAX_SAFE_INTEGER);
-      if (until > now) {
-        cache.delete(key);
-        cache.set(key, { access, until });
-        while (cache.size > CACHE_LIMIT) cache.delete(cache.keys().next().value!);
-      }
-    }
-    return access;
-  })();
-  inflight.set(flight, pending);
-  try {
-    return await pending;
-  } finally {
-    inflight.delete(flight);
-  }
+function cachePolicy(env: EgressEnv, horizon?: number): { ttl: number; margin: number; horizon?: number } {
+  return { ttl: setting(env, "CREDENTIAL_CACHE_TTL_MS"), margin: setting(env, "REFRESH_MARGIN_MS"), horizon };
 }
 
-function modelHeaders(input: unknown, subscription: boolean): Headers {
+function resolveModel(env: EgressEnv, authority: SessionAuthority, provider: ModelProvider, rejected?: number, observe?: (outcome: CredentialOutcome) => void): Promise<ModelAccess> {
+  return models.get(cacheKey(authority, provider), rejected, cachePolicy(env, authority.grant_expires_at), async () => {
+    if (authority.grant_id !== undefined) {
+      metrics.model_authority_rpcs++;
+      const authorized = await account(env, authority.account_id).authorizeModel({ account_id: authority.account_id, authority }) as Authorized;
+      if (!authorized.ok) return authorized;
+    }
+    return await vaultModel(env, authority.account_id, provider, rejected);
+  }, outcome => {
+    if (outcome === "hit") metrics.model_cache_hits++;
+    else if (outcome === "miss") metrics.model_cache_misses++;
+    else if (outcome !== "refresh") metrics.model_coalesced++;
+    observe?.(outcome);
+  });
+}
+
+async function vaultModel(env: EgressEnv, account_id: string, provider: ModelProvider, rejected?: number): Promise<ModelAccess> {
+  metrics.vault_rpcs++;
+  const access = await env.VAULT.model({ account_id, provider, rejected_generation: rejected }) as ModelAccess;
+  if (access.ok || access.error !== "credential_missing") return access;
+  metrics.vault_migrations++;
+  const migrated = await account(env, account_id).migrate({ account_id }) as ImportResult;
+  if (!migrated.ok) return migrated;
+  metrics.vault_rpcs++;
+  return await env.VAULT.model({ account_id, provider, rejected_generation: rejected }) as ModelAccess;
+}
+
+function connectionSecret(env: EgressEnv, account_id: string, connection: Connection, rejected?: number): Promise<SecretAccess> {
+  return secrets.get(connection.id, rejected, cachePolicy(env), async () => {
+    metrics.vault_rpcs++;
+    const access = await env.VAULT.connection({ account_id, connection_id: connection.id, rejected_generation: rejected }) as SecretAccess;
+    if (access.ok && access.refreshable && connection.auth.type === "basic") return { ok: false, status: 500, error: "configuration_error" };
+    return access;
+  });
+}
+
+function modelHeaders(input: unknown): Headers {
   if (!Array.isArray(input) || input.length > 128) throw new Failure(400, "invalid_request");
   const headers = new Headers();
   for (const pair of input) {
@@ -218,6 +228,10 @@ function modelHeaders(input: unknown, subscription: boolean): Headers {
     if (!MODEL_REQUEST_HEADER.test(name)) continue;
     try { headers.append(name, pair[1]); } catch { throw new Failure(400, "invalid_request"); }
   }
+  return headers;
+}
+
+function subscriptionHeaders(headers: Headers, subscription: boolean): Headers {
   const betas = (headers.get("anthropic-beta") ?? "").split(",").map(beta => beta.trim()).filter(beta => beta && (subscription || beta !== SUBSCRIPTION.beta));
   if (subscription && !betas.includes(SUBSCRIPTION.beta)) betas.push(SUBSCRIPTION.beta);
   const unique = [...new Set(betas)];
@@ -247,11 +261,57 @@ function codexHeaders(input: unknown): Headers {
   return headers;
 }
 
-function sendModel(env: EgressEnv, provider: ModelProvider, endpoint: string, headers: Headers, access: Granted, body: ArrayBuffer, signal: AbortSignal): Promise<Response> {
+function gzipPadded(body: ArrayBuffer): Uint8Array {
+  const random = crypto.getRandomValues(new Uint8Array(2 + GZIP_PADDING_LENGTHS));
+  const length = (random[0] | (random[1] << 8)) % GZIP_PADDING_LENGTHS;
+  const padded = new Uint8Array(body.byteLength + 1 + length);
+  padded.set(new Uint8Array(body));
+  padded[body.byteLength] = 0x20;
+  for (let index = 0; index < length; index++) padded[body.byteLength + 1 + index] = random[2 + index] & 1 ? 0x09 : 0x20;
+  return padded;
+}
+
+function gzipBody(body: ArrayBuffer): Promise<ArrayBuffer> {
+  return new Response(new Blob([gzipPadded(body)]).stream().pipeThrough(new CompressionStream("gzip"))).arrayBuffer();
+}
+
+function badJson(text: string): boolean {
+  if (!text.startsWith("bad json: ")) return false;
+  const detail = text.slice("bad json: ".length);
+  return detail.startsWith("invalid character ") || BAD_JSON_DETAILS.has(detail);
+}
+
+function invalidJson(body: string): boolean {
+  let value: any;
+  try { value = JSON.parse(body); } catch { return badJson(body.trimEnd()); }
+  if (value?.type === "error" && typeof value.error?.message === "string") return INVALID_JSON_MESSAGES.some(prefix => value.error.message.startsWith(prefix));
+  return value?.reason === "bad_json" && typeof value.error === "string" && badJson(value.error);
+}
+
+function sendModel(env: EgressEnv, provider: ModelProvider, endpoint: string, headers: Headers, access: Granted, body: ArrayBuffer, signal: AbortSignal, encoded: { gzip?: Promise<ArrayBuffer> }): Promise<Response> {
   const outgoing = new Headers(headers);
   for (const [name, value] of access.headers) outgoing.set(name, value);
-  const request = new Request(endpoint, { method: "POST", headers: outgoing, body, redirect: "manual", signal });
-  return modelFetch(request, outgoing => provider === "codex" && env.CODEX_TRANSPORT ? env.CODEX_TRANSPORT.fetch(outgoing) : fetch(outgoing), setting(env, "MODEL_RESPONSE_HEADERS_TIMEOUT_MS"), setting(env, "MODEL_STREAM_IDLE_TIMEOUT_MS"), () => { metrics.model_timeouts++; });
+  const send = (payload: ArrayBuffer, gzip: boolean) => {
+    const request = new Request(endpoint, { method: "POST", headers: outgoing, body: payload, redirect: "manual", signal });
+    if (gzip) request.headers.set("content-encoding", "gzip");
+    return modelFetch(request, outgoing => provider === "codex" && env.CODEX_TRANSPORT ? env.CODEX_TRANSPORT.fetch(outgoing) : fetch(outgoing), setting(env, "MODEL_RESPONSE_HEADERS_TIMEOUT_MS"), setting(env, "MODEL_STREAM_IDLE_TIMEOUT_MS"), () => { metrics.model_timeouts++; });
+  };
+  if (provider !== "claude" || gzipRejected || body.byteLength < GZIP_MIN_BODY_BYTES || new URL(endpoint).hostname !== GZIP_HOST) return send(body, false);
+  return (async () => {
+    encoded.gzip ??= gzipBody(body);
+    const compressed = await encoded.gzip;
+    metrics.model_gzip_requests++;
+    metrics.model_gzip_input_bytes += body.byteLength;
+    metrics.model_gzip_output_bytes += compressed.byteLength;
+    const response = await send(compressed, true);
+    if (!GZIP_REJECTIONS.has(response.status)) return response;
+    const text = await readLimited(response, 65_536);
+    const anthropic = (response.headers.get("request-id") ?? "").startsWith("req_") || response.headers.has("cf-ray");
+    if (anthropic && (response.status !== 400 || !invalidJson(text ?? ""))) return new Response(text, { status: response.status, statusText: response.statusText, headers: response.headers });
+    gzipRejected = true;
+    metrics.model_gzip_rejections++;
+    return send(body, false);
+  })();
 }
 
 function sendSocket(env: EgressEnv, headers: Headers, access: Granted, signal: AbortSignal): Promise<Response> {
@@ -332,7 +392,6 @@ async function openSocket(env: EgressEnv, request: Request): Promise<Response> {
     if (request.headers.get("upgrade")?.toLowerCase() !== "websocket" || !dispatch || typeof dispatch !== "object") throw new Failure(400, "invalid_request");
     if (modelProvider(dispatch.provider) !== "codex") throw new Failure(400, "unsupported_provider");
     const authority = authorityOf(dispatch.authority);
-    if (!env.CODEX_OAUTH_JSON) throw new Failure(500, "configuration_error");
     const headers = codexAllowed(dispatch.headers, CODEX_SOCKET_HEADER);
     headers.set("upgrade", "websocket");
     const idle = setting(env, "MODEL_STREAM_IDLE_TIMEOUT_MS");
@@ -369,8 +428,7 @@ async function openSocket(env: EgressEnv, request: Request): Promise<Response> {
         return finish(new Response(null, { status: 101, headers: allowed, webSocket: response.webSocket }));
       }
       if (response.status !== 401 || previous) {
-        const key = cacheKey(authority, "codex");
-        if (response.status === 401 && cache.get(key)?.access.generation === access.generation) cache.delete(key);
+        if (response.status === 401) models.evict(cacheKey(authority, "codex"), access.generation);
         mark = clock();
         const projected = await projectSocket(response);
         trace.error_projection_ms = elapsed(mark);
@@ -435,7 +493,7 @@ export class SessionEgress extends WorkerEntrypoint<EgressEnv> {
           return json(result, result.status ?? (result.ok ? 200 : 400));
         }
         metrics.service_requests++;
-        return await dispatchConnector(this.env, request, input, rejected_generation => target.sessionServiceAccess({ account_id: authority.account_id, authority, connection_id: input.connection_id, kind: input.kind ?? "connector", rejected_generation }) as Promise<ServiceAccess>);
+        return await dispatchConnector(this.env, request, input, authority.account_id, () => target.sessionServiceAccess({ account_id: authority.account_id, authority, connection_id: input.connection_id, kind: input.kind ?? "connector" }) as Promise<ServiceAccess>);
       } catch (error) {
         const failure = denial(error);
         return json({ ok: false, error: failure.error }, failure.status);
@@ -483,20 +541,8 @@ export class SessionEgress extends WorkerEntrypoint<EgressEnv> {
       transport = provider === "codex" && this.env.CODEX_TRANSPORT ? "fixed_binding" : "direct";
       const authority = authorityOf(dispatch.authority);
       const body = await request.arrayBuffer();
-      let endpoint: string;
-      let headers: Headers;
-      if (provider === "codex") {
-        if (!this.env.CODEX_OAUTH_JSON) throw new Failure(500, "configuration_error");
-        endpoint = CODEX.endpoint;
-        headers = codexHeaders(dispatch.headers);
-      } else {
-        const current = mode(this.env);
-        if (current === "unconfigured") throw new Failure(500, "configuration_error");
-        const subscription = current === "subscription";
-        if (dispatch.subscription !== subscription) throw new Failure(409, "subscription_mismatch");
-        endpoint = modelEndpoint(this.env);
-        headers = modelHeaders(dispatch.headers, subscription);
-      }
+      let endpoint = CODEX.endpoint;
+      const headers = provider === "codex" ? codexHeaders(dispatch.headers) : modelHeaders(dispatch.headers);
       request_ms = elapsed(entered);
       const one = start(1);
       begin("authority");
@@ -507,9 +553,20 @@ export class SessionEgress extends WorkerEntrypoint<EgressEnv> {
         one.error = errorOf(first.error);
         return finish(egressError(first, provider));
       }
+      if (provider === "claude") {
+        if (dispatch.subscription !== first.subscription) {
+          one.origin = "local_validation";
+          one.status = 409;
+          one.error = "subscription_mismatch";
+          return finish(egressError({ status: 409, error: "subscription_mismatch" }, provider));
+        }
+        endpoint = modelEndpoint(this.env, first.subscription);
+        subscriptionHeaders(headers, first.subscription);
+      }
       one.origin = "transport";
       begin("transport");
-      let response = await sendModel(this.env, provider, endpoint, headers, first, body, request.signal);
+      const encoded: { gzip?: Promise<ArrayBuffer> } = {};
+      let response = await sendModel(this.env, provider, endpoint, headers, first, body, request.signal, encoded);
       end();
       classify(one, response);
       if (response.status === 401) {
@@ -536,13 +593,10 @@ export class SessionEgress extends WorkerEntrypoint<EgressEnv> {
         metrics.model_recoveries++;
         two.origin = "transport";
         begin("transport");
-        response = await sendModel(this.env, provider, endpoint, headers, next, body, request.signal);
+        response = await sendModel(this.env, provider, endpoint, headers, next, body, request.signal, encoded);
         end();
         classify(two, response);
-        if (response.status === 401) {
-          const key = cacheKey(authority, provider);
-          if (cache.get(key)?.access.generation === next.generation) cache.delete(key);
-        }
+        if (response.status === 401) models.evict(cacheKey(authority, provider), next.generation);
       }
       begin("projection");
       const projected = await projectModel(response, provider);
@@ -624,19 +678,18 @@ function connectorHeaders(connection: Connection, input: unknown): Headers {
   return headers;
 }
 
-function sendConnector(url: URL, method: string, headers: Headers, access: Extract<ServiceAccess, { ok: true }>, body: string | undefined, signal: AbortSignal): Promise<Response> {
+function sendConnector(url: URL, method: string, headers: Headers, connection: Connection, access: Secret, body: string | undefined, signal: AbortSignal): Promise<Response> {
   const outgoing = new Headers(headers);
-  for (const [name, value] of access.headers) outgoing.set(name, value);
+  const [name, value] = placeCredential(connection.auth, access.secret);
+  outgoing.set(name, value);
   return fetch(url, { method, headers: outgoing, body, redirect: "manual", signal });
 }
 
-function secretsOf(access: Extract<ServiceAccess, { ok: true }>): string[] {
-  const values = new Set(access.secrets);
-  for (const [, value] of access.headers) {
-    values.add(value);
-    const space = value.indexOf(" ");
-    if (space > 0) values.add(value.slice(space + 1));
-  }
+function secretsOf(connection: Connection, access: Secret): string[] {
+  const [, value] = placeCredential(connection.auth, access.secret);
+  const values = new Set([access.secret, value]);
+  const space = value.indexOf(" ");
+  if (space > 0) values.add(value.slice(space + 1));
   return [...values].filter(value => value.length >= 8);
 }
 
@@ -685,7 +738,7 @@ async function readService(request: Request): Promise<any> {
   } catch { throw new Failure(400, "invalid_request"); }
 }
 
-async function dispatchConnector(env: EgressEnv, request: Request, input: any, resolve: (rejected?: number) => Promise<ServiceAccess>): Promise<Response> {
+async function dispatchConnector(env: EgressEnv, request: Request, input: any, account_id: string, authorize: () => Promise<ServiceAccess>): Promise<Response> {
   const method = input.method === undefined ? "GET" : typeof input.method === "string" ? input.method.toUpperCase() : "";
   const path = input.path ?? "/";
   const kind = input.kind ?? "connector";
@@ -699,17 +752,21 @@ async function dispatchConnector(env: EgressEnv, request: Request, input: any, r
   if (body !== undefined && (method === "GET" || method === "HEAD")) throw new Failure(400, "invalid_request");
   if (body !== undefined && encoder.encode(body).byteLength > connection.max_body_bytes) throw new Failure(413, "body_too_large");
   metrics.service_authority_rpcs++;
-  let access = await resolve();
+  const authorized = await authorize();
+  if (!authorized.ok) {
+    metrics.service_denied++;
+    return json({ ok: false, error: authorized.error }, authorized.status);
+  }
+  let access = await connectionSecret(env, account_id, connection);
   if (!access.ok) {
     metrics.service_denied++;
     return json({ ok: false, error: access.error }, access.status);
   }
   const vault = kind === "vault" || connection.kind === "vault";
-  let response = await sendConnector(url, method, headers, access, body, request.signal);
+  let response = await sendConnector(url, method, headers, connection, access, body, request.signal);
   if (response.status === 401 && access.refreshable) {
     await response.body?.cancel();
-    metrics.service_authority_rpcs++;
-    const next = await resolve(access.generation);
+    const next = await connectionSecret(env, account_id, connection, access.generation);
     if (!next.ok) {
       metrics.service_denied++;
       return json({ ok: false, error: next.error }, next.status);
@@ -717,7 +774,7 @@ async function dispatchConnector(env: EgressEnv, request: Request, input: any, r
     if (next.generation !== access.generation) {
       metrics.service_recoveries++;
       access = next;
-      response = await sendConnector(url, method, headers, access, body, request.signal);
+      response = await sendConnector(url, method, headers, connection, access, body, request.signal);
     } else return json({ ok: false, status: 401 });
   }
   if (response.status >= 300 && response.status < 400) {
@@ -729,7 +786,7 @@ async function dispatchConnector(env: EgressEnv, request: Request, input: any, r
     await response.body?.cancel();
     return json({ ok: response.ok, status: response.status });
   }
-  return projectConnector(connection, response, secretsOf(access));
+  return projectConnector(connection, response, secretsOf(connection, access));
 }
 
 export class ConnectServiceEgress extends WorkerEntrypoint<EgressEnv> {
@@ -741,7 +798,7 @@ export class ConnectServiceEgress extends WorkerEntrypoint<EgressEnv> {
       if (typeof input.account_id !== "string" || !ACCOUNT_PATTERN.test(input.account_id) || typeof input.token !== "string" || input.token.length > 512 || typeof input.origin !== "string" || (input.app_id !== undefined && typeof input.app_id !== "string")) throw new Failure(400, "invalid_request");
       const authority = account(this.env, input.account_id);
       const command: ServiceRequest = { account_id: input.account_id, token: input.token, origin: input.origin, app_id: input.app_id, connection_id: input.connection_id, kind: input.kind ?? "connector" };
-      return await dispatchConnector(this.env, request, input, rejected_generation => authority.serviceAccess({ ...command, rejected_generation }) as Promise<ServiceAccess>);
+      return await dispatchConnector(this.env, request, input, input.account_id, () => authority.serviceAccess(command) as Promise<ServiceAccess>);
     } catch (error) {
       const failure = denial(error);
       if (failure.status < 500) metrics.service_denied++;

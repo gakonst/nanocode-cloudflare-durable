@@ -58,7 +58,7 @@ const access = [segment({ alg: "RS256", typ: "JWT" }), segment({ exp: Math.floor
 const options = localOptions({
   provider: async () => { throw new Error("Private egress attempted direct network access"); },
   agent: { MODEL_SOCKET_LINGER_MS: String(LINGER_MS) },
-  egress: { CODEX_OAUTH_JSON: JSON.stringify({ auth_mode: "chatgpt", tokens: { access_token: access, refresh_token: secret(), account_id: account } }), VAULT_KEY: secret() },
+  vault: { CODEX_OAUTH_JSON: JSON.stringify({ auth_mode: "chatgpt", tokens: { access_token: access, refresh_token: secret(), account_id: account } }), VAULT_KEY: secret() },
   egressServices: { CODEX_TRANSPORT: "codex-mock" },
   workers: [{ name: "codex-mock", routes: ["mock.control/*"], modules: [{ type: "ESModule", path: "codex-mock.mjs", contents: MOCK }], compatibilityDate: "2026-10-16", bindings: { CONNECT_DELAY_MS: String(CONNECT_DELAY_MS) } }],
 });

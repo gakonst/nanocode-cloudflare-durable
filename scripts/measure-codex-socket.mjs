@@ -177,7 +177,8 @@ const options = localOptions({
     credentials.push(rotated, rotated.split(".")[2], currentRefresh);
     return Response.json({ access_token: rotated, refresh_token: currentRefresh, expires_in: 3600, token_type: "Bearer" });
   },
-  egress: { MODEL_STREAM_IDLE_TIMEOUT_MS: "1000", CODEX_OAUTH_JSON: JSON.stringify({ auth_mode: "chatgpt", tokens: { access_token: access, refresh_token: refresh, account_id: account } }), VAULT_KEY: secret() },
+  egress: { MODEL_STREAM_IDLE_TIMEOUT_MS: "1000" },
+  vault: { CODEX_OAUTH_JSON: JSON.stringify({ auth_mode: "chatgpt", tokens: { access_token: access, refresh_token: refresh, account_id: account } }), VAULT_KEY: secret() },
   egressServices: { CODEX_TRANSPORT: "codex-mock" },
   workers: [
     { name: "codex-mock", routes: ["mock.control/*"], modules: [{ type: "ESModule", path: "codex-mock.mjs", contents: MOCK }], compatibilityDate: "2026-10-16", bindings: { CONNECT_DELAY_MS: String(CONNECT_DELAY_MS), EXPECTED: JSON.stringify({ authorization: `Bearer ${access}`, account }), SECRETS: JSON.stringify(credentials) } },

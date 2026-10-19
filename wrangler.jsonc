@@ -22,6 +22,7 @@
   ],
   "vars": {
     "ACCOUNT_ID": "default",
+    "WORKER_TOKEN_SHA256": "1074ee1870ae6c08005081e2c0bc88ec9d2efca2a977c4e8c5b1306a6c302df8",
     "SESSION_LOCATION_HINT": "enam",
     "MODEL_AUTH": "subscription",
     "RECOVERY_DELAY_MS": "30000",

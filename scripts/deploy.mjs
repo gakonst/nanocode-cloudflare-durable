@@ -12,9 +12,10 @@ mkdirSync("output", { recursive: true });
 const bootstrap = resolve("output/egress-bootstrap.json");
 const config = JSON.parse(readFileSync("wrangler.egress.jsonc", "utf8"));
 config.main = resolve(config.main);
-delete config.services;
+config.services = config.services.filter(service => service.service !== "nanocode-worker");
 writeFileSync(bootstrap, JSON.stringify(config, null, 2));
 try {
+  deploy("wrangler.vault.jsonc");
   deploy(bootstrap);
   deploy("wrangler.jsonc");
   deploy("wrangler.egress.jsonc");

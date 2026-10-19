@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { createHash, randomBytes } from "node:crypto";
 import { createServer } from "node:http";
 import { createServer as createSocketServer } from "node:net";
 import { once } from "node:events";
@@ -39,14 +40,19 @@ const publicConfig = JSON.parse(readFileSync("wrangler.jsonc", "utf8"));
 publicConfig.main = resolve(publicConfig.main);
 publicConfig.build.cwd = process.cwd();
 publicConfig.build.watch_dir = publicConfig.build.watch_dir.map(path => relative(resolve("output"), resolve(path)));
-publicConfig.vars = { ...publicConfig.vars, WORKER_TOKEN: "local-measurement", MODEL_AUTH: "api_key", RECOVERY_DELAY_MS: "1000" };
+publicConfig.vars = { ...publicConfig.vars, WORKER_TOKEN_SHA256: createHash("sha256").update("local-measurement").digest("hex"), MODEL_AUTH: "api_key", RECOVERY_DELAY_MS: "1000" };
 publicConfig.observability = { enabled: false };
 const egressConfig = JSON.parse(readFileSync("wrangler.egress.jsonc", "utf8"));
 egressConfig.main = resolve(egressConfig.main);
-egressConfig.vars = { ...egressConfig.vars, ANTHROPIC_API_KEY: "local-provider", ANTHROPIC_ENDPOINT: `http://127.0.0.1:${provider.address().port}/v1/messages` };
+egressConfig.vars = { ...egressConfig.vars, ANTHROPIC_ENDPOINT: `http://127.0.0.1:${provider.address().port}/v1/messages` };
 egressConfig.observability = { enabled: false };
+const vaultConfig = JSON.parse(readFileSync("wrangler.vault.jsonc", "utf8"));
+vaultConfig.main = resolve(vaultConfig.main);
+vaultConfig.vars = { ...vaultConfig.vars, ANTHROPIC_API_KEY: "local-provider", VAULT_KEY: randomBytes(32).toString("base64url") };
+vaultConfig.observability = { enabled: false };
 writeFileSync("output/wrangler-measurement.json", JSON.stringify(publicConfig));
 writeFileSync("output/wrangler-egress-measurement.json", JSON.stringify(egressConfig));
+writeFileSync("output/wrangler-vault-measurement.json", JSON.stringify(vaultConfig));
 const state = resolve(mkdtempSync("output/wrangler-state-"));
 let child;
 let logs = "";
@@ -64,7 +70,7 @@ const until = async (condition, detail, timeout = 20000) => {
 };
 const start = async () => {
   const offset = logs.length;
-  child = spawn(process.execPath, ["node_modules/wrangler/bin/wrangler.js", "dev", "--local", "--config", "output/wrangler-measurement.json", "--config", "output/wrangler-egress-measurement.json", "--persist-to", state, "--ip", "127.0.0.1", "--port", String(port), "--inspector-port", "0", "--show-interactive-dev-session=false"], { detached: true, stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, WRANGLER_SEND_METRICS: "false" } });
+  child = spawn(process.execPath, ["node_modules/wrangler/bin/wrangler.js", "dev", "--local", "--config", "output/wrangler-measurement.json", "--config", "output/wrangler-egress-measurement.json", "--config", "output/wrangler-vault-measurement.json", "--persist-to", state, "--ip", "127.0.0.1", "--port", String(port), "--inspector-port", "0", "--show-interactive-dev-session=false"], { detached: true, stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, WRANGLER_SEND_METRICS: "false" } });
   child.stdout.on("data", data => { logs += data; });
   child.stderr.on("data", data => { logs += data; });
   await until(() => {
@@ -124,7 +130,7 @@ try {
   await complete("queued");
   if (initial.ok.session_id !== restored.ok.session_id || modelCalls !== 4) throw new Error("Wrangler recovery changed identity or duplicated requests");
   measurements.push({ id: "process-restart-and-drain", milliseconds: performance.now() - recovery });
-  const report = { runtime: "wrangler dev, two local Workers", measurements, modelCalls, session_identity_preserved: true, typescript_reload_preserved_wasm: true };
+  const report = { runtime: "wrangler dev, three local Workers", measurements, modelCalls, session_identity_preserved: true, typescript_reload_preserved_wasm: true };
   writeFileSync("output/wrangler-measurement-report.json", JSON.stringify(report, null, 2));
   console.log(JSON.stringify(report, null, 2));
 } finally {

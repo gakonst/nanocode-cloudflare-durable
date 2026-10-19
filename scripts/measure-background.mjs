@@ -289,7 +289,7 @@ async function eventSummary() {
 try {
   await mf.ready;
   const bindings = await mf.getBindings("nanocode-worker");
-  for (const key of ["ANTHROPIC_API_KEY", "OAUTH_JSON", "ACCOUNTS", "VAULT_KEY", "RUNNER_TOKEN"]) if (key in bindings) throw new Error("Provider secret boundary is violated");
+  for (const key of ["ANTHROPIC_API_KEY", "OAUTH_JSON", "ACCOUNTS", "VAULT_KEY", "RUNNER_TOKEN", "WORKER_TOKEN", "VAULT"]) if (key in bindings) throw new Error("Provider secret boundary is violated");
 
   phase = "1-spawn";
   await submit("bg-spawn", prompts.spawn);

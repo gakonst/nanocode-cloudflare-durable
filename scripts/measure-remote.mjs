@@ -199,7 +199,8 @@ await startRunner();
 const options = localOptions({
   persistence,
   agent: { RUNNER_ENABLED: "true", REMOTE_MAX_FRAME_BYTES: String(policy.max_frame_bytes), REMOTE_TIMEOUT_MS: String(policy.timeout_ms) },
-  egress: { RUNNER_URL: `ws://127.0.0.1:${port}`, RUNNER_TOKEN: token },
+  egress: { RUNNER_URL: `ws://127.0.0.1:${port}` },
+  vault: { RUNNER_TOKENS_JSON: JSON.stringify({ default: token }) },
 });
 options.workers[1].outboundService = outbound;
 let mf = new Miniflare(convertV4MiniflareOptions(options));
@@ -258,7 +259,9 @@ async function run(id, scenario, expected) {
 try {
   await mf.ready;
   const bindings = await mf.getBindings("nanocode-worker");
-  for (const key of ["RUNNER_TOKEN", "RUNNER_URL", "ANTHROPIC_API_KEY", "OAUTH_JSON"]) if (key in bindings) throw new Error("Runner or provider secret reached the public Worker");
+  for (const key of ["RUNNER_TOKEN", "RUNNER_URL", "ANTHROPIC_API_KEY", "OAUTH_JSON", "WORKER_TOKEN"]) if (key in bindings) throw new Error("Runner or provider secret reached the public Worker");
+  const egressBindings = await mf.getBindings("nanocode-egress");
+  for (const key of ["RUNNER_TOKEN", "RUNNER_TOKENS_JSON", "ANTHROPIC_API_KEY", "OAUTH_JSON", "CODEX_OAUTH_JSON", "VAULT_KEY"]) if (key in egressBindings) throw new Error("A stored credential reached private egress");
 
   const workspaceTurn = await run("workspace", "remote-workspace");
   const workspaceResults = observed["remote-workspace"];

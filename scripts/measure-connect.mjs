@@ -37,10 +37,11 @@ const provider = async request => {
   return new Response(events.map(([event, data]) => `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`).join(""), { headers: { "content-type": "text/event-stream" } });
 };
 const connections = {
-  demo: { base_url: "https://connector.invalid", methods: ["GET"], paths: ["/safe"], response_fields: ["answer"], max_body_bytes: 4096, max_response_bytes: 4096, credential: { type: "static", value: connectorCredential } },
-  vault: { kind: "vault", base_url: "https://vault.invalid", methods: ["GET"], paths: ["/safe"], max_body_bytes: 4096, max_response_bytes: 4096, credential: { type: "static", value: vaultCredential } },
+  demo: { base_url: "https://connector.invalid", methods: ["GET"], paths: ["/safe"], response_fields: ["answer"], max_body_bytes: 4096, max_response_bytes: 4096 },
+  vault: { kind: "vault", base_url: "https://vault.invalid", methods: ["GET"], paths: ["/safe"], max_body_bytes: 4096, max_response_bytes: 4096 },
 };
-const options = localOptions({ provider, egress: { CONNECTIONS_JSON: JSON.stringify(connections), VAULT_KEY: randomBytes(32).toString("base64url") } });
+const connectionCredentials = { demo: { type: "static", value: connectorCredential }, vault: { type: "static", value: vaultCredential } };
+const options = localOptions({ provider, egress: { CONNECTIONS_JSON: JSON.stringify(connections) }, vault: { CONNECTION_CREDENTIALS_JSON: JSON.stringify(connectionCredentials), VAULT_KEY: randomBytes(32).toString("base64url") } });
 const mf = new Miniflare(convertV4MiniflareOptions(options));
 const owner = { authorization: "Bearer local-measurement", "content-type": "application/json" };
 const request = (path, method = "GET", body, headers = owner) => mf.dispatchFetch(`https://worker${path}`, { method, headers, body: body === undefined ? undefined : JSON.stringify(body) });

@@ -14,7 +14,7 @@ export interface Env {
   AUTHORITY: PrivateBinding;
   SERVICE_EGRESS: PrivateBinding;
   REMOTE: PrivateBinding;
-  WORKER_TOKEN: string;
+  WORKER_TOKEN_SHA256: string;
   ACCOUNT_ID: string;
   MODEL_AUTH: string;
   RECOVERY_DELAY_MS: string;
@@ -51,13 +51,13 @@ const HAND_TAG = "hand";
 const WATCH_TAG = "watch";
 type Watch = { watch: string; cursor: number };
 
+const TOKEN_DIGEST = /^[0-9a-f]{64}$/;
+
 async function ownerAuthorized(request: Request, env: Env): Promise<boolean> {
-  if (!env.WORKER_TOKEN) return false;
-  const encoder = new TextEncoder();
-  const [actual, expected] = await Promise.all([
-    crypto.subtle.digest("SHA-256", encoder.encode(request.headers.get("authorization") ?? "")),
-    crypto.subtle.digest("SHA-256", encoder.encode(`Bearer ${env.WORKER_TOKEN}`)),
-  ]);
+  const header = request.headers.get("authorization") ?? "";
+  if (!TOKEN_DIGEST.test(env.WORKER_TOKEN_SHA256 ?? "") || !header.startsWith("Bearer ")) return false;
+  const actual = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(header.slice(7)));
+  const expected = Uint8Array.from(env.WORKER_TOKEN_SHA256.match(/../g)!, byte => parseInt(byte, 16));
   return crypto.subtle.timingSafeEqual(actual, expected);
 }
 
@@ -67,7 +67,7 @@ export default {
     const authorized = await ownerAuthorized(request, env);
     const connect = await handleConnect(request, env, authorized);
     if (connect) return connect;
-    if (!env.WORKER_TOKEN) return json({ error: "WORKER_TOKEN is not configured" }, 503);
+    if (!TOKEN_DIGEST.test(env.WORKER_TOKEN_SHA256 ?? "")) return json({ error: "WORKER_TOKEN_SHA256 is not configured" }, 503);
     if (!authorized) return json({ error: "unauthorized" }, 401);
     const url = new URL(request.url);
     if (url.pathname === "/health") return json({ ok: true, model: "claude-opus-5-5", models: { claude: "claude-opus-5-5", codex: "gpt-6.1-sol" }, auth: env.MODEL_AUTH, architecture: "session-local", credential_boundary: "private-egress" });

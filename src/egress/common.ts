@@ -1,11 +1,13 @@
 import { DEFAULT_EXECUTOR, EXECUTOR_ID, LEGACY_RUNNER, runnerConnection, type AuthorityResult, type ModelProvider, type PrivateBinding } from "../contracts";
+import type { CredentialBroker } from "../vault";
 import type { AccountAuthority } from "./account";
 
 export interface EgressEnv {
   ACCOUNTS: DurableObjectNamespace<AccountAuthority>;
+  VAULT: Service<CredentialBroker>;
   OAUTH_JSON?: string;
   CODEX_OAUTH_JSON?: string;
-  ANTHROPIC_API_KEY?: string;
+  VAULT_KEY?: string;
   ANTHROPIC_ENDPOINT?: string;
   ACCOUNT_ID?: string;
   CREDENTIAL_CACHE_TTL_MS: string;
@@ -17,31 +19,17 @@ export interface EgressEnv {
   MODEL_RESPONSE_HEADERS_TIMEOUT_MS: string;
   MODEL_STREAM_IDLE_TIMEOUT_MS: string;
   CONNECTIONS_JSON?: string;
-  VAULT_KEY?: string;
   SESSION_FENCES?: PrivateBinding;
   RUNNER_URL?: string;
-  RUNNER_TOKEN?: string;
   RUNNERS_JSON?: string;
   CODEX_TRANSPORT?: PrivateBinding;
   [binding: `RUNNER_VPC_${string}`]: unknown;
 }
 
-export const SUBSCRIPTION = {
-  token_url: "https://platform.claude.com/v1/oauth/token",
-  client_id: "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
-  scopes: ["org:create_api_key", "user:profile", "user:inference", "user:sessions:claude_code", "user:mcp_servers", "user:file_upload", "user:plugins"],
-  beta: "oauth-2025-04-20",
-};
-
-export const CODEX = {
-  endpoint: "https://chatgpt.com/backend-api/codex/responses",
-  token_url: "https://auth.openai.com/oauth/token",
-  client_id: "app_EMoamEEZ73f0CkXaXp7hrann",
-  claims: "https://api.openai.com/auth",
-};
+export const SUBSCRIPTION = { beta: "oauth-2025-04-20" };
+export const CODEX = { endpoint: "https://chatgpt.com/backend-api/codex/responses" };
 
 export const ACCOUNT_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
-export const SECRET_PATTERN = /^[A-Za-z0-9\-._~+/=]{1,16384}$/;
 export const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 
@@ -67,29 +55,13 @@ export function modelAccount(env: Pick<EgressEnv, "ACCOUNT_ID">): string {
   return account;
 }
 
-export function mode(env: EgressEnv): "subscription" | "api_key" | "unconfigured" {
-  return env.OAUTH_JSON ? "subscription" : env.ANTHROPIC_API_KEY ? "api_key" : "unconfigured";
-}
-
 export function modelProvider(value: unknown): ModelProvider {
   if (value === undefined || value === null || value === "claude") return "claude";
   if (value === "codex") return "codex";
   throw new Failure(400, "unsupported_provider");
 }
 
-export function jwtClaims(token: string): Record<string, any> | null {
-  const parts = token.split(".");
-  if (parts.length !== 3 || !parts[1] || !/^[A-Za-z0-9_-]+$/.test(parts[1])) return null;
-  try {
-    const claims = JSON.parse(decoder.decode(unbase64url(parts[1])));
-    return claims && typeof claims === "object" && !Array.isArray(claims) ? claims : null;
-  } catch {
-    return null;
-  }
-}
-
-export function modelEndpoint(env: EgressEnv): string {
-  const subscription = mode(env) === "subscription";
+export function modelEndpoint(env: EgressEnv, subscription: boolean): string {
   const value = env.ANTHROPIC_ENDPOINT ?? (subscription ? "https://api.anthropic.com/v1/messages?beta=true" : "https://api.anthropic.com/v1/messages");
   let url: URL;
   try { url = new URL(value); } catch { throw new Failure(500, "configuration_error"); }
@@ -138,10 +110,6 @@ export async function sha256hex(value: string): Promise<string> {
 
 export type Placement = { type: "bearer" } | { type: "header"; name: string; prefix: string } | { type: "basic" };
 
-export type ConnectionCredential =
-  | { type: "static"; value: string }
-  | { type: "oauth"; access: string; refresh: string; expires_at: number; token_url: string; client_id: string; client_secret?: string; scope?: string };
-
 export type Connection = {
   id: string;
   kind: "connector" | "vault";
@@ -155,7 +123,6 @@ export type Connection = {
   max_body_bytes: number;
   max_response_bytes: number;
   auth: Placement;
-  credential: ConnectionCredential;
 };
 
 export const FORBIDDEN_HEADERS = new Set(["authorization", "proxy-authorization", "cookie", "set-cookie", "host", "x-api-key", "content-length", "transfer-encoding", "connection", "keep-alive", "upgrade", "te", "trailer", "forwarded", "x-forwarded-for", "x-forwarded-host", "x-real-ip", "cf-connecting-ip", "accept-encoding"]);
@@ -183,7 +150,7 @@ export function connections(env: EgressEnv): Map<string, Connection> {
 
 function connection(env: EgressEnv, id: string, value: any): Connection {
   const fail = () => { throw new Failure(500, "configuration_error"); };
-  if (!IDENTIFIER.test(id) || !value || typeof value !== "object") fail();
+  if (!IDENTIFIER.test(id) || !value || typeof value !== "object" || "credential" in value) fail();
   const kind = value.kind ?? "connector";
   if (kind !== "connector" && kind !== "vault") fail();
   let base: URL;
@@ -219,7 +186,6 @@ function connection(env: EgressEnv, id: string, value: any): Connection {
     max_body_bytes: limit(value.max_body_bytes, 1 << 20),
     max_response_bytes: limit(value.max_response_bytes, 4 << 20),
     auth,
-    credential: credential(value.credential, auth, fail),
   };
 }
 
@@ -234,31 +200,17 @@ function placement(value: any, fail: () => never): Placement {
   return fail();
 }
 
-function credential(value: any, auth: Placement, fail: () => never): ConnectionCredential {
-  if (value?.type === "static" && typeof value.value === "string" && /^[\x21-\x7e]{1,16384}$/.test(value.value)) return { type: "static", value: value.value };
-  if (value?.type === "oauth" && auth.type !== "basic") {
-    let url: URL;
-    try { url = new URL(value.token_url); } catch { return fail(); }
-    if (url.protocol !== "https:" || url.username || url.password || url.hash) fail();
-    if (typeof value.access !== "string" || !SECRET_PATTERN.test(value.access) || typeof value.refresh !== "string" || !SECRET_PATTERN.test(value.refresh) || !Number.isSafeInteger(value.expires_at) || typeof value.client_id !== "string" || !value.client_id) fail();
-    if ((value.client_secret !== undefined && typeof value.client_secret !== "string") || (value.scope !== undefined && typeof value.scope !== "string")) fail();
-    return { type: "oauth", access: value.access, refresh: value.refresh, expires_at: value.expires_at, token_url: url.toString(), client_id: value.client_id, client_secret: value.client_secret, scope: value.scope };
-  }
-  return fail();
-}
-
 export function placeCredential(auth: Placement, secret: string): [string, string] {
   if (auth.type === "bearer") return ["authorization", `Bearer ${secret}`];
   if (auth.type === "basic") return ["authorization", `Basic ${btoa(secret)}`];
   return [auth.name, `${auth.prefix}${secret}`];
 }
 
-export type Executor = { id: string; url: string; token: string; binding?: string };
+export type Executor = { id: string; url: string; binding?: string };
 export type ExecutorTransport = { fetch(request: Request): Promise<Response> };
-type ExecutorEnv = Pick<EgressEnv, "RUNNERS_JSON" | "RUNNER_URL" | "RUNNER_TOKEN"> & { [binding: `RUNNER_VPC_${string}`]: unknown };
+type ExecutorEnv = Pick<EgressEnv, "RUNNERS_JSON" | "RUNNER_URL"> & { [binding: `RUNNER_VPC_${string}`]: unknown };
 
 const EXECUTOR_SCHEMES: Record<string, string> = { "wss:": "https:", "https:": "https:", "ws:": "http:", "http:": "http:" };
-const EXECUTOR_TOKEN = /^[\x21-\x7e]{1,4096}$/;
 const EXECUTOR_LIMIT = 64;
 const EXECUTOR_BINDING = /^RUNNER_VPC_[A-Z0-9_]+$/;
 
@@ -266,7 +218,7 @@ let executorSource: string | undefined;
 let parsedExecutors = new Map<string, Executor>();
 
 export function executors(env: ExecutorEnv): Map<string, Executor> {
-  const source = JSON.stringify([env.RUNNERS_JSON ?? null, env.RUNNER_URL ?? null, env.RUNNER_TOKEN ?? null]);
+  const source = JSON.stringify([env.RUNNERS_JSON ?? null, env.RUNNER_URL ?? null]);
   if (source === executorSource) return parsedExecutors;
   const fail = (): never => { throw new Failure(500, "configuration_error"); };
   const result = new Map<string, Executor>();
@@ -276,10 +228,10 @@ export function executors(env: ExecutorEnv): Map<string, Executor> {
     if (!Array.isArray(document) || document.length > EXECUTOR_LIMIT) fail();
     for (const entry of document as unknown[]) {
       if (!entry || typeof entry !== "object" || Array.isArray(entry)) fail();
-      const { id, url, token, binding, ...rest } = entry as Record<string, unknown>;
+      const { id, url, binding, ...rest } = entry as Record<string, unknown>;
       if (Object.keys(rest).length || typeof id !== "string" || !EXECUTOR_ID.test(id) || result.has(id)) fail();
       if (binding !== undefined && (typeof binding !== "string" || !EXECUTOR_BINDING.test(binding))) fail();
-      const value = executor(id as string, url, token, fail);
+      const value = executor(id as string, url, fail);
       if (binding !== undefined) {
         executorFetcher(env, binding as string);
         value.binding = binding as string;
@@ -287,23 +239,23 @@ export function executors(env: ExecutorEnv): Map<string, Executor> {
       result.set(id as string, value);
     }
   }
-  if (env.RUNNER_URL !== undefined || env.RUNNER_TOKEN !== undefined) {
+  if (env.RUNNER_URL !== undefined) {
     if (result.has(DEFAULT_EXECUTOR)) fail();
-    result.set(DEFAULT_EXECUTOR, executor(DEFAULT_EXECUTOR, env.RUNNER_URL, env.RUNNER_TOKEN, fail));
+    result.set(DEFAULT_EXECUTOR, executor(DEFAULT_EXECUTOR, env.RUNNER_URL, fail));
   }
   executorSource = source;
   parsedExecutors = result;
   return result;
 }
 
-function executor(id: string, value: unknown, token: unknown, fail: () => never): Executor {
-  if (typeof value !== "string" || value.length > 2048 || typeof token !== "string" || !EXECUTOR_TOKEN.test(token)) fail();
+function executor(id: string, value: unknown, fail: () => never): Executor {
+  if (typeof value !== "string" || value.length > 2048) fail();
   let url: URL;
   try { url = new URL(value as string); } catch { return fail(); }
   const scheme = EXECUTOR_SCHEMES[url.protocol];
   if (!scheme || url.username || url.password || url.search || url.hash || url.href !== `${url.protocol}//${url.host}${url.pathname}`) fail();
   if (scheme === "http:" && !loopback(url.hostname)) fail();
-  return { id, url: `${scheme}//${url.host}${url.pathname}`, token: token as string };
+  return { id, url: `${scheme}//${url.host}${url.pathname}` };
 }
 
 function executorFetcher(env: ExecutorEnv, name: string): ExecutorTransport {
@@ -337,53 +289,61 @@ export function executorSelected(selected: string[], id: string): boolean {
   return selected.includes(runnerConnection(id)) || (id === DEFAULT_EXECUTOR && selected.includes(LEGACY_RUNNER));
 }
 
-type VaultKey = { kid: string; key: CryptoKey };
-let vaultSource: string | undefined;
-let vaultKey: Promise<VaultKey> | undefined;
+export type Denied = { ok: false; status: number; error: string };
+export type CacheOutcome = "hit" | "miss" | "coalesced" | "refresh" | "refresh_coalesced";
+type Expiring = { ok: true; generation: number; expires_at: number | null };
 
-function keyFor(env: EgressEnv): Promise<VaultKey> | undefined {
-  if (!env.VAULT_KEY) return undefined;
-  if (env.VAULT_KEY.length < 32) throw new Failure(500, "configuration_error");
-  if (vaultSource !== env.VAULT_KEY || !vaultKey) {
-    const source = env.VAULT_KEY;
-    vaultSource = source;
-    vaultKey = (async () => {
-      const material = await crypto.subtle.importKey("raw", encoder.encode(source), "HKDF", false, ["deriveKey"]);
-      const key = await crypto.subtle.deriveKey({ name: "HKDF", hash: "SHA-256", salt: encoder.encode("nanocode-egress-vault"), info: encoder.encode("credential-envelope-v1") }, material, { name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]);
-      return { kid: (await sha256hex(`nanocode-vault-kid:${source}`)).slice(0, 16), key };
+export class AccessCache<T extends Expiring> {
+  private readonly entries = new Map<string, { access: T; until: number }>();
+  private readonly inflight = new Map<string, Promise<T | Denied>>();
+
+  constructor(private readonly limit: number) {}
+
+  get size(): number {
+    return this.entries.size;
+  }
+
+  get pending(): number {
+    return this.inflight.size;
+  }
+
+  async get(key: string, rejected: number | undefined, policy: { ttl: number; margin: number; horizon?: number }, load: () => Promise<T | Denied>, observe?: (outcome: CacheOutcome) => void): Promise<T | Denied> {
+    const entry = this.entries.get(key);
+    if (rejected === undefined && entry && entry.until > Date.now()) {
+      observe?.("hit");
+      return entry.access;
+    }
+    if (entry && (rejected === undefined || entry.access.generation === rejected)) this.entries.delete(key);
+    const flight = rejected === undefined ? key : `${key}\u0001${rejected}`;
+    const existing = this.inflight.get(flight);
+    if (existing) {
+      observe?.(rejected === undefined ? "coalesced" : "refresh_coalesced");
+      return existing;
+    }
+    observe?.(rejected === undefined ? "miss" : "refresh");
+    const pending = (async () => {
+      const access = await load();
+      if (access.ok) {
+        const now = Date.now();
+        const until = Math.min(now + policy.ttl, access.expires_at === null ? Number.MAX_SAFE_INTEGER : access.expires_at - policy.margin, policy.horizon ?? Number.MAX_SAFE_INTEGER);
+        if (until > now) {
+          this.entries.delete(key);
+          this.entries.set(key, { access, until });
+          while (this.entries.size > this.limit) this.entries.delete(this.entries.keys().next().value!);
+        }
+      }
+      return access;
     })();
+    this.inflight.set(flight, pending);
+    try {
+      return await pending;
+    } finally {
+      this.inflight.delete(flight);
+    }
   }
-  return vaultKey;
-}
 
-export function vaultConfigured(env: EgressEnv): boolean {
-  return !!env.VAULT_KEY;
-}
-
-export async function seal(env: EgressEnv, aad: string, value: unknown, required: boolean): Promise<string> {
-  const pending = keyFor(env);
-  if (!pending) {
-    if (required) throw new Failure(503, "vault_key_required");
-    return `p1.${JSON.stringify(value)}`;
-  }
-  const { kid, key } = await pending;
-  const iv = crypto.getRandomValues(new Uint8Array(12));
-  const sealed = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv, additionalData: encoder.encode(aad) }, key, encoder.encode(JSON.stringify(value))));
-  return `v1.${kid}.${base64url(iv)}.${base64url(sealed)}`;
-}
-
-export async function open<T>(env: EgressEnv, aad: string, envelope: string): Promise<{ value: T; plaintext: boolean }> {
-  if (envelope.startsWith("p1.")) return { value: JSON.parse(envelope.slice(3)) as T, plaintext: true };
-  const [version, kid, iv, sealed] = envelope.split(".");
-  const pending = keyFor(env);
-  if (version !== "v1" || !pending) throw new Failure(503, "vault_key_required");
-  const key = await pending;
-  if (key.kid !== kid) throw new Failure(503, "vault_key_mismatch");
-  try {
-    const plain = await crypto.subtle.decrypt({ name: "AES-GCM", iv: unbase64url(iv), additionalData: encoder.encode(aad) }, key.key, unbase64url(sealed));
-    return { value: JSON.parse(decoder.decode(plain)) as T, plaintext: false };
-  } catch {
-    throw new Failure(503, "vault_key_mismatch");
+  evict(key: string, generation: number): void {
+    if (this.entries.get(key)?.access.generation === generation) this.entries.delete(key);
   }
 }
 

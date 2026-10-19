@@ -95,7 +95,9 @@ const metrics = async () => (await request(`http://worker/sessions/${name}/metri
 try {
   await mf.ready;
   const bindings = await mf.getBindings("nanocode-worker");
-  for (const key of ["ANTHROPIC_API_KEY", "OAUTH_JSON", "ACCOUNTS", "VAULT_KEY", "RUNNER_TOKEN"]) if (key in bindings) throw new Error("Provider secret boundary is violated");
+  for (const key of ["ANTHROPIC_API_KEY", "OAUTH_JSON", "ACCOUNTS", "VAULT_KEY", "RUNNER_TOKEN", "WORKER_TOKEN", "VAULT"]) if (key in bindings) throw new Error("Provider secret boundary is violated");
+  const egressBindings = await mf.getBindings("nanocode-egress");
+  for (const key of ["ANTHROPIC_API_KEY", "OAUTH_JSON", "CODEX_OAUTH_JSON", "VAULT_KEY", "RUNNER_TOKENS_JSON", "CONNECTION_CREDENTIALS_JSON"]) if (key in egressBindings) throw new Error("A stored credential reached private egress");
   await turn("cold");
   await turn("warm");
   const warm = await metrics();

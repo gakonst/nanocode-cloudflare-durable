@@ -5,9 +5,9 @@
   "scripts": {
     "build": "node scripts/build.mjs",
     "check": "tsc --noEmit",
-    "dev": "wrangler dev -c wrangler.jsonc -c wrangler.egress.jsonc",
+    "dev": "wrangler dev -c wrangler.jsonc -c wrangler.egress.jsonc -c wrangler.vault.jsonc",
     "deploy": "node scripts/deploy.mjs",
-    "dry-run": "wrangler deploy -c wrangler.egress.jsonc --dry-run --outdir output/egress && wrangler deploy -c wrangler.jsonc --dry-run --outdir output/deploy",
+    "dry-run": "wrangler deploy -c wrangler.vault.jsonc --dry-run --outdir output/vault && wrangler deploy -c wrangler.egress.jsonc --dry-run --outdir output/egress && wrangler deploy -c wrangler.jsonc --dry-run --outdir output/deploy",
     "measure": "node scripts/measure-local.mjs",
     "measure:deployed": "node scripts/measure-deployed.mjs"
   },

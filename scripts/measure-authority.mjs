@@ -18,7 +18,7 @@ const transport = process.argv.includes("--transport");
 let mf;
 const assertions = [];
 const check = (value, message) => { if (!value) throw new Error(message); assertions.push(message); };
-const storage = () => mf.unsafeGetDurableObjectStorage("nanocode-egress", "AccountAuthority", { name: "default" });
+const storage = () => mf.unsafeGetDurableObjectStorage("nanocode-vault", "CredentialVault", { name: "default" });
 const provider = async request => {
   if (new URL(request.url).hostname === "platform.claude.com") {
     refreshes++;
@@ -38,7 +38,7 @@ const provider = async request => {
   if (delayValid) { delayValid = false; await new Promise(resolve => setTimeout(resolve, 800)); }
   return new Response("ok", { headers: { "content-type": "text/plain" } });
 };
-const options = localOptions({ provider, agent: { MODEL_AUTH: "subscription" }, egress: { OAUTH_JSON: JSON.stringify(seed), VAULT_KEY: secret(), ...(transport ? { MODEL_RESPONSE_HEADERS_TIMEOUT_MS: "200" } : {}) } });
+const options = localOptions({ provider, agent: { MODEL_AUTH: "subscription" }, egress: transport ? { MODEL_RESPONSE_HEADERS_TIMEOUT_MS: "200" } : {}, vault: { OAUTH_JSON: JSON.stringify(seed), VAULT_KEY: secret() } });
 const dispatch = async () => {
   const bindings = await mf.getBindings("nanocode-worker");
   return bindings.EGRESS.fetch(new Request("https://egress.internal/model", { method: "POST", headers: { "content-type": "application/octet-stream", "x-nanocode-model": JSON.stringify({ authority: { account_id: "default", session_id: "authority-measurement" }, subscription: true, headers: [] }) }, body: "{}" }));
@@ -62,10 +62,10 @@ try {
   check(encrypted[0].state === "ready" && encrypted[0].generation === 2 && encrypted[0].format === "v1.", "Rotated credentials are encrypted and committed before release");
   const bindings = await mf.getBindings("nanocode-worker");
   const metrics = await (await bindings.EGRESS.fetch(new Request("https://egress.internal/metrics"))).json();
-  const before = metrics.metrics.model_authority_rpcs;
+  const before = metrics.metrics.model_authority_rpcs + metrics.metrics.vault_rpcs;
   await (await dispatch()).text();
   const warm = await (await bindings.EGRESS.fetch(new Request("https://egress.internal/metrics"))).json();
-  check(warm.metrics.model_authority_rpcs === before, "Warm model dispatch makes zero account authority RPCs");
+  check(warm.metrics.model_authority_rpcs + warm.metrics.vault_rpcs === before, "Warm model dispatch makes zero authority or vault RPCs");
   await mf.dispose();
   await launch();
   check((await dispatch()).status === 200 && refreshes === 1, "Cold egress restoration reuses the committed rotated credential");
@@ -78,7 +78,7 @@ try {
   for (const response of forced) await response.text();
   const refreshesBeforeInterruption = refreshes;
   await mf.dispose();
-  options.workers[1].bindings.OAUTH_JSON = JSON.stringify({ ...seed, access: secret(), refresh: currentRefresh, expires: Date.now() - 1 });
+  options.workers[2].bindings.OAUTH_JSON = JSON.stringify({ ...seed, access: secret(), refresh: currentRefresh, expires: Date.now() - 1 });
   hangRefresh = true;
   await launch();
   const uncertain = dispatch().catch(() => undefined);
@@ -94,7 +94,7 @@ try {
   check(blocked.status === 401 && refreshes === refreshesBeforeInterruption + 1, "Uncertain refresh is not repeated after runtime replacement");
   await blocked.text();
   await mf.dispose();
-  options.workers[1].bindings.OAUTH_JSON = JSON.stringify({ ...seed, access: secret(), refresh: currentRefresh, expires: Date.now() - 1 });
+  options.workers[2].bindings.OAUTH_JSON = JSON.stringify({ ...seed, access: secret(), refresh: currentRefresh, expires: Date.now() - 1 });
   await launch();
   check((await dispatch()).status === 200 && refreshes === refreshesBeforeInterruption + 2, "Fresh credential import resets the blocked refresh state");
   const report = { runtime: "local workerd", assertions, refreshes, providerCalls, credential_values_reported: false };
