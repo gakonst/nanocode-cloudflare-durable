@@ -1,6 +1,6 @@
 import { WorkerEntrypoint } from "cloudflare:workers";
 import { json, sessionUuid, type AuthorityCommand, type AuthorityResult, type ModelDispatch, type ModelProvider, type SessionAuthority, type SocketDispatch } from "../contracts";
-import type { ImportResult, ModelAccess, SecretAccess } from "../vault";
+import type { ModelAccess, SecretAccess } from "../vault";
 import { AccountAuthority, type Authorized, type ServiceAccess, type ServiceRequest } from "./account";
 import { modelFetch, socketFetch } from "./model-transport";
 import { AccessCache, ACCOUNT_PATTERN, CODEX, connections, encoder, Failure, FORBIDDEN_HEADERS, modelAccount, modelEndpoint, modelProvider, placeCredential, readLimited, setting, SUBSCRIPTION, type CacheOutcome, type Connection, type EgressEnv } from "./common";
@@ -39,7 +39,8 @@ type DiagnosticMime = "json" | "html" | "event_stream" | "other" | "missing";
 type CredentialOutcome = "none" | CacheOutcome;
 type TransportKind = "direct" | "fixed_binding";
 type AttemptPhase = "authority" | "transport" | "discard" | "projection";
-type AttemptDiagnostic = { attempt: 1 | 2; status: number; origin: DiagnosticOrigin; credential: CredentialOutcome; transport: TransportKind; auth_lookup_ms: number; fetch_header_ms: number; discard_ms: number; error_projection_ms: number; mime: DiagnosticMime; mitigated: boolean; auth_error: boolean; request_id: boolean; error: string };
+type AttemptDiagnostic = { attempt: 1 | 2; status: number; origin: DiagnosticOrigin; credential: CredentialOutcome; transport: TransportKind; auth_lookup_ms: number; fetch_header_ms: number; discard_ms: number; error_projection_ms: number; mime: DiagnosticMime; mitigated: boolean; auth_error: boolean; request_id: boolean; error: string; body_bytes: number; sent_bytes: number; gzip: boolean; gzip_rejected: boolean };
+type Encoded = { gzip?: Promise<ArrayBuffer>; sent_bytes: number; gzip_sent: boolean; gzip_rejected: boolean };
 type ModelDiagnostic = { provider: "claude" | "codex"; websocket: boolean; attempt: 1 | 2; status: number; origin: DiagnosticOrigin; auth_lookup_ms: number; fetch_header_ms: number; error_projection_ms: number; mime: DiagnosticMime; mitigated: boolean; auth_error: boolean; request_id: boolean; credential: CredentialOutcome; transport: TransportKind; request_ms: number; total_ms: number; retried: boolean; rotated: boolean; error: string; attempts: AttemptDiagnostic[] };
 
 const metrics = {
@@ -50,7 +51,6 @@ const metrics = {
   model_coalesced: 0,
   model_authority_rpcs: 0,
   vault_rpcs: 0,
-  vault_migrations: 0,
   model_unauthorized: 0,
   model_recoveries: 0,
   model_provider_errors: 0,
@@ -77,7 +77,7 @@ function snapshot() {
 }
 
 function attemptDiagnostic(attempt: 1 | 2, origin: DiagnosticOrigin, transport: TransportKind): AttemptDiagnostic {
-  return { attempt, status: 0, origin, credential: "none", transport, auth_lookup_ms: 0, fetch_header_ms: 0, discard_ms: 0, error_projection_ms: 0, mime: "missing", mitigated: false, auth_error: false, request_id: false, error: "none" };
+  return { attempt, status: 0, origin, credential: "none", transport, auth_lookup_ms: 0, fetch_header_ms: 0, discard_ms: 0, error_projection_ms: 0, mime: "missing", mitigated: false, auth_error: false, request_id: false, error: "none", body_bytes: 0, sent_bytes: 0, gzip: false, gzip_rejected: false };
 }
 
 function elapsed(start: number, end: number = clock()): number {
@@ -111,7 +111,11 @@ function classify(trace: AttemptDiagnostic, response: Response): void {
 }
 
 function attemptValue(trace: AttemptDiagnostic): AttemptDiagnostic {
-  return { attempt: trace.attempt === 2 ? 2 : 1, status: statusOf(trace.status), origin: trace.origin, credential: CREDENTIAL_OUTCOMES.has(trace.credential) ? trace.credential : "none", transport: trace.transport === "fixed_binding" ? "fixed_binding" : "direct", auth_lookup_ms: milliseconds(trace.auth_lookup_ms), fetch_header_ms: milliseconds(trace.fetch_header_ms), discard_ms: milliseconds(trace.discard_ms), error_projection_ms: milliseconds(trace.error_projection_ms), mime: trace.mime, mitigated: trace.mitigated === true, auth_error: trace.auth_error === true, request_id: trace.request_id === true, error: errorOf(trace.error) };
+  return { attempt: trace.attempt === 2 ? 2 : 1, status: statusOf(trace.status), origin: trace.origin, credential: CREDENTIAL_OUTCOMES.has(trace.credential) ? trace.credential : "none", transport: trace.transport === "fixed_binding" ? "fixed_binding" : "direct", auth_lookup_ms: milliseconds(trace.auth_lookup_ms), fetch_header_ms: milliseconds(trace.fetch_header_ms), discard_ms: milliseconds(trace.discard_ms), error_projection_ms: milliseconds(trace.error_projection_ms), mime: trace.mime, mitigated: trace.mitigated === true, auth_error: trace.auth_error === true, request_id: trace.request_id === true, error: errorOf(trace.error), body_bytes: bytesOf(trace.body_bytes), sent_bytes: bytesOf(trace.sent_bytes), gzip: trace.gzip === true, gzip_rejected: trace.gzip_rejected === true };
+}
+
+function bytesOf(value: unknown): number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : 0;
 }
 
 function diagnosticValue(provider: ModelProvider, attempts: AttemptDiagnostic[], request_ms: number, total_ms: number, rotated: boolean, websocket = false): ModelDiagnostic {
@@ -201,12 +205,6 @@ function resolveModel(env: EgressEnv, authority: SessionAuthority, provider: Mod
 
 async function vaultModel(env: EgressEnv, account_id: string, provider: ModelProvider, rejected?: number): Promise<ModelAccess> {
   metrics.vault_rpcs++;
-  const access = await env.VAULT.model({ account_id, provider, rejected_generation: rejected }) as ModelAccess;
-  if (access.ok || access.error !== "credential_missing") return access;
-  metrics.vault_migrations++;
-  const migrated = await account(env, account_id).migrate({ account_id }) as ImportResult;
-  if (!migrated.ok) return migrated;
-  metrics.vault_rpcs++;
   return await env.VAULT.model({ account_id, provider, rejected_generation: rejected }) as ModelAccess;
 }
 
@@ -288,10 +286,12 @@ function invalidJson(body: string): boolean {
   return value?.reason === "bad_json" && typeof value.error === "string" && badJson(value.error);
 }
 
-function sendModel(env: EgressEnv, provider: ModelProvider, endpoint: string, headers: Headers, access: Granted, body: ArrayBuffer, signal: AbortSignal, encoded: { gzip?: Promise<ArrayBuffer> }): Promise<Response> {
+function sendModel(env: EgressEnv, provider: ModelProvider, endpoint: string, headers: Headers, access: Granted, body: ArrayBuffer, signal: AbortSignal, encoded: Encoded): Promise<Response> {
   const outgoing = new Headers(headers);
   for (const [name, value] of access.headers) outgoing.set(name, value);
   const send = (payload: ArrayBuffer, gzip: boolean) => {
+    encoded.sent_bytes = payload.byteLength;
+    encoded.gzip_sent = gzip;
     const request = new Request(endpoint, { method: "POST", headers: outgoing, body: payload, redirect: "manual", signal });
     if (gzip) request.headers.set("content-encoding", "gzip");
     return modelFetch(request, outgoing => provider === "codex" && env.CODEX_TRANSPORT ? env.CODEX_TRANSPORT.fetch(outgoing) : fetch(outgoing), setting(env, "MODEL_RESPONSE_HEADERS_TIMEOUT_MS"), setting(env, "MODEL_STREAM_IDLE_TIMEOUT_MS"), () => { metrics.model_timeouts++; });
@@ -309,6 +309,7 @@ function sendModel(env: EgressEnv, provider: ModelProvider, endpoint: string, he
     const anthropic = (response.headers.get("request-id") ?? "").startsWith("req_") || response.headers.has("cf-ray");
     if (anthropic && (response.status !== 400 || !invalidJson(text ?? ""))) return new Response(text, { status: response.status, statusText: response.statusText, headers: response.headers });
     gzipRejected = true;
+    encoded.gzip_rejected = true;
     metrics.model_gzip_rejections++;
     return send(body, false);
   })();
@@ -565,9 +566,11 @@ export class SessionEgress extends WorkerEntrypoint<EgressEnv> {
       }
       one.origin = "transport";
       begin("transport");
-      const encoded: { gzip?: Promise<ArrayBuffer> } = {};
+      const encoded: Encoded = { sent_bytes: 0, gzip_sent: false, gzip_rejected: false };
+      const sent = (trace: AttemptDiagnostic) => { trace.body_bytes = body.byteLength; trace.sent_bytes = encoded.sent_bytes; trace.gzip = encoded.gzip_sent; trace.gzip_rejected = encoded.gzip_rejected; };
       let response = await sendModel(this.env, provider, endpoint, headers, first, body, request.signal, encoded);
       end();
+      sent(one);
       classify(one, response);
       if (response.status === 401) {
         metrics.model_unauthorized++;
@@ -595,6 +598,7 @@ export class SessionEgress extends WorkerEntrypoint<EgressEnv> {
         begin("transport");
         response = await sendModel(this.env, provider, endpoint, headers, next, body, request.signal, encoded);
         end();
+        sent(two);
         classify(two, response);
         if (response.status === 401) models.evict(cacheKey(authority, provider), next.generation);
       }

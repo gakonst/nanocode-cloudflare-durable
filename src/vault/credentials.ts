@@ -170,7 +170,6 @@ export async function seal(source: string | undefined, aad: string, value: unkno
 }
 
 export async function open<T>(source: string | undefined, aad: string, envelope: string): Promise<T> {
-  if (envelope.startsWith("p1.")) return JSON.parse(envelope.slice(3)) as T;
   const [version, kid, iv, sealed] = envelope.split(".");
   if (version !== "v1") throw new Failure(503, "vault_key_required");
   const key = await keyFor(source);

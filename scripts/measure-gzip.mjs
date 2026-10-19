@@ -103,12 +103,15 @@ try {
   const turnRequests = received.slice(turnBefore);
   check(result.status === "completed" && JSON.stringify(result.ok?.message).includes("gzip-ok") && turnRequests.length > 0 && turnRequests.every(entry => entry.encoding === "gzip" && JSON.parse(entry.text).stream === true), "A WASM agent turn sends gzipped Messages bodies through egress and completes");
   const turnMetrics = await metrics();
+  const session = await (await mf.dispatchFetch(sessions.replace(/\/turns$/, "/metrics"), { headers })).json();
+  const attempt = session.model_diagnostics.at(-1)?.attempts?.[0];
+  check(attempt?.gzip === true && attempt.sent_bytes > 0 && attempt.sent_bytes < attempt.body_bytes, "Session model diagnostics record the gzipped and identity sizes");
 
   const report = {
     runtime: "local workerd (Miniflare): WASM SDK session, private egress and vault, mock Anthropic Messages endpoint at api.anthropic.com",
     assertions,
     large_body: { identity_bytes: large.length, gzip_bytes: received.find(entry => entry.encoding === "gzip")?.bytes },
-    turn: { requests: turnRequests.length, identity_bytes: turnRequests.map(entry => entry.text.length), gzip_bytes: turnRequests.map(entry => entry.bytes) },
+    turn: { requests: turnRequests.length, identity_bytes: turnRequests.map(entry => entry.text.length), gzip_bytes: turnRequests.map(entry => entry.bytes), diagnostic: { body_bytes: attempt.body_bytes, sent_bytes: attempt.sent_bytes, gzip: attempt.gzip } },
     metrics: { first_isolate: { requests: afterJson.model_gzip_requests, rejections: afterJson.model_gzip_rejections }, turn_isolate: { requests: turnMetrics.model_gzip_requests, input_bytes: turnMetrics.model_gzip_input_bytes, output_bytes: turnMetrics.model_gzip_output_bytes } },
   };
   writeFileSync("output/gzip-measurement.json", JSON.stringify(report, null, 2));

@@ -1,7 +1,6 @@
 import { DurableObject } from "cloudflare:workers";
 import { DEFAULT_EXECUTOR, LEGACY_RUNNER, runnerConnection, sessionUuid, type AuthorityCommand, type AuthorityResult, type ModelProvider, type SessionAuthority, type SessionDescriptor } from "../contracts";
-import { open, type StoredToken } from "../vault/credentials";
-import type { ImportEntry, ImportResult, VaultStatus } from "../vault";
+import type { VaultStatus } from "../vault";
 import { ACCOUNT_PATTERN, base64url, connections, exactOrigin, executorConnection, executorId, executors, executorSelected, Failure, modelAccount, random, setting, sha256, sha256hex, type Denied, type EgressEnv } from "./common";
 
 export type Authorized = { ok: true } | Denied;
@@ -14,7 +13,6 @@ type Client = { client_id: string; app_id: string; origins: string; redirect_uri
 type Code = { digest: string; client_id: string; origin: string; redirect_uri: string; principal: string; scopes: string; connections: string; challenge: string; expires_at: number; grant_id: string | null };
 type Thread = { thread_id: string; app_id: string; origin: string; principal: string; session_name: string; session_id: string; created_at: number };
 type Fence = { grant_id: string; session_name: string; revision: number; attempts: number; next_at: number };
-type CredentialRow = { name: string; seed: string; envelope: string; generation: number; state: string; forced: number; expires_at: number | null; updated_at: number };
 type Pending = { access: string; refresh: string; access_digest: string; refresh_digest: string };
 
 const SCHEMA = `
@@ -28,7 +26,7 @@ CREATE TABLE IF NOT EXISTS codes (digest TEXT PRIMARY KEY, client_id TEXT NOT NU
 CREATE TABLE IF NOT EXISTS threads (thread_id TEXT PRIMARY KEY, app_id TEXT NOT NULL, origin TEXT NOT NULL, principal TEXT NOT NULL, session_name TEXT NOT NULL UNIQUE, session_id TEXT NOT NULL, created_at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS grant_sessions (grant_id TEXT NOT NULL, session_name TEXT NOT NULL, session_id TEXT NOT NULL, PRIMARY KEY (grant_id, session_name));
 CREATE TABLE IF NOT EXISTS fences (grant_id TEXT NOT NULL, session_name TEXT NOT NULL, revision INTEGER NOT NULL, attempts INTEGER NOT NULL, next_at INTEGER NOT NULL, PRIMARY KEY (grant_id, session_name));
-CREATE TABLE IF NOT EXISTS credentials (name TEXT PRIMARY KEY, seed TEXT NOT NULL, envelope TEXT NOT NULL, generation INTEGER NOT NULL, state TEXT NOT NULL, forced INTEGER NOT NULL, expires_at INTEGER, updated_at INTEGER NOT NULL);
+DROP TABLE IF EXISTS credentials;
 `;
 
 const APP_ID = /^[A-Za-z0-9_.:-]{1,128}$/;
@@ -40,7 +38,6 @@ const CHALLENGE = /^[A-Za-z0-9_-]{43}$/;
 const VERIFIER = /^[A-Za-z0-9._~-]{43,128}$/;
 const TOKEN = /^(nc1|nr1|na1)\.([A-Za-z0-9_-]{1,64})\.([A-Za-z0-9_-]{43})$/;
 const FENCE_BACKOFF_CAP = 3_600_000;
-const CODEX_CREDENTIAL = "model:codex";
 
 function failure(error: unknown): { ok: false; status: number; error: string } {
   if (error instanceof Failure) return { ok: false, status: error.status, error: error.code };
@@ -102,7 +99,6 @@ function safeGrant(grant: Grant) {
 
 export class AccountAuthority extends DurableObject<EgressEnv> {
   private account?: string;
-  private migration?: Promise<ImportResult>;
   private claude?: { subscription: boolean; until: number };
   private counters = { fence_deliveries: 0, fence_failures: 0 };
 
@@ -607,33 +603,5 @@ export class AccountAuthority extends DurableObject<EgressEnv> {
       for (const id of available.keys()) result.push({ connection_id: runnerConnection(id), kind: "executor", executor_id: id, methods, credential: "private" });
     }
     return { ok: true, connections: result };
-  }
-
-  async migrate(input: { account_id: string }): Promise<ImportResult> {
-    try {
-      const account = this.bind(input?.account_id);
-      if (account !== modelAccount(this.env)) throw new Failure(403, "forbidden");
-      this.migration ??= this.export(account).finally(() => { this.migration = undefined; });
-      return await this.migration;
-    } catch (error) {
-      return failure(error);
-    }
-  }
-
-  private async export(account: string): Promise<ImportResult> {
-    const entries: ImportEntry[] = [];
-    const seeds = new Map<string, string | undefined>([["model", this.env.OAUTH_JSON], [CODEX_CREDENTIAL, this.env.CODEX_OAUTH_JSON]]);
-    for (const row of this.rows<CredentialRow>("SELECT * FROM credentials")) {
-      const source = seeds.get(row.name);
-      if (source !== undefined && row.seed !== await sha256hex(`${row.name}:${source}`)) continue;
-      const token = await open<StoredToken>(this.env.VAULT_KEY, `${account}|${row.name}`, row.envelope);
-      entries.push({ name: row.name, seed: row.seed, token, generation: row.generation, state: row.state, forced: row.forced, expires_at: row.expires_at });
-    }
-    for (const [name, source] of seeds) {
-      if (source === undefined || entries.some(entry => entry.name === name)) continue;
-      const existing = this.row<{ generation: number }>("SELECT generation FROM credentials WHERE name = ?", name);
-      entries.push({ name, seed: await sha256hex(`${name}:${source}`), source, generation: (existing?.generation ?? 0) + 1, state: "ready", forced: 0, expires_at: null });
-    }
-    return await this.env.VAULT.import({ account_id: account, entries }) as ImportResult;
   }
 }

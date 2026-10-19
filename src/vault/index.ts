@@ -21,8 +21,6 @@ export type SecretAccess = { ok: true; generation: number; expires_at: number | 
 export type RunnerAccess = { ok: true; token: string } | Denied;
 export type CredentialState = { state: string; generation: number; expires_at: number | null };
 export type VaultStatus = { ok: true; encryption: boolean; claude: "subscription" | "api_key" | "unconfigured"; model: CredentialState | null; codex: CredentialState | null; connections: Record<string, string | null>; runners: string[]; counters: Record<string, number> } | Denied;
-export type ImportEntry = { name: string; seed: string; token?: StoredToken; source?: string; generation: number; state: string; forced: number; expires_at: number | null };
-export type ImportResult = { ok: true; imported: string[]; retained: string[] } | Denied;
 
 type CredentialRow = { name: string; seed: string; envelope: string; generation: number; state: string; forced: number; expires_at: number | null; updated_at: number };
 type Granted = Extract<ModelAccess, { ok: true }>;
@@ -30,9 +28,7 @@ type Granted = Extract<ModelAccess, { ok: true }>;
 const SCHEMA = "CREATE TABLE IF NOT EXISTS credentials (name TEXT PRIMARY KEY, seed TEXT NOT NULL, envelope TEXT NOT NULL, generation INTEGER NOT NULL, state TEXT NOT NULL, forced INTEGER NOT NULL, expires_at INTEGER, updated_at INTEGER NOT NULL)";
 const CODEX_CREDENTIAL = "model:codex";
 const CONNECTION_ID = /^[A-Za-z0-9_-]{1,64}$/;
-const CREDENTIAL_NAME = /^(model|model:codex|connection:[A-Za-z0-9_-]{1,64})$/;
 const RUNNER_TOKEN = /^[\x21-\x7e]{1,4096}$/;
-const STATES = new Set(["ready", "exchanging", "login_required", "on_hold", "account_mismatch"]);
 
 function denied(error: unknown): Denied {
   if (error instanceof Failure) return { ok: false, status: error.status, error: error.code };
@@ -89,7 +85,7 @@ function runnerTokens(env: VaultEnv): Map<string, string> {
 
 export class CredentialVault extends DurableObject<VaultEnv> {
   private gates = new Map<string, Promise<unknown>>();
-  private counters = { refreshes: 0, refresh_failures: 0, imports: 0 };
+  private counters = { refreshes: 0, refresh_failures: 0 };
 
   constructor(ctx: DurableObjectState, env: VaultEnv) {
     super(ctx, env);
@@ -139,35 +135,6 @@ export class CredentialVault extends DurableObject<VaultEnv> {
         runners: [...runnerTokens(this.env).keys()],
         counters: { ...this.counters },
       };
-    } catch (error) {
-      return denied(error);
-    }
-  }
-
-  async import(entries: ImportEntry[]): Promise<ImportResult> {
-    try {
-      if (!Array.isArray(entries)) throw new Failure(400, "invalid_request");
-      const prepared: CredentialRow[] = [];
-      for (const entry of entries) {
-        if (!entry || typeof entry.name !== "string" || !CREDENTIAL_NAME.test(entry.name) || typeof entry.seed !== "string" || !/^[0-9a-f]{64}$/.test(entry.seed) || !Number.isSafeInteger(entry.generation) || entry.generation < 1 || !STATES.has(entry.state) || (entry.forced !== 0 && entry.forced !== 1) || (entry.expires_at !== null && !Number.isSafeInteger(entry.expires_at))) throw new Failure(400, "invalid_request");
-        const token = entry.source !== undefined ? entry.name === "model" ? subscriptionSeed(entry.source) : entry.name === CODEX_CREDENTIAL ? codexSeed(entry.source) : undefined : entry.token;
-        if (!token || typeof token.access !== "string" || !SECRET_PATTERN.test(token.access) || typeof token.refresh !== "string" || !SECRET_PATTERN.test(token.refresh)) throw new Failure(400, "invalid_request");
-        if (entry.name === CODEX_CREDENTIAL && (typeof token.account_id !== "string" || !CODEX_ACCOUNT.test(token.account_id))) throw new Failure(400, "invalid_request");
-        const seeded = entry.source !== undefined;
-        prepared.push({ name: entry.name, seed: entry.seed, envelope: await seal(this.env.VAULT_KEY, this.aad(entry.name), token), generation: entry.generation, state: seeded ? "ready" : entry.state, forced: seeded ? 0 : entry.forced, expires_at: token.expires_at, updated_at: Date.now() });
-      }
-      const imported: string[] = [];
-      const retained: string[] = [];
-      this.ctx.storage.transactionSync(() => {
-        for (const row of prepared) {
-          if (this.row(row.name)) { retained.push(row.name); continue; }
-          this.run("INSERT INTO credentials VALUES (?, ?, ?, ?, ?, ?, ?, ?)", row.name, row.seed, row.envelope, row.generation, row.state, row.forced, row.expires_at, row.updated_at);
-          imported.push(row.name);
-        }
-      });
-      await this.ctx.storage.sync();
-      this.counters.imports += imported.length;
-      return { ok: true, imported, retained };
     } catch (error) {
       return denied(error);
     }
@@ -409,15 +376,6 @@ export class CredentialBroker extends WorkerEntrypoint<VaultEnv> {
     try {
       this.owner(input?.account_id);
       return await this.vault().status() as VaultStatus;
-    } catch (error) {
-      return denied(error);
-    }
-  }
-
-  async import(input: { account_id: string; entries: ImportEntry[] }): Promise<ImportResult> {
-    try {
-      this.owner(input?.account_id);
-      return await this.vault().import(input.entries) as ImportResult;
     } catch (error) {
       return denied(error);
     }

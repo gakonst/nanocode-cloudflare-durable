@@ -5,9 +5,6 @@ import type { AccountAuthority } from "./account";
 export interface EgressEnv {
   ACCOUNTS: DurableObjectNamespace<AccountAuthority>;
   VAULT: Service<CredentialBroker>;
-  OAUTH_JSON?: string;
-  CODEX_OAUTH_JSON?: string;
-  VAULT_KEY?: string;
   ANTHROPIC_ENDPOINT?: string;
   ACCOUNT_ID?: string;
   CREDENTIAL_CACHE_TTL_MS: string;
