@@ -1,4 +1,3 @@
-import { connect } from "node:http2";
 import { readFileSync } from "node:fs";
 import { createInterface } from "node:readline";
 import { performance } from "node:perf_hooks";
@@ -13,23 +12,69 @@ const token = process.env.WORKER_TOKEN;
 if (!token || /[\r\n]/.test(token)) throw new Error("Provide WORKER_TOKEN through the environment");
 const target = values.hand ? { hand: values.hand } : values.executor ? { executor: values.executor } : {};
 const label = values.label ?? values.hand ?? values.executor ?? "no executor";
-const started = performance.now();
-let connectedMs;
-const client = connect(origin.origin);
-client.once("connect", () => { connectedMs = performance.now() - started; });
-client.on("error", error => { process.stderr.write("Worker connection failed: " + error.message + "\n"); process.exitCode = 1; });
-const keepalive = setInterval(() => { if (!client.closed && !client.destroyed) client.ping(() => {}); }, 30000);
+const KEEPALIVE_MS = 30000;
+const sessionPath = "/sessions/" + encodeURIComponent(values.session);
+let connectedMs, socket, connecting, pending, cursor = 0, warmed = false;
 
-function listing() {
+function sessionSocket() {
+  return socket ? Promise.resolve() : connecting ??= open().finally(() => { connecting = undefined; });
+}
+
+function open() {
+  const started = performance.now();
+  const url = new URL(sessionPath + "/socket?after=" + cursor, origin);
+  url.protocol = "wss:";
+  const next = new WebSocket(url, { headers: { authorization: "Bearer " + token } });
   return new Promise((resolve, reject) => {
-    const stream = client.request({ ":method": "GET", ":path": "/sessions/" + encodeURIComponent(values.session) + "/hands", authorization: "Bearer " + token });
-    let body = "";
-    stream.setEncoding("utf8");
-    stream.on("data", chunk => { body += chunk; });
-    stream.on("error", reject);
-    stream.on("end", () => { try { resolve(JSON.parse(body).hands ?? []); } catch { reject(new Error("Invalid hand listing")); } });
-    stream.end();
+    next.addEventListener("open", () => { connectedMs ??= performance.now() - started; socket = next; resolve(); }, { once: true });
+    next.addEventListener("error", () => reject(new Error("Worker socket failed")), { once: true });
+    next.addEventListener("message", event => receive(String(event.data)));
+    next.addEventListener("close", event => {
+      if (socket !== next) return;
+      socket = undefined;
+      if (!pending) return;
+      sessionSocket().then(() => pending && socket.send(pending.message), error => { pending?.reject(new Error("Worker socket closed with " + event.code + " and could not reconnect: " + error.message)); pending = undefined; });
+    });
   });
+}
+
+function receive(data) {
+  if (data === "pong") return;
+  let message;
+  try { message = JSON.parse(data); } catch { process.stderr.write("Invalid Worker message.\n"); return; }
+  if (message.type === "event") {
+    cursor = Math.max(cursor, message.seq);
+    if (!pending || message.request_id !== pending.requestId) return;
+    pending.view.envelope(message);
+    if (pending.view.terminal) settle();
+  } else if (message.type === "turn" && message.request_id === pending?.requestId) {
+    pending.acceptedMs = performance.now() - pending.submitted;
+    if (message.status === 200) { pending.view.envelope({ event: { type: "result", status: message.body.status } }); settle(); }
+    else if (message.status !== 202) { pending.view.finish(); pending.reject(new Error("Worker rejected the turn with HTTP " + message.status + ": " + JSON.stringify(message.body).slice(0, 500))); pending = undefined; }
+  } else if (message.type === "error") {
+    process.stderr.write("Worker: " + message.error + "\n");
+  }
+}
+
+function settle() {
+  const { view, index, submitted, acceptedMs, resolve } = pending;
+  pending = undefined;
+  view.finish();
+  if (values.timing) process.stderr.write(JSON.stringify({ turn: index, connection_ms: index === 1 ? connectedMs : 0, accepted_ms: acceptedMs, ttft_ms: view.firstText === undefined ? undefined : view.firstText - submitted, total_ms: performance.now() - submitted }) + "\n");
+  if (view.terminal !== "completed") process.exitCode = 1;
+  resolve();
+}
+
+function warm() {
+  if (warmed || pending) return;
+  warmed = true;
+  sessionSocket().then(() => socket.send(JSON.stringify({ type: "warm" })), () => { warmed = false; });
+}
+
+async function listing() {
+  const response = await fetch(new URL(sessionPath + "/hands", origin), { headers: { authorization: "Bearer " + token } });
+  const body = await response.json().catch(() => { throw new Error("Invalid hand listing"); });
+  return body.hands ?? [];
 }
 
 async function handAttached() {
@@ -135,45 +180,27 @@ function render() {
   };
 }
 
-function turn(index, prompt) {
-  const submitted = performance.now();
-  const view = render();
+async function turn(index, prompt) {
+  await sessionSocket();
+  const requestId = "try-" + index;
+  const message = JSON.stringify({ type: "turn", request_id: requestId, provider: values.provider, ...target, prompt });
   return new Promise((resolve, reject) => {
-    const stream = client.request({ ":method": "POST", ":path": "/sessions/" + encodeURIComponent(values.session) + "/turns", authorization: "Bearer " + token, "content-type": "application/json", accept: "text/event-stream" });
-    let buffer = "", status, headersMs, failure = "";
-    stream.setEncoding("utf8");
-    stream.on("response", headers => { status = headers[":status"]; headersMs = performance.now() - submitted; });
-    stream.on("data", chunk => {
-      if (status !== 200) { failure += chunk; return; }
-      buffer += chunk.replace(/\r\n/g, "\n");
-      let split;
-      while ((split = buffer.indexOf("\n\n")) >= 0) {
-        const frame = buffer.slice(0, split);
-        buffer = buffer.slice(split + 2);
-        const data = frame.split("\n").filter(item => item.startsWith("data:")).map(item => item.slice(5).replace(/^ /, "")).join("\n");
-        if (!data) continue;
-        try { view.envelope(JSON.parse(data)); } catch { process.stderr.write("Invalid Worker stream.\n"); }
-      }
-    });
-    stream.on("error", reject);
-    stream.on("end", () => {
-      view.finish();
-      if (status !== 200) { reject(new Error("Worker rejected the turn with HTTP " + status + ": " + failure.slice(0, 500))); return; }
-      if (!view.terminal) { reject(new Error("Stream ended without a final result.")); return; }
-      if (values.timing) process.stderr.write(JSON.stringify({ turn: index, connection_ms: index === 1 ? connectedMs : 0, headers_ms: headersMs, ttft_ms: view.firstText === undefined ? undefined : view.firstText - submitted, total_ms: performance.now() - submitted }) + "\n");
-      if (view.terminal !== "completed") process.exitCode = 1;
-      resolve();
-    });
-    stream.end(JSON.stringify({ request_id: "try-" + index, provider: values.provider, ...target, prompt }));
-  });
+    pending = { index, requestId, message, view: render(), submitted: performance.now(), resolve, reject };
+    socket.send(message);
+  }).finally(() => { warmed = false; });
 }
 
+const keepalive = setInterval(() => socket?.send("ping"), KEEPALIVE_MS);
 try {
+  await sessionSocket();
   await handAttached();
   let index = 0;
   if (positionals.length === 1 && positionals[0] === "-") {
     const input = createInterface({ input: process.stdin, crlfDelay: Infinity });
-    if (process.stdin.isTTY) process.stdout.write("> ");
+    if (process.stdin.isTTY) {
+      process.stdin.on("keypress", warm);
+      process.stdout.write("> ");
+    }
     for await (const prompt of input) {
       if (prompt.trim()) await turn(++index, prompt);
       if (process.stdin.isTTY) process.stdout.write("> ");
@@ -186,5 +213,5 @@ try {
   process.exitCode = 1;
 } finally {
   clearInterval(keepalive);
-  client.close();
+  socket?.close(1000, "done");
 }

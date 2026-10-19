@@ -97,6 +97,7 @@ enum Command {
     },
     Settle,
     Revoke,
+    Preconnect,
     Dispose,
 }
 
@@ -579,6 +580,12 @@ async fn execute(command: Command) -> Result<Value, String> {
         },
         Command::Settle => ready()?.settle().await.map(Value::Bool),
         Command::Revoke => ready()?.revoke().await.map(|()| Value::Null),
+        Command::Preconnect => ready()?
+            .agent
+            .preconnect()
+            .await
+            .map(|()| Value::Null)
+            .map_err(text),
         Command::Dispose => dispose().await,
     }
 }

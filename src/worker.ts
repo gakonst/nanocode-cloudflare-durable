@@ -48,6 +48,8 @@ function duration(value: string, name: string): number {
 
 const handName = (value: unknown): value is string => typeof value === "string" && EXECUTOR_ID.test(value);
 const HAND_TAG = "hand";
+const WATCH_TAG = "watch";
+type Watch = { watch: string; cursor: number };
 
 async function ownerAuthorized(request: Request, env: Env): Promise<boolean> {
   if (!env.WORKER_TOKEN) return false;
@@ -112,6 +114,7 @@ export class AgentSession extends DurableObject<Env> {
   private readonly connections = new Map<string, RemoteExecutor>();
   private readonly handSockets = new Map<WebSocket, RemoteExecutor>();
   private linger?: ReturnType<typeof setTimeout>;
+  private watchersPending = false;
   private running?: Running;
   private pumping = false;
   private readonly eventHub = new EventHub();
@@ -134,7 +137,9 @@ export class AgentSession extends DurableObject<Env> {
       CREATE TABLE IF NOT EXISTS grant_fences (grant_id TEXT PRIMARY KEY, revision INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS event_turns (scope TEXT NOT NULL, turn_id TEXT NOT NULL, request_id TEXT NOT NULL, PRIMARY KEY (scope, turn_id));
       CREATE TABLE IF NOT EXISTS hand_sockets (connection TEXT PRIMARY KEY, scope TEXT NOT NULL, hand TEXT NOT NULL, catalog TEXT NOT NULL) WITHOUT ROWID;
+      CREATE TABLE IF NOT EXISTS watch_sockets (id TEXT PRIMARY KEY, scope TEXT NOT NULL, descriptor TEXT NOT NULL) WITHOUT ROWID;
     `);
+    ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair("ping", "pong"));
     const columns = new Set(ctx.storage.sql.exec("PRAGMA table_info(jobs)").toArray().map(row => row.name));
     if (!columns.has("scope")) ctx.storage.sql.exec("ALTER TABLE jobs ADD COLUMN scope TEXT NOT NULL DEFAULT 'owner'");
     if (!columns.has("descriptor")) ctx.storage.sql.exec("ALTER TABLE jobs ADD COLUMN descriptor TEXT NOT NULL DEFAULT '{}'");
@@ -142,6 +147,7 @@ export class AgentSession extends DurableObject<Env> {
     if (!columns.has("first_seq")) ctx.storage.sql.exec("ALTER TABLE jobs ADD COLUMN first_seq INTEGER");
     if (!columns.has("last_seq")) ctx.storage.sql.exec("ALTER TABLE jobs ADD COLUMN last_seq INTEGER");
     this.restoreHands();
+    this.restoreWatchers();
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -160,7 +166,7 @@ export class AgentSession extends DurableObject<Env> {
       const parts = url.pathname.split("/");
       if (request.method === "GET" && parts[2] === "metrics") return json({ ...this.counts, object_id: this.ctx.id.toString(), database_bytes: this.ctx.storage.sql.databaseSize, model_diagnostics: this.modelDiagnostics.filter(entry => entry.scope === scope).map(entry => entry.value), timing: this.timings.get(scope)?.snapshot() ?? {}, checkpoints: { ...this.store.metrics, timing: this.residents.get(scope)?.metrics.timing.checkpoints ?? {} }, resident_runtimes: this.runtimes.size, runtime: this.residents.get(scope)?.metrics, persisted: this.store.row("SELECT (SELECT COUNT(*) FROM states) AS states, (SELECT COUNT(*) FROM records) AS records, (SELECT COUNT(*) FROM jobs WHERE scope = ? AND status IN ('queued', 'running')) AS unfinished", scope) });
       if (request.method === "GET" && parts[2] === "events") return this.events(scope, url, request.headers.get("accept")?.includes("text/event-stream"), descriptor);
-      if (parts[2] === "socket") return json({ error: "use the authenticated event stream" }, 405);
+      if (parts[2] === "socket") return this.watch(scope, url, request, descriptor);
       if (parts[2] === "hands") {
         if (request.method !== "GET") return json({ error: "method not allowed" }, 405);
         if (parts.length === 3 && request.headers.get("upgrade")?.toLowerCase() !== "websocket") return json({ hands: [...(this.hands.get(scope) ?? [])].filter(([, entry]) => entry.ready).map(([hand]) => hand) });
@@ -562,18 +568,123 @@ export class AgentSession extends DurableObject<Env> {
 
   async webSocketMessage(socket: WebSocket, message: string | ArrayBuffer): Promise<void> {
     const executor = this.handSockets.get(socket);
-    if (executor) executor.receive(message);
-    else try { socket.close(1011, "unknown hand connection"); } catch {}
+    if (executor) return executor.receive(message);
+    if (this.ctx.getTags(socket).includes(WATCH_TAG)) return this.watcherMessage(socket, message);
+    try { socket.close(1011, "unknown connection"); } catch {}
   }
 
   async webSocketClose(socket: WebSocket): Promise<void> {
     this.handSockets.get(socket)?.disconnected();
     this.handSockets.delete(socket);
+    this.forgetWatcher(socket);
   }
 
   async webSocketError(socket: WebSocket): Promise<void> {
     this.handSockets.get(socket)?.disconnected("runner connection failed");
     this.handSockets.delete(socket);
+    this.forgetWatcher(socket);
+  }
+
+  private watch(scope: string, url: URL, request: Request, descriptor: SessionDescriptor): Response {
+    if (request.headers.get("upgrade")?.toLowerCase() !== "websocket") return json({ error: "session sockets attach over WebSocket" }, 426);
+    const after = Number(url.searchParams.get("after") ?? "0");
+    if (!Number.isSafeInteger(after) || after < 0) return json({ error: "after must be a nonnegative integer" }, 400);
+    const [client, server] = Object.values(new WebSocketPair());
+    const id = crypto.randomUUID();
+    this.ctx.storage.sql.exec("INSERT INTO watch_sockets VALUES (?, ?, ?)", id, scope, JSON.stringify(descriptor));
+    this.ctx.acceptWebSocket(server, [WATCH_TAG]);
+    server.serializeAttachment({ watch: id, cursor: after } satisfies Watch);
+    this.notifyWatchers();
+    return new Response(null, { status: 101, webSocket: client });
+  }
+
+  private watcher(socket: WebSocket): { state: Watch; scope: string; descriptor: SessionDescriptor } | undefined {
+    const state = socket.deserializeAttachment() as Watch | null;
+    const row = state ? this.store.row("SELECT scope, descriptor FROM watch_sockets WHERE id = ?", state.watch) : undefined;
+    if (!state || !row) return undefined;
+    return { state, scope: String(row.scope), descriptor: JSON.parse(String(row.descriptor)) };
+  }
+
+  private forgetWatcher(socket: WebSocket): void {
+    const state = socket.deserializeAttachment() as Watch | null;
+    if (state?.watch) this.ctx.storage.sql.exec("DELETE FROM watch_sockets WHERE id = ?", state.watch);
+  }
+
+  private restoreWatchers(): void {
+    const live = this.ctx.getWebSockets(WATCH_TAG).map(socket => (socket.deserializeAttachment() as Watch | null)?.watch).filter(Boolean);
+    this.ctx.storage.sql.exec("DELETE FROM watch_sockets WHERE id NOT IN (SELECT value FROM json_each(?))", JSON.stringify(live));
+  }
+
+  private notifyWatchers(): void {
+    if (this.watchersPending) return;
+    this.watchersPending = true;
+    queueMicrotask(() => {
+      this.watchersPending = false;
+      this.flushWatchers();
+    });
+  }
+
+  private flushWatchers(): void {
+    const page = policy(this.env.EVENT_PAGE_SIZE, "EVENT_PAGE_SIZE");
+    const byScope = new Map<string, { socket: WebSocket; state: Watch }[]>();
+    for (const socket of this.ctx.getWebSockets(WATCH_TAG)) {
+      const watcher = this.watcher(socket);
+      if (!watcher) { try { socket.close(1011, "watch registration was lost"); } catch {} continue; }
+      if (this.isFenced(watcher.descriptor)) { this.forgetWatcher(socket); try { socket.close(4003, "grant revoked"); } catch {} continue; }
+      let list = byScope.get(watcher.scope);
+      if (!list) byScope.set(watcher.scope, list = []);
+      list.push({ socket, state: watcher.state });
+    }
+    for (const [scope, list] of byScope) {
+      let after = Math.min(...list.map(entry => entry.state.cursor));
+      for (;;) {
+        const rows = this.ctx.storage.sql.exec<{ seq: number; request_id: string | null; body: string; created_at: number }>("SELECT seq, request_id, body, created_at FROM events WHERE scope = ? AND seq > ? ORDER BY seq LIMIT ?", scope, after, page).toArray();
+        for (const row of rows) {
+          const message = `{"type":"event","seq":${row.seq},"request_id":${JSON.stringify(row.request_id)},"created_at":${row.created_at},"event":${row.body}}`;
+          for (const entry of list) {
+            if (row.seq <= entry.state.cursor) continue;
+            try { entry.socket.send(message); entry.state.cursor = row.seq; } catch {}
+          }
+        }
+        if (rows.length < page) break;
+        after = rows.at(-1)!.seq;
+      }
+      for (const entry of list) entry.socket.serializeAttachment(entry.state);
+    }
+  }
+
+  private async watcherMessage(socket: WebSocket, message: string | ArrayBuffer): Promise<void> {
+    const watcher = this.watcher(socket);
+    if (!watcher) { try { socket.close(1011, "watch registration was lost"); } catch {} return; }
+    if (this.isFenced(watcher.descriptor)) { this.forgetWatcher(socket); try { socket.close(4003, "grant revoked"); } catch {} return; }
+    let input: any;
+    try { input = JSON.parse(typeof message === "string" ? message : new TextDecoder().decode(message)); } catch { socket.send(JSON.stringify({ type: "error", error: "messages must be JSON" })); return; }
+    const headers = { "content-type": "application/json", "x-nanocode-descriptor": headerJson(watcher.descriptor) };
+    if (input?.type === "turn") {
+      const { type: _, ...turn } = input;
+      const response = await this.fetch(new Request("https://session.internal/internal/turns", { method: "POST", headers, body: JSON.stringify(turn) }));
+      socket.send(JSON.stringify({ type: "turn", request_id: turn.request_id, status: response.status, body: await response.json() }));
+    } else if (input?.type === "cancel" && typeof input.request_id === "string") {
+      const response = await this.fetch(new Request(`https://session.internal/internal/cancel/${encodeURIComponent(input.request_id)}`, { method: "POST", headers }));
+      socket.send(JSON.stringify({ type: "cancel", request_id: input.request_id, status: response.status, body: await response.json() }));
+    } else if (input?.type === "warm") {
+      const warmed = await this.warm(watcher.scope).catch(() => false);
+      socket.send(JSON.stringify({ type: "warm", warmed }));
+    } else {
+      socket.send(JSON.stringify({ type: "error", error: "unknown message type" }));
+    }
+  }
+
+  private async warm(scope: string): Promise<boolean> {
+    const sessionId = this.store.row("SELECT value FROM metadata WHERE key = ?", scope === "owner" ? "session_id" : `session_id:${scope}`)?.value;
+    const last = this.ctx.storage.sql.exec<Job>("SELECT * FROM jobs WHERE scope = ? ORDER BY rowid DESC LIMIT 1", scope).toArray()[0];
+    if (!sessionId || !last) return false;
+    const descriptor = this.descriptor(last);
+    if (this.isFenced(descriptor)) return false;
+    const runtime = await this.runtime(scope, String(sessionId), descriptor);
+    await runtime.preconnect();
+    if (!this.pumping && !this.store.row("SELECT request_id FROM jobs WHERE status IN ('queued', 'running') LIMIT 1") && !this.store.row("SELECT key FROM metadata WHERE key LIKE 'background:%' LIMIT 1")) this.releaseIdle();
+    return true;
   }
 
   private executorEnabled(descriptor: SessionDescriptor): boolean {
@@ -761,6 +872,7 @@ export class AgentSession extends DurableObject<Env> {
     const seq = this.ctx.storage.sql.exec<{ seq: number }>("INSERT INTO events (scope, request_id, body, created_at) VALUES (?, ?, ?, ?) RETURNING seq", scope, requestId, JSON.stringify(event), Date.now()).one().seq;
     this.counts.events_written++;
     this.eventHub.notify();
+    this.notifyWatchers();
     return seq;
   }
 

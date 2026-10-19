@@ -41,7 +41,7 @@ const provider = async request => {
 const options = localOptions({ provider, agent: { MODEL_AUTH: "subscription" }, egress: { OAUTH_JSON: JSON.stringify(seed), VAULT_KEY: secret(), ...(transport ? { MODEL_RESPONSE_HEADERS_TIMEOUT_MS: "200" } : {}) } });
 const dispatch = async () => {
   const bindings = await mf.getBindings("nanocode-worker");
-  return bindings.EGRESS.fetch(new Request("https://egress.internal/model", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ authority: { account_id: "default", session_id: "authority-measurement" }, subscription: true, headers: [], body: "{}" }) }));
+  return bindings.EGRESS.fetch(new Request("https://egress.internal/model", { method: "POST", headers: { "content-type": "application/octet-stream", "x-nanocode-model": JSON.stringify({ authority: { account_id: "default", session_id: "authority-measurement" }, subscription: true, headers: [] }) }, body: "{}" }));
 };
 const launch = async () => { mf = new Miniflare(convertV4MiniflareOptions(options)); await mf.ready; };
 const until = async condition => {

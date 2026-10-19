@@ -168,6 +168,10 @@ export class AgentRuntime {
     return await this.command({ op: "settle" }) === true;
   }
 
+  async preconnect(): Promise<void> {
+    await this.command({ op: "preconnect" });
+  }
+
   async revoke(): Promise<void> {
     try { await this.command({ op: "revoke" }); }
     finally { this.closeSockets("runtime revoked", "cancelled"); }

@@ -163,7 +163,7 @@ try {
     await turn("after-cancellation");
     if (transport) {
       const bindings = await mf.getBindings("nanocode-worker");
-      const dispatch = signal => bindings.EGRESS.fetch(new Request("https://egress.internal/model", { method: "POST", signal, headers: { "content-type": "application/json" }, body: JSON.stringify({ authority: { account_id: "default", session_id: "transport-measurement" }, subscription: false, headers: [], body: JSON.stringify({ model: "claude-opus-5-5" }) }) }));
+      const dispatch = signal => bindings.EGRESS.fetch(new Request("https://egress.internal/model", { method: "POST", signal, headers: { "content-type": "application/octet-stream", "x-nanocode-model": JSON.stringify({ authority: { account_id: "default", session_id: "transport-measurement" }, subscription: false, headers: [] }) }, body: JSON.stringify({ model: "claude-opus-5-5" }) }));
       for (const fault of ["headers", "body", "error-body", "active"]) {
         transportMode = fault;
         const start = performance.now();
