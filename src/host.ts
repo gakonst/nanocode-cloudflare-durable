@@ -84,6 +84,7 @@ export class AgentRuntime {
   private readonly attached = new Set<string>();
   hands = false;
   remote = false;
+  subscription = false;
 
   private constructor(private readonly store: CheckpointStore, private readonly options: RuntimeOptions) {}
 
@@ -91,6 +92,7 @@ export class AgentRuntime {
     const runtime = new AgentRuntime(store, options);
     runtime.hands = config.hands ?? false;
     runtime.remote = config.remote ?? false;
+    runtime.subscription = config.subscription;
     const instantiateStarted = performance.now();
     const instance = await WebAssembly.instantiate(module, { host: runtime.imports() });
     runtime.timings.record("wasm.instantiate", performance.now() - instantiateStarted);

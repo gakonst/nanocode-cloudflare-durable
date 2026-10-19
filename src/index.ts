@@ -26,6 +26,7 @@ export interface NanocodeEnv {
 export type NanocodeOptions<E extends NanocodeEnv> = {
   authenticate(request: Request, env: E): Promise<string | null> | string | null;
   egress(env: E): PrivateBinding;
+  subscription?(account: string, env: E): Promise<boolean> | boolean;
 };
 
 type Job = { request_id: string; prompt: string; status: string; result: string | null; scope: string; descriptor: string; cancel_requested: number; first_seq: number | null; last_seq: number | null };
@@ -325,7 +326,7 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
     private runtime(scope: string, sessionId: string, descriptor: SessionDescriptor): Promise<AgentRuntime> {
       let resident = this.runtimes.get(scope);
       if (resident) return resident.then(async runtime => {
-        if (runtime.reusable && runtime.hands === this.handsMode(scope, descriptor)) return runtime;
+        if (runtime.reusable && runtime.hands === this.handsMode(scope, descriptor) && runtime.subscription === descriptor.subscription) return runtime;
         if (this.runtimes.get(scope) === resident) { this.runtimes.delete(scope); this.residents.delete(scope); }
         this.releaseHands(scope);
         await runtime.dispose().catch(() => {});
@@ -801,7 +802,8 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
     let name: string;
     try { name = decodeURIComponent(match[1]); } catch { return json({ error: "invalid session encoding" }, 400); }
     if (!name || name.includes("\0")) return json({ error: "invalid session name" }, 400);
-    const descriptor: SessionDescriptor = { account_id: account, session_id: "", session_name: name, subscription: env.MODEL_AUTH === "subscription" };
+    const subscription = options.subscription ? await options.subscription(account, env) : env.MODEL_AUTH === "subscription";
+    const descriptor: SessionDescriptor = { account_id: account, session_id: "", session_name: name, subscription };
     let path = `/internal/${match[2] ?? "metrics"}`;
     if (match[4]) path = `/internal/cancel/${match[3]}`;
     else if (match[3]) path += `/${match[3]}`;
