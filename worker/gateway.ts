@@ -10,6 +10,12 @@ function json(value: unknown, status = 200): Response {
   return Response.json(value, { status, headers: { "cache-control": "no-store" } });
 }
 
+function shape(query: unknown): { input_items: number; continued: boolean } {
+  const body = typeof query === "object" && query !== null ? query as { input?: unknown; messages?: unknown; previous_response_id?: unknown } : {};
+  const items = Array.isArray(body.input) ? body.input : Array.isArray(body.messages) ? body.messages : [];
+  return { input_items: items.length, continued: typeof body.previous_response_id === "string" };
+}
+
 function modelError(provider: ModelProvider, status: number, type: string, message: string): Response {
   if (provider === "codex") return json({ error: { type, message } }, status);
   return json({ type: "error", error: { type, message } }, status);
@@ -24,8 +30,9 @@ async function model(open: () => AiGateway, request: Request): Promise<Response>
   if (dispatch.subscription) return modelError(provider, 409, "invalid_request_error", "AI Gateway uses API-key authentication; set MODEL_AUTH to api_key");
   const headers: Record<string, string> = {};
   for (const [name, value] of dispatch.headers) if (route.headers.test(name.toLowerCase())) headers[name.toLowerCase()] = value;
+  const body = await request.arrayBuffer();
   let query: unknown;
-  try { query = JSON.parse(await request.text()); } catch { return modelError(provider, 400, "invalid_request_error", "model request body is not JSON"); }
+  try { query = JSON.parse(new TextDecoder().decode(body)); } catch { return modelError(provider, 400, "invalid_request_error", "model request body is not JSON"); }
   const gateway = open();
   let upstream: Response;
   try {
@@ -35,6 +42,7 @@ async function model(open: () => AiGateway, request: Request): Promise<Response>
   }
   const forwarded = new Headers({ "cache-control": "no-store" });
   for (const [name, value] of upstream.headers) if (RESPONSE_HEADER.test(name)) forwarded.set(name, value);
+  forwarded.set("x-nanocode-model-diagnostic", JSON.stringify({ provider, transport: "gateway", status: upstream.status, body_bytes: body.byteLength, ...shape(query) }));
   return new Response(upstream.body, { status: upstream.status, headers: forwarded });
 }
 
