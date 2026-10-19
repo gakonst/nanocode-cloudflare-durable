@@ -247,7 +247,7 @@ function codexHeaders(input: unknown): Headers {
   return headers;
 }
 
-function sendModel(env: EgressEnv, provider: ModelProvider, endpoint: string, headers: Headers, access: Granted, body: string, signal: AbortSignal): Promise<Response> {
+function sendModel(env: EgressEnv, provider: ModelProvider, endpoint: string, headers: Headers, access: Granted, body: ArrayBuffer, signal: AbortSignal): Promise<Response> {
   const outgoing = new Headers(headers);
   for (const [name, value] of access.headers) outgoing.set(name, value);
   const request = new Request(endpoint, { method: "POST", headers: outgoing, body, redirect: "manual", signal });
@@ -477,12 +477,12 @@ export class SessionEgress extends WorkerEntrypoint<EgressEnv> {
     };
     try {
       let dispatch: ModelDispatch;
-      try { dispatch = await request.json<ModelDispatch>(); } catch { throw new Failure(400, "invalid_request"); }
+      try { dispatch = JSON.parse(request.headers.get("x-nanocode-model") ?? ""); } catch { throw new Failure(400, "invalid_request"); }
       if (!dispatch || typeof dispatch !== "object") throw new Failure(400, "invalid_request");
       provider = modelProvider(dispatch.provider);
       transport = provider === "codex" && this.env.CODEX_TRANSPORT ? "fixed_binding" : "direct";
       const authority = authorityOf(dispatch.authority);
-      if (typeof dispatch.body !== "string") throw new Failure(400, "invalid_request");
+      const body = await request.arrayBuffer();
       let endpoint: string;
       let headers: Headers;
       if (provider === "codex") {
@@ -509,7 +509,7 @@ export class SessionEgress extends WorkerEntrypoint<EgressEnv> {
       }
       one.origin = "transport";
       begin("transport");
-      let response = await sendModel(this.env, provider, endpoint, headers, first, dispatch.body, request.signal);
+      let response = await sendModel(this.env, provider, endpoint, headers, first, body, request.signal);
       end();
       classify(one, response);
       if (response.status === 401) {
@@ -536,7 +536,7 @@ export class SessionEgress extends WorkerEntrypoint<EgressEnv> {
         metrics.model_recoveries++;
         two.origin = "transport";
         begin("transport");
-        response = await sendModel(this.env, provider, endpoint, headers, next, dispatch.body, request.signal);
+        response = await sendModel(this.env, provider, endpoint, headers, next, body, request.signal);
         end();
         classify(two, response);
         if (response.status === 401) {

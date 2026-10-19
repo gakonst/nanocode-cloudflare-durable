@@ -1,8 +1,8 @@
 use std::{
     cell::{Cell, RefCell},
-    rc::Rc,
     collections::BTreeMap,
     future::Future,
+    rc::Rc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -15,6 +15,13 @@ use serde_json::{Value, json};
 #[link(wasm_import_module = "host")]
 unsafe extern "C" {
     fn dispatch(id: u32, pointer: *const u8, length: usize);
+    fn dispatch_body(
+        id: u32,
+        pointer: *const u8,
+        length: usize,
+        body: *const u8,
+        body_length: usize,
+    );
     fn cancel(id: u32);
     fn clock(monotonic: u32) -> f64;
     fn random(pointer: *mut u8, length: usize);
@@ -53,6 +60,10 @@ pub enum Reply {
 }
 
 pub async fn request(request: Value) -> Reply {
+    send(request, None).await
+}
+
+async fn send(request: Value, body: Option<&[u8]>) -> Reply {
     let id = NEXT.with_borrow_mut(|next| {
         *next = next
             .checked_add(1)
@@ -63,20 +74,36 @@ pub async fn request(request: Value) -> Reply {
     PENDING.with_borrow_mut(|pending| pending.insert(id, sender));
     let guard = Pending(id);
     let bytes = serde_json::to_vec(&request).expect("encode host request");
-    unsafe { dispatch(id, bytes.as_ptr(), bytes.len()) };
+    match body {
+        Some(body) => unsafe {
+            dispatch_body(id, bytes.as_ptr(), bytes.len(), body.as_ptr(), body.len())
+        },
+        None => unsafe { dispatch(id, bytes.as_ptr(), bytes.len()) },
+    }
     let response = receiver.await.expect("host request sender dropped");
     drop(guard);
     response
 }
 
 pub async fn call(request: Value) -> Result<Value, Value> {
-    let Reply::Json(response) = self::request(request).await else {
+    settle(self::request(request).await)
+}
+
+pub async fn call_with_body(request: Value, body: &[u8]) -> Result<Value, Value> {
+    settle(send(request, Some(body)).await)
+}
+
+fn settle(reply: Reply) -> Result<Value, Value> {
+    let Reply::Json(mut response) = reply else {
         panic!("expected JSON host response")
     };
-    if let Some(error) = response.get("error") {
-        Err(error.clone())
+    if let Some(error) = response.get_mut("error") {
+        Err(error.take())
     } else {
-        Ok(response.get("ok").expect("host response envelope").clone())
+        Ok(response
+            .get_mut("ok")
+            .expect("host response envelope")
+            .take())
     }
 }
 

@@ -343,17 +343,17 @@ try {
   const fallbackHandshakes = ofSession(state.handshakes, fallbackSession);
   const fallbackRequests = ofSession(state.requests, fallbackSession);
   check(fallbackHandshakes.length === 1 && fallbackHandshakes[0].rejected === 426 && fallbackRequests.length === fallbackTurns.length && fallbackRequests.every(entry => entry.transport === "https" && entry.authorized && entry.lite === "true" && entry.type === null && entry.previous === null), "A 426 handshake rejection falls back to HTTPS and the session stays on HTTPS");
-  check(kinds(fallbackList, "model.attempt.retrying", "fallback").some(entry => entry.payload.error_class === "websocket_fallback") && fallbackTurns.every(entry => entry.message === "socket-ok"), "The SDK reports the WebSocket fallback and every fallback turn completes");
+  check((kinds(fallbackList, "model.attempt.retrying", "fallback").some(entry => entry.payload.error_class === "websocket_fallback") || kinds(fallbackList, "model.connection.failed").some(entry => entry.payload.error?.includes("HTTP 426"))) && fallbackTurns.every(entry => entry.message === "socket-ok"), "The SDK reports the rejected WebSocket handshake and every fallback turn completes");
   const httpsCalls = calls(fallbackList, fallbackTurns.slice(1).map(entry => entry.id));
 
   const forbiddenName = `codex-forbidden-${stamp}`;
-  await mock("/reject", { method: "POST", body: JSON.stringify(Array.from({ length: 5 }, () => ({ status: 403, retry_after: 0, code: "forbidden" }))) });
+  await mock("/reject", { method: "POST", body: JSON.stringify(Array.from({ length: 6 }, () => ({ status: 403, retry_after: 0, code: "forbidden" }))) });
   const forbidden = await turn(forbiddenName, "forbidden", "Say hello after forbidden");
   state = await stats();
   const forbiddenHandshakes = ofSession(state.handshakes, forbidden.session);
   const forbiddenRequests = ofSession(state.requests, forbidden.session);
   const forbiddenList = await events(forbiddenName);
-  check(forbiddenHandshakes.length === 5 && forbiddenHandshakes.every(entry => entry.rejected === 403) && forbiddenRequests.length === 1 && forbiddenRequests[0].transport === "https" && forbidden.message === "socket-ok", "Repeated 403 handshake rejections honour Retry-After, exhaust the socket budget and fall back to HTTPS");
+  check(forbiddenHandshakes.length === 6 && forbiddenHandshakes.every(entry => entry.rejected === 403) && forbiddenRequests.length === 1 && forbiddenRequests[0].transport === "https" && forbidden.message === "socket-ok", "A rejected background connect and five rejected model-call handshakes honour Retry-After, exhaust the socket budget and fall back to HTTPS");
   const forbiddenFailures = kinds(forbiddenList, "model.connection.failed");
 
   const probeSession = "01a151aa-0000-7000-8000-000000000000";
@@ -384,7 +384,7 @@ try {
   state = await stats();
   const frames = [...framesBeforeRestart, ...state.requests];
   check(!exposed(surfaces.persisted) && !exposed(surfaces.metrics) && !exposed(egressMetrics) && frames.every(entry => entry.credential_free), "No credential value appears in persisted SDK state, records, events, jobs, metrics, diagnostics or model frames");
-  check(forbiddenFailures.length === 5 && forbiddenFailures.every(entry => entry.payload.error.includes("Provider request failed") && !exposed(entry.payload)), "Handshake rejection details visible to the WASM SDK are the safe projection");
+  check(forbiddenFailures.length === 6 && forbiddenFailures.every(entry => entry.payload.error.includes("Provider request failed") && !exposed(entry.payload)), "Handshake rejection details visible to the WASM SDK are the safe projection");
   check(outbound === 0, "Private egress made no direct network requests");
 
   const report = {

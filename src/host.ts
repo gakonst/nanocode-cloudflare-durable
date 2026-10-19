@@ -21,6 +21,7 @@ export type TurnOutcome = AgentResult & { waiting?: boolean };
 export type RuntimeActivity = { pending: string[]; quiescent: boolean; activity: unknown };
 
 export type RuntimeMetrics = {
+  wasm_memory_bytes: number;
   timing: { runtime_id: string; started_at: number; elapsed_ms: number; spans: TimingSnapshot; checkpoints: TimingSnapshot; models: ModelTiming[] };
   initializations: number;
   runs: number;
@@ -65,7 +66,7 @@ export class AgentRuntime {
   private readonly sockets = new Map<number, Socket>();
   private readonly commands = new Map<number, Pending>();
   private readonly watchers = new Set<() => void>();
-  private readonly counters: Omit<RuntimeMetrics, "timing"> = {
+  private readonly counters: Omit<RuntimeMetrics, "timing" | "wasm_memory_bytes"> = {
     initializations: 0, runs: 0, completed: 0, failed: 0, cancelled: 0, retries: 0, waits: 0, resumes: 0, rejected_runs: 0, cancellations: 0,
     host_calls: 0, store_calls: 0, model_requests: 0, model_sockets: 0, socket_sends: 0, socket_frames: 0, body_reads: 0, event_batches: 0, events: 0,
     host_cancellations: 0, dropped_replies: 0, disposals: 0,
@@ -96,7 +97,7 @@ export class AgentRuntime {
     runtime.wasm = instance.exports as unknown as Exports;
     try {
       const initStarted = performance.now();
-      const opened = await runtime.command({ op: "init", config: { session_id: config.session_id, provider: config.provider ?? "claude", subscription: config.subscription, endpoint: config.endpoint, remote: config.remote ?? false, executor: config.executor, hands: runtime.hands } }) as { pending: string[] };
+      const opened = await runtime.command({ op: "init", config: { session_id: config.session_id, provider: config.provider ?? "claude", subscription: config.subscription, endpoint: config.endpoint, remote: config.remote ?? false, executor: config.executor, hands: runtime.hands, event_coalesce_ms: config.event_coalesce_ms ?? 0 } }) as { pending: string[] };
       runtime.timings.record("sdk.open", performance.now() - initStarted);
       runtime.pendingAtOpen = opened.pending;
     } catch (error) {
@@ -108,7 +109,7 @@ export class AgentRuntime {
   }
 
   get metrics(): Readonly<RuntimeMetrics> {
-    return { ...this.counters, timing: { runtime_id: this.runtimeId, started_at: this.startedAt, elapsed_ms: this.elapsed(), spans: this.timings.snapshot(), checkpoints: this.checkpointTimings.snapshot(), models: this.models.map(value => ({ ...value })) } };
+    return { ...this.counters, wasm_memory_bytes: this.wasm.memory.buffer.byteLength, timing: { runtime_id: this.runtimeId, started_at: this.startedAt, elapsed_ms: this.elapsed(), spans: this.timings.snapshot(), checkpoints: this.checkpointTimings.snapshot(), models: this.models.map(value => ({ ...value })) } };
   }
 
   get closed(): boolean {
@@ -226,26 +227,30 @@ export class AgentRuntime {
     if (failure !== undefined) throw failure;
   }
 
+  private accept(id: number, pointer: number, length: number, body?: Uint8Array) {
+    const received = performance.now();
+    const request = JSON.parse(this.read(pointer, length));
+    if (body) request.body = body;
+    this.counters.bridge_request_bytes += length + (body?.byteLength ?? 0);
+    this.timings.record("bridge.decode", performance.now() - received);
+    if (request.op === "events") request.events = request.events.map((event: object) => ({ ...event, host_timing: { runtime_id: this.runtimeId, received_ms: received - this.started } }));
+    this.counters.host_calls++;
+    this.inflight.set(id, () => {});
+    void Promise.resolve()
+      .then(async () => {
+        const started = performance.now();
+        this.timings.record(`queue.${request.op}`, started - received);
+        try { return await this.execute(id, request); }
+        finally { this.timings.record(`host.${request.op}`, performance.now() - started); }
+      })
+      .then(ok => ({ ok }), error => ({ error: AgentRuntime.encodeError(error) }))
+      .then(reply => this.complete(id, reply));
+  }
+
   private imports() {
     return {
-      dispatch: (id: number, pointer: number, length: number) => {
-        const received = performance.now();
-        const request = JSON.parse(this.read(pointer, length));
-        this.counters.bridge_request_bytes += length;
-        this.timings.record("bridge.decode", performance.now() - received);
-        if (request.op === "events") request.events = request.events.map((event: object) => ({ ...event, host_timing: { runtime_id: this.runtimeId, received_ms: received - this.started } }));
-        this.counters.host_calls++;
-        this.inflight.set(id, () => {});
-        void Promise.resolve()
-          .then(async () => {
-            const started = performance.now();
-            this.timings.record(`queue.${request.op}`, started - received);
-            try { return await this.execute(id, request); }
-            finally { this.timings.record(`host.${request.op}`, performance.now() - started); }
-          })
-          .then(ok => ({ ok }), error => ({ error: AgentRuntime.encodeError(error) }))
-          .then(reply => this.complete(id, reply));
-      },
+      dispatch: (id: number, pointer: number, length: number) => this.accept(id, pointer, length),
+      dispatch_body: (id: number, pointer: number, length: number, body: number, bodyLength: number) => this.accept(id, pointer, length, new Uint8Array(this.wasm.memory.buffer, body, bodyLength).slice()),
       cancel: (id: number) => {
         const cancel = this.inflight.get(id);
         if (!cancel) return;
@@ -396,7 +401,7 @@ export class AgentRuntime {
         if (!entry) return { closed: "after the client released it" };
         await this.options.socket!.admit();
         if (entry.closed !== undefined) return { closed: entry.closed };
-        try { entry.socket.send(request.text); }
+        try { entry.socket.send(this.decoder.decode(request.body)); }
         catch { this.closeSocket(request.id, "before request dispatch", "failed"); return { closed: entry.closed }; }
         entry.timing.sends = (entry.timing.sends ?? 0) + 1;
         this.counters.socket_sends++;

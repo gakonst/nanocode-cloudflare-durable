@@ -48,6 +48,8 @@ struct Configuration {
     executor: Option<String>,
     #[serde(default)]
     hands: bool,
+    #[serde(default)]
+    event_coalesce_ms: u64,
 }
 
 impl Configuration {
@@ -140,6 +142,7 @@ fn current() -> Option<Rc<Session>> {
 }
 
 async fn open(config: Configuration) -> Result<Session, String> {
+    let coalesce = std::time::Duration::from_millis(config.event_coalesce_ms);
     let store = nanocode::session_store(store::WorkerStore).map_err(text)?;
     if store
         .summary(&config.session_id)
@@ -212,7 +215,7 @@ async fn open(config: Configuration) -> Result<Session, String> {
     let opened = async {
         let stored = store.load(&config.session_id).await.map_err(text)?;
         let (agent, stream) = runtime.open_loaded(&store, &stored).await.map_err(text)?;
-        let events = events::Events::start(stream, subagents);
+        let events = events::Events::start(stream, subagents, coalesce);
         let pending = stored
             .turns
             .iter()

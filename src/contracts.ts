@@ -48,7 +48,6 @@ export type ModelDispatch = {
   authority: SessionAuthority;
   endpoint: string;
   headers: [string, string][];
-  body: string;
   subscription: boolean;
 };
 
@@ -80,6 +79,7 @@ export type AgentConfiguration = {
   remote?: boolean;
   executor?: string;
   hands?: boolean;
+  event_coalesce_ms?: number;
 };
 
 export type AgentInput = { request_id: string; prompt: string; hand?: string };
@@ -113,7 +113,7 @@ export type ModelTiming = {
 };
 
 export type RuntimeOptions = {
-  dispatch(request: { endpoint: string; headers: [string, string][]; body: string }, signal?: AbortSignal, timing?: ModelTiming & { runtime_id: string }): Promise<Response>;
+  dispatch(request: { endpoint: string; headers: [string, string][]; body: Uint8Array }, signal?: AbortSignal, timing?: ModelTiming & { runtime_id: string }): Promise<Response>;
   wake?(): void;
   event(value: unknown): Promise<void>;
   events?(values: unknown[]): Promise<void>;

@@ -19,7 +19,7 @@ use nanocode::{
 };
 use serde_json::{Value, json};
 
-use super::bridge::{Reply, call};
+use super::bridge::{Reply, call, call_with_body};
 
 pub struct WorkerTransport;
 
@@ -61,10 +61,12 @@ struct Started {
 }
 
 async fn start(endpoint: &str, headers: &[(&str, &str)], body: &str) -> Result<Started, String> {
-    let value =
-        call(json!({"op": "http_start", "endpoint": endpoint, "headers": headers, "body": body}))
-            .await
-            .map_err(text)?;
+    let value = call_with_body(
+        json!({"op": "http_start", "endpoint": endpoint, "headers": headers}),
+        body.as_bytes(),
+    )
+    .await
+    .map_err(text)?;
     let id = serde_json::from_value(value["id"].clone()).map_err(text)?;
     Ok(Started {
         status: status(&value)?,
@@ -163,7 +165,12 @@ struct Socket {
 impl HostConnection for Socket {
     fn send<'a>(&'a self, message: &'a str) -> HostFuture<'a, Result<(), HostError>> {
         Box::pin(async move {
-            match call(json!({"op": "socket_send", "id": self.id, "text": message})).await {
+            match call_with_body(
+                json!({"op": "socket_send", "id": self.id}),
+                message.as_bytes(),
+            )
+            .await
+            {
                 Ok(Value::Null) => Ok(()),
                 Ok(closed) => Err(
                     HostError::new(closed["closed"].as_str().unwrap_or_default())

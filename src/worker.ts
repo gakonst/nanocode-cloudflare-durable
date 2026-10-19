@@ -5,7 +5,7 @@ import { EventHub } from "./events";
 import { RemoteExecutor } from "./remote/host";
 import { handleConnect } from "./connect/index";
 export { SubscriptionAuth } from "./auth";
-import { DEFAULT_EXECUTOR, EXECUTOR_ID, LEGACY_RUNNER, RECENT_MODEL_LIMIT, runnerConnection, headerJson, json, sessionUuid, type AgentResult, type PrivateBinding, type SessionDescriptor } from "./contracts";
+import { DEFAULT_EXECUTOR, EXECUTOR_ID, LEGACY_RUNNER, RECENT_MODEL_LIMIT, runnerConnection, headerJson, json, sessionUuid, type AgentResult, type ModelDispatch, type PrivateBinding, type SessionDescriptor } from "./contracts";
 import { Timings, timingDifference, type TimingSnapshot } from "./timing";
 
 export interface Env {
@@ -20,6 +20,7 @@ export interface Env {
   RECOVERY_DELAY_MS: string;
   CONNECT_STREAM_REVALIDATE_MS: string;
   EVENT_PAGE_SIZE: string;
+  EVENT_COALESCE_MS: string;
   RUNNER_ENABLED: string;
   REMOTE_MAX_FRAME_BYTES: string;
   REMOTE_TIMEOUT_MS: string;
@@ -34,6 +35,12 @@ type TurnTiming = { started: number; admitted_at?: number; admission_ms?: number
 function policy(value: string, name: string): number {
   const number = Number(value);
   if (!Number.isSafeInteger(number) || number <= 0) throw new Error(`${name} must be a positive integer`);
+  return number;
+}
+
+function duration(value: string, name: string): number {
+  const number = Number(value);
+  if (!Number.isSafeInteger(number) || number < 0) throw new Error(`${name} must be a nonnegative integer`);
   return number;
 }
 
@@ -401,7 +408,7 @@ export class AgentSession extends DurableObject<Env> {
           : undefined;
         void connecting?.catch(() => {});
         try {
-          const created = await AgentRuntime.create({ session_id: sessionId, provider: descriptor.provider ?? "claude", subscription: descriptor.subscription, endpoint: descriptor.provider === "codex" ? "https://chatgpt.com/backend-api/codex" : `https://api.anthropic.com/v1/messages${descriptor.subscription ? "?beta=true" : ""}`, remote: enabled, executor: descriptor.executor_id, hands: this.handsMode(scope, descriptor) }, this.store, {
+          const created = await AgentRuntime.create({ session_id: sessionId, provider: descriptor.provider ?? "claude", subscription: descriptor.subscription, endpoint: descriptor.provider === "codex" ? "https://chatgpt.com/backend-api/codex" : `https://api.anthropic.com/v1/messages${descriptor.subscription ? "?beta=true" : ""}`, remote: enabled, executor: descriptor.executor_id, hands: this.handsMode(scope, descriptor), event_coalesce_ms: duration(this.env.EVENT_COALESCE_MS, "EVENT_COALESCE_MS") }, this.store, {
         remote: {
           failed: () => remoteFailed || remote?.failure !== undefined,
           execute: async (request: any, id: number) => {
@@ -435,7 +442,8 @@ export class AgentSession extends DurableObject<Env> {
           if (this.dispatchBlocked(scope, descriptor)) throw new Error("request authority stopped");
           await this.durable(scope);
           this.counts.model_dispatches++;
-          const response = await this.env.EGRESS.fetch(new Request("https://egress.internal/model", { method: "POST", signal, headers: { "content-type": "application/json" }, body: JSON.stringify({ ...request, authority, provider: descriptor.provider ?? "claude", subscription: descriptor.subscription }) }));
+          const dispatch: ModelDispatch = { endpoint: request.endpoint, headers: request.headers, authority, provider: descriptor.provider ?? "claude", subscription: descriptor.subscription };
+          const response = await this.env.EGRESS.fetch(new Request("https://egress.internal/model", { method: "POST", signal, headers: { "content-type": "application/octet-stream", "x-nanocode-model": headerJson(dispatch) }, body: request.body }));
           const diagnostic = response.headers.get("x-nanocode-model-diagnostic");
           if (diagnostic) {
             try {
