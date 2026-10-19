@@ -40,10 +40,8 @@ export type SessionDescriptor = SessionAuthority & {
   session_name: string;
   thread_id?: string;
   subscription: boolean;
-  hand?: HandSelection;
+  hand?: string;
 };
-
-export type HandSelection = string | string[];
 
 export type ModelDispatch = {
   provider?: ModelProvider;
@@ -81,7 +79,7 @@ export type AgentConfiguration = {
   executor?: string;
 };
 
-export type AgentInput = { request_id: string; prompt: string; hand?: HandSelection };
+export type AgentInput = { request_id: string; prompt: string; hand?: string };
 
 export type AgentResult = {
   ok?: { session_id: string; model: string; message: unknown };

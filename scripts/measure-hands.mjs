@@ -77,9 +77,22 @@ const scripts = {
   "hands-where": [() => `text(JSON.stringify(await tools.exec_command({ cmd: "pwd" })));`],
   "hands-callback": [() => `text(JSON.stringify({ agents: await tools.list_agents({}) }));`],
   "hands-store": [() => `store("marker", "kept-on-hand"); text("stored");`, () => `text(load("marker"));`],
-  "hands-remember": [() => `store("thread", "kept-on-hand"); text("stored");`],
-  "hands-recall": [() => `text(String(load("thread")));`],
-  "hands-together": [() => `const started = Date.now(); const where = await tools.exec_command({ cmd: "sleep 1; pwd" }); text(JSON.stringify({ started, ended: Date.now(), where }));`],
+  "hands-list": [() => `text(JSON.stringify(await tools.hands({})));`],
+  "hands-fanout": [() => `const { hands } = await tools.hands({});
+const runs = await Promise.all(hands.map(async hand => {
+  const started = Date.now();
+  const where = await tools.exec_command({ cmd: "sleep 1; pwd", hand });
+  return { hand, started, ended: Date.now(), where: where.output };
+}));
+text(JSON.stringify(runs));`],
+  "hands-handoff": [() => `const { hands, here } = await tools.hands({});
+const other = hands.find(hand => hand !== here);
+await tools.exec_command({ cmd: "printf 'written on ' > note.txt && pwd >> note.txt" });
+const note = (await tools.exec_command({ cmd: "cat note.txt" })).output.trim();
+await tools.apply_patch({ input: "*** Begin Patch\\n*** Add File: copied.txt\\n+" + note + "\\n*** End Patch\\n", hand: other });
+text(JSON.stringify({ here, other, note, copied: (await tools.exec_command({ cmd: "cat copied.txt", hand: other })).output }));`],
+  "hands-settled": [() => `const settled = await Promise.allSettled(["desk", "${laptopName}"].map(hand => tools.exec_command({ cmd: "pwd", hand })));
+text(JSON.stringify(settled.map(entry => entry.status === "fulfilled" ? { ok: entry.value.output } : { error: String(entry.reason) })));`],
   "hands-latency": [() => `text("pong");`],
 };
 
@@ -115,6 +128,7 @@ const workspaces = {};
 const logs = {};
 const hands = {};
 const measurements = [];
+let laptopName;
 
 async function until(condition, detail, timeout = policy.timeout_ms * 2) {
   const begin = performance.now();
@@ -163,72 +177,58 @@ async function turn(id, scenario, hand) {
 
 const expect = (condition, detail) => { if (!condition) throw new Error(detail); };
 
-function perHand(result) {
-  const parts = (result?.text ?? "").split(/\[hand ([^\]\n]+)\]\n/);
-  const sections = {};
-  for (let index = 1; index < parts.length; index += 2) sections[parts[index]] = parts[index + 1];
-  return sections;
+function output(result) {
+  const text = result?.text ?? "";
+  return JSON.parse(text.slice(text.indexOf("Output:\n") + "Output:\n".length));
 }
 
 try {
   const base = String(await mf.ready);
   const attachStart = performance.now();
   startHand("laptop", base, false);
-  await until(async () => (await attached()).length === 1, () => `Machine-named hand did not attach: ${JSON.stringify(logs)}`);
-  const laptopName = (await attached())[0];
+  startHand("desk", base);
+  await until(async () => (await attached()).length === 2, () => `Hands did not attach: ${JSON.stringify(logs)}`);
+  laptopName = (await attached()).find(hand => hand !== "desk");
   const attachMs = performance.now() - attachStart;
 
-  const pinned = await turn("thread-pin", "hands-where", laptopName);
-  expect(pinned.results[0]?.text.includes(workspaces.laptop), `pinned turn ran elsewhere: ${JSON.stringify(pinned.results)}`);
-  const kept = await turn("thread-kept", "hands-remember");
-  expect(kept.results[0]?.text.includes("stored") && !kept.results[0].error, `turn without hand left the pin: ${JSON.stringify(kept.results)}`);
+  const listed = await turn("list", "hands-list", laptopName);
+  const listing = output(listed.results[0]);
+  expect(listing.here === laptopName && listing.hands.length === 2 && listing.hands.includes("desk"), `hand listing: ${JSON.stringify(listed.results)}`);
 
-  const deskStart = performance.now();
-  startHand("desk", base);
-  const switched = await turn("thread-desk", "hands-where", "desk");
-  const deskJoinMs = performance.now() - deskStart;
-  expect(switched.results[0]?.text.includes(workspaces.desk), `new hand turn ran elsewhere: ${JSON.stringify(switched.results)}`);
-  const back = await turn("thread-back", "hands-recall", laptopName);
-  expect(back.results[0]?.text.includes("kept-on-hand"), `returning to the first hand lost its state: ${JSON.stringify(back.results)}`);
+  const fanout = await turn("fanout", "hands-fanout", laptopName);
+  const runs = output(fanout.results[0]);
+  expect(runs.length === 2 && runs.find(run => run.hand === laptopName)?.where.includes(workspaces.laptop) && runs.find(run => run.hand === "desk")?.where.includes(workspaces.desk), `fan-out ran elsewhere: ${JSON.stringify(fanout.results)}`);
+  const overlapped = Math.max(...runs.map(run => run.started)) < Math.min(...runs.map(run => run.ended));
+  const fanoutWallMs = Math.max(...runs.map(run => run.ended)) - Math.min(...runs.map(run => run.started));
+  expect(overlapped, `hands ran one after another: ${JSON.stringify(runs)}`);
 
-  const together = await turn("thread-all", "hands-together", "*");
-  const sections = perHand(together.results[0]);
-  const spans = Object.fromEntries(Object.entries(sections).map(([hand, text]) => [hand, /"started":(\d+),"ended":(\d+)/.exec(text)?.slice(1).map(Number)]));
-  expect(Object.keys(spans).sort().join() === [laptopName, "desk"].sort().join() && Object.values(spans).every(Boolean), `every-hand turn: ${JSON.stringify(together.results)}`);
-  expect(sections[laptopName].includes(workspaces.laptop) && sections.desk.includes(workspaces.desk), `every-hand turn ran elsewhere: ${JSON.stringify(sections)}`);
-  const allStarted = Math.min(...Object.values(spans).map(span => span[0]));
-  const allEnded = Math.max(...Object.values(spans).map(span => span[1]));
-  const overlapped = Math.max(...Object.values(spans).map(span => span[0])) < Math.min(...Object.values(spans).map(span => span[1]));
-  expect(overlapped, `hands ran one after another: ${JSON.stringify(spans)}`);
+  const handoff = await turn("handoff", "hands-handoff", laptopName);
+  const handed = output(handoff.results[0]);
+  const copied = readFileSync(resolve(workspaces.desk, "copied.txt"), "utf8");
+  expect(handed.other === "desk" && copied.includes(`written on ${workspaces.laptop}`), `handoff: ${JSON.stringify(handoff.results)}`);
 
-  const listed = await turn("thread-list", "hands-where", [laptopName, "desk"]);
-  const listedSections = perHand(listed.results[0]);
-  expect(listedSections[laptopName]?.includes(workspaces.laptop) && listedSections.desk?.includes(workspaces.desk), `listed hands: ${JSON.stringify(listed.results)}`);
+  const switched = await turn("where-desk", "hands-where", "desk");
+  expect(switched.results[0]?.text.includes(workspaces.desk), `desk turn ran elsewhere: ${JSON.stringify(switched.results)}`);
+  const ambiguous = await turn("where-ambiguous", "hands-where");
+  expect(/no hand is selected/.test(ambiguous.results[0]?.text ?? ""), `turn without a hand among two: ${JSON.stringify(ambiguous.results)}`);
+  const invalid = await request("/turns", { method: "POST", body: JSON.stringify({ request_id: "invalid-hand", prompt: "Run hands-where [invalid-hand]", hand: ["desk"] }) });
+  expect(invalid.status === 400, `hand list was accepted with ${invalid.status}`);
 
   await stopHand("desk");
   const deskLeftMs = await until(async () => !(await attached()).includes("desk"), "Killed hand stayed attached");
-  const remaining = await turn("thread-all-departed", "hands-where", "*");
-  const remainingSections = perHand(remaining.results[0]);
-  expect(Object.keys(remainingSections).join() === laptopName && !remaining.results[0].error, `every-hand turn after a hand left: ${JSON.stringify(remaining.results)}`);
-  const missing = await turn("thread-list-departed", "hands-where", [laptopName, "desk"]);
-  const missingSections = perHand(missing.results[0]);
-  expect(missingSections[laptopName]?.includes(workspaces.laptop) && /not connected; nothing was dispatched/.test(missingSections.desk ?? ""), `listed hands after one left: ${JSON.stringify(missing.results)}`);
-  expect(missing.timing?.hand_wait_ms >= graceMs, `listed departed hand did not wait for its grace period: ${JSON.stringify(missing.timing)}`);
+  const settled = await turn("settled", "hands-settled", laptopName);
+  const outcomes = output(settled.results[0]);
+  expect(/hand `desk` is not attached/.test(outcomes[0]?.error ?? "") && outcomes[1]?.ok?.includes(workspaces.laptop), `calls after a hand left: ${JSON.stringify(settled.results)}`);
+  const sole = await turn("where-sole", "hands-where");
+  expect(sole.results[0]?.text.includes(workspaces.laptop), `turn without a hand beside one hand: ${JSON.stringify(sole.results)}`);
 
   const deskReturnStart = performance.now();
   logs.desk = "";
   startHand("desk", base);
   await until(async () => (await attached()).includes("desk"), () => `Hand did not reattach: ${logs.desk}`);
   const deskReturnMs = performance.now() - deskReturnStart;
-  const rejoined = await turn("thread-all-back", "hands-where", "*");
-  expect(Object.keys(perHand(rejoined.results[0])).length === 2, `every-hand turn after reattach: ${JSON.stringify(rejoined.results)}`);
-
-  const unpinned = await turn("thread-unpinned", "hands-where", null);
-  expect(/no hand is selected/.test(unpinned.results[0]?.text ?? ""), `unpinned turn: ${JSON.stringify(unpinned.results)}`);
-  const stillUnpinned = await turn("thread-still-unpinned", "hands-where");
-  expect(/no hand is selected/.test(stillUnpinned.results[0]?.text ?? ""), `turn after unpinning: ${JSON.stringify(stillUnpinned.results)}`);
-  const invalid = await request("/turns", { method: "POST", body: JSON.stringify({ request_id: "invalid-hand", prompt: "Run hands-where [invalid-hand]", hand: ["desk", "desk"] }) });
-  expect(invalid.status === 400, `duplicate hand list was accepted with ${invalid.status}`);
+  const rejoined = await turn("fanout-again", "hands-fanout", "desk");
+  expect(output(rejoined.results[0]).length === 2, `fan-out after reattach: ${JSON.stringify(rejoined.results)}`);
 
   const callback = await turn("callback", "hands-callback", laptopName);
   expect(callback.results[0]?.text.includes("agents"), `brain callback failed: ${JSON.stringify(callback.results)}`);
@@ -262,7 +262,7 @@ try {
   await new Promise(resolve => setTimeout(resolve, keepaliveMs));
   const reconnects = (logs.laptop.match(/hand: connected/g) ?? []).length;
   expect(reconnects === 1 && (await attached()).includes(laptopName), `Idle hand did not stay attached: ${logs.laptop}`);
-  const idle = await turn("where-idle", "hands-where");
+  const idle = await turn("where-idle", "hands-where", laptopName);
   expect(idle.results[0]?.text.includes(workspaces.laptop), `idle hand: ${JSON.stringify(idle.results)}`);
 
   const latencies = [];
@@ -274,24 +274,21 @@ try {
     note: "Local transport and mock provider; not production colo latency.",
     hand_build_ms: buildMs,
     machine_named_hand: laptopName,
-    attach_machine_named_hand_ms: attachMs,
-    thread: {
-      pinned_turn_ms: pinned.milliseconds,
-      unchanged_pin_turn_ms: kept.milliseconds,
-      new_hand_spawn_to_turn_complete_ms: deskJoinMs,
-      back_to_first_hand_turn_ms: back.milliseconds,
-      every_hand: { turn_ms: together.milliseconds, hands: Object.keys(spans), one_second_cells_wall_ms: allEnded - allStarted, overlapped },
-      listed_hands_turn_ms: listed.milliseconds,
-      killed_hand_detached_ms: deskLeftMs,
-      every_hand_after_departure: Object.keys(remainingSections),
-      listed_departed_hand_wait_ms: missing.timing?.hand_wait_ms,
-      reattached_ms: deskReturnMs,
-      unpinned_result: unpinned.results[0]?.text,
+    attach_two_hands_ms: attachMs,
+    one_script: {
+      fan_out_turn_ms: fanout.milliseconds,
+      fan_out_one_second_calls_wall_ms: fanoutWallMs,
+      overlapped,
+      handoff_turn_ms: handoff.milliseconds,
+      handoff_copied: copied,
     },
-    turn_ms: { callback: callback.milliseconds },
-    killed_hand_detached_ms: detachMs,
-    departed_hand_result: departed.results[0]?.text,
-    departed_hand_wait_ms: departed.timing?.hand_wait_ms,
+    killed_hand_detached_ms: deskLeftMs,
+    after_departure: outcomes,
+    reattached_ms: deskReturnMs,
+    turn_ms: { list: listed.milliseconds, desk: switched.milliseconds, sole_hand: sole.milliseconds, callback: callback.milliseconds },
+    departed_home_result: departed.results[0]?.text,
+    departed_home_wait_ms: departed.timing?.hand_wait_ms,
+    home_left_registry_ms: detachMs,
     late_hand: { submitted_before_spawn_ms: 300, spawn_to_turn_complete_ms: lateAttachedMs, hand_wait_ms: late.timing?.hand_wait_ms, turn_ms: late.milliseconds },
     reconnect_to_attached_ms: reconnectMs,
     idle_ms: keepaliveMs,

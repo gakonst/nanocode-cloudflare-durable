@@ -51,11 +51,11 @@ stop_hand() {
 }
 trap stop_hand EXIT
 if [[ $executor == here ]]; then
-  hand="*"
+  hand="cli-$(uuidgen | tr '[:upper:]' '[:lower:]' | cut -c1-8)"
   hand_log="${TMPDIR:-/tmp}/nanocode-hand-$session.log"
-  NANOCODE_RUNNER_TOKEN=$worker_token "${NANOCODE_BIN:-nanocode}" hand "wss://$origin/sessions/$session/hands" 2>"$hand_log" &
+  NANOCODE_RUNNER_TOKEN=$worker_token "${NANOCODE_BIN:-nanocode}" hand "wss://$origin/sessions/$session/hands/$hand" 2>"$hand_log" &
   hand_pid=$!
-  executor="this machine"
+  executor="$hand (this machine)"
 fi
 request_data=$(node --input-type=module -e '
 const [provider, executor, prompt, hand] = process.argv.slice(1);

@@ -16,7 +16,7 @@ use futures_util::{
 };
 use nanocode_code_mode::{
     Tool, ToolInput, ToolOutput,
-    embedded::{CodeModeExecution, CodeModeHostError, CodeModeObserver, HostFuture},
+    embedded::{CodeModeExecution, CodeModeHostError, CodeModeObserver, HandCalls, HostFuture},
     remote::{
         RemoteCodeModeHost, RemoteContext, RemoteFrame as Frame, RemoteOperation, RemoteTransport,
         deliver_update,
@@ -43,6 +43,7 @@ struct Client {
     max_frame_bytes: usize,
     timeout: Duration,
     failure: Mutex<Option<String>>,
+    hands: Mutex<Option<Arc<dyn HandCalls>>>,
 }
 
 struct WorkerTransport {
@@ -116,6 +117,7 @@ impl Client {
         input: Value,
         freeform: bool,
         context: RemoteContext,
+        hand: Option<String>,
     ) {
         let origin = context
             .call_id
@@ -127,13 +129,17 @@ impl Client {
             .lock()
             .unwrap()
             .get(&(context.session_id.clone(), origin))
-            .and_then(|state| {
-                state
-                    .tools
-                    .iter()
-                    .find(|tool| tool.definition().name() == name)
-                    .map(|tool| (Arc::clone(tool), state.context.clone()))
+            .map(|state| {
+                (
+                    state
+                        .tools
+                        .iter()
+                        .find(|tool| tool.definition().name() == name)
+                        .cloned(),
+                    state.context.clone(),
+                )
             });
+        let hands = self.hands.lock().unwrap().clone();
         let (abort, registration) = AbortHandle::new_pair();
         self.running
             .lock()
@@ -145,10 +151,21 @@ impl Client {
             let execution = Abortable::new(
                 async move {
                     let (tool, mut authoritative) = local.ok_or_else(|| {
-                        error(format!("brain callback tool `{name}` unavailable"))
+                        error(format!("brain callback origin for `{name}` unavailable"))
                     })?;
                     authoritative.call_id = context.call_id;
                     let owned = authoritative.owned();
+                    if let Some(hand) = hand {
+                        let hands = hands.ok_or_else(|| {
+                            error("this brain does not route calls between hands")
+                        })?;
+                        let output = hands.call(&hand, &name, input, owned.as_context()).await;
+                        return serde_json::to_value(output.into_wire().map_err(error)?)
+                            .map_err(error);
+                    }
+                    let tool = tool.ok_or_else(|| {
+                        error(format!("brain callback tool `{name}` unavailable"))
+                    })?;
                     let input = if freeform {
                         ToolInput::Freeform(
                             input
@@ -223,7 +240,8 @@ impl Client {
                 input,
                 freeform,
                 context,
-            } => self.callback(id, name, input, freeform, context),
+                hand,
+            } => self.callback(id, name, input, freeform, context, hand),
             _ => return Err(error("unexpected runner frame")),
         }
         wake();
@@ -343,6 +361,7 @@ pub async fn host(connection: Option<String>) -> Result<RemoteCodeModeHost, Stri
         max_frame_bytes,
         timeout: Duration::from_millis(timeout_ms),
         failure: Mutex::new(None),
+        hands: Mutex::new(None),
     });
     CLIENTS.with_borrow_mut(|clients| {
         clients.retain(|client| client.strong_count() > 0);
@@ -519,6 +538,60 @@ impl RemoteTransport for WorkerTransport {
             guard.complete = true;
             result
         })
+    }
+
+    fn call(&self, operation: RemoteOperation) -> HostFuture<'_, Result<Value, CodeModeHostError>> {
+        Box::pin(async move {
+            if let Some(failure) = self.client.failure.lock().unwrap().clone() {
+                return Err(error(format!(
+                    "{failure}; the operation was not dispatched"
+                )));
+            }
+            let id = self.client.next.fetch_add(1, Ordering::Relaxed);
+            let (sender, mut replies) = mpsc::unbounded();
+            self.client.pending.lock().unwrap().insert(id, sender);
+            let mut guard = Pending {
+                client: Arc::clone(&self.client),
+                id,
+                session_id: None,
+                origin: None,
+                complete: false,
+            };
+            self.client
+                .dispatch(Frame::Request { id, operation })
+                .map_err(|_| error("remote connection closed; the operation was not dispatched"))?;
+            let receive = pin!(async {
+                while let Some(frame) = replies.next().await {
+                    match frame {
+                        Frame::Reply { result, .. } => {
+                            return result
+                                .map_err(error)?
+                                .ok_or_else(|| error("hand omitted the tool result"));
+                        }
+                        Frame::Update { .. } => {}
+                        _ => return Err(error("unexpected operation reply")),
+                    }
+                }
+                Err(error(
+                    "remote reply channel closed; operation outcome unknown",
+                ))
+            });
+            let result = match select(receive, nanocode::platform::sleep(self.client.timeout)).await
+            {
+                Either::Left((result, _)) => result,
+                Either::Right(_) => {
+                    return Err(error(
+                        "remote operation deadline elapsed; outcome unknown; no retry",
+                    ));
+                }
+            };
+            guard.complete = true;
+            result
+        })
+    }
+
+    fn route_hands(&self, hands: Arc<dyn HandCalls>) {
+        *self.client.hands.lock().unwrap() = Some(hands);
     }
 
     fn notify(&self, operation: RemoteOperation) -> Result<(), CodeModeHostError> {

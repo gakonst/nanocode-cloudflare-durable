@@ -58,30 +58,11 @@ impl Configuration {
 }
 
 #[derive(Deserialize)]
-#[serde(untagged)]
-enum Hands {
-    One(String),
-    Many(Vec<String>),
-}
-
-impl Hands {
-    fn selection(self) -> ExecutorSelection {
-        match self {
-            Self::One(name) if name == "*" => ExecutorSelection::All,
-            Self::One(name) => ExecutorSelection::Executor(name.into()),
-            Self::Many(names) => {
-                ExecutorSelection::Executors(names.into_iter().map(Arc::from).collect())
-            }
-        }
-    }
-}
-
-#[derive(Deserialize)]
 struct Input {
     request_id: String,
     prompt: String,
     #[serde(default)]
-    hand: Option<Hands>,
+    hand: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -97,7 +78,7 @@ enum Command {
     Resume {
         request_id: String,
         #[serde(default)]
-        hand: Option<Hands>,
+        hand: Option<String>,
     },
     Attach {
         hand: String,
@@ -196,6 +177,7 @@ async fn open(config: Configuration) -> Result<Session, String> {
                 .map_err(text)?,
         ),
     };
+    let executors = CodeModeExecutors::new();
     builder = builder
         .workspace("/")
         .tools(
@@ -204,18 +186,18 @@ async fn open(config: Configuration) -> Result<Session, String> {
                 .tool(capabilities::Connections)
                 .tool(capabilities::ConnectionRequest("connector"))
                 .tool(capabilities::ConnectionRequest("vault"))
+                .tool(executors.tool())
                 .build()
                 .map_err(text)?,
         )
         .durability(store.clone());
-    let executors = CodeModeExecutors::new();
     if config.remote {
         let name: Arc<str> = config.executor.as_deref().unwrap_or("default").into();
         executors.insert(Arc::clone(&name), Arc::new(remote::host(None).await?));
         executors.set_default(Some(name));
     }
     builder = builder
-        .instructions("Code Mode runs on the hands this thread is pinned to: one machine attached to the session, several of them, or the session's configured executor. With several hands each cell runs on every one of them concurrently and its output is labelled per hand. Relative paths resolve from each hand's working directory; query pwd through the shell when an absolute path is needed.")
+        .instructions("Code Mode scripts run on one machine: the hand that sent the prompt, the only attached hand, or the session's configured executor. Inside a script any tool call runs on another attached hand when its arguments include hand: \"<name>\", so one script can work on several machines at once, for example with Promise.all; tools.hands() lists them. Relative paths resolve from each hand's working directory; query pwd through the shell when an absolute path is needed.")
         .code_mode_host(executors.clone())
         .map_err(text)?;
     let runtime = builder
@@ -386,14 +368,19 @@ impl Session {
         &self,
         request_id: &str,
         prompt: Prompt,
-        hand: Option<Hands>,
+        hand: Option<String>,
     ) -> Result<Value, String> {
         if self.busy.replace(true) {
             return Ok(waiting());
         }
         let _busy = Busy(self);
+        let names = self.executors.names();
+        let hand = hand.map(Arc::from).or_else(|| match names.as_slice() {
+            [only] if self.executors.default_executor().is_none() => Some(Arc::clone(only)),
+            _ => None,
+        });
         self.executors
-            .select(self.root(), hand.map(Hands::selection));
+            .select(self.root(), hand.map(ExecutorSelection::Executor));
         self.execute(request_id, prompt, false).await
     }
 
@@ -427,7 +414,7 @@ impl Session {
         }
     }
 
-    async fn resume(&self, request_id: &str, hand: Option<Hands>) -> Result<Value, String> {
+    async fn resume(&self, request_id: &str, hand: Option<String>) -> Result<Value, String> {
         if self.busy.get() || self.live.borrow().contains_key(request_id) {
             return Ok(waiting());
         }

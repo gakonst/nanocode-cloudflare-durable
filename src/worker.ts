@@ -5,7 +5,7 @@ import { EventHub } from "./events";
 import { RemoteExecutor } from "./remote/host";
 import { handleConnect } from "./connect/index";
 export { SubscriptionAuth } from "./auth";
-import { DEFAULT_EXECUTOR, EXECUTOR_ID, LEGACY_RUNNER, RECENT_MODEL_LIMIT, runnerConnection, headerJson, json, sessionUuid, type AgentResult, type HandSelection, type PrivateBinding, type SessionDescriptor } from "./contracts";
+import { DEFAULT_EXECUTOR, EXECUTOR_ID, LEGACY_RUNNER, RECENT_MODEL_LIMIT, runnerConnection, headerJson, json, sessionUuid, type AgentResult, type PrivateBinding, type SessionDescriptor } from "./contracts";
 import { Timings, timingDifference, type TimingSnapshot } from "./timing";
 
 export interface Env {
@@ -102,7 +102,7 @@ export class AgentSession extends DurableObject<Env> {
   private readonly hands = new Map<string, Map<string, { connection: string; executor: RemoteExecutor; ready: boolean }>>();
   private readonly connections = new Map<string, RemoteExecutor>();
   private nextConnection = 0;
-  private handWait?: { scope: string; selection: HandSelection; resolve(): void };
+  private handWait?: { scope: string; hand: string; resolve(): void };
   private running?: Running;
   private pumping = false;
   private readonly eventHub = new EventHub();
@@ -166,9 +166,8 @@ export class AgentSession extends DurableObject<Env> {
       if (input.request_id.startsWith("subagent-completion:")) return json({ error: "request_id prefix is reserved" }, 400);
       if (input.provider !== undefined && input.provider !== "claude" && input.provider !== "codex") return json({ error: "provider must be claude or codex" }, 400);
       if (input.executor !== undefined && (typeof input.executor !== "string" || !EXECUTOR_ID.test(input.executor))) return json({ error: "invalid executor" }, 400);
-      const named: unknown[] = input.hand === "*" || input.hand == null ? [] : Array.isArray(input.hand) ? input.hand : [input.hand];
-      if (!named.every(handName) || (Array.isArray(input.hand) && (!named.length || new Set(named).size !== named.length))) return json({ error: "hand must be a hand name, \"*\" for every attached hand, a list of distinct names, or null" }, 400);
-      if (descriptor.grant_id && named.some(hand => !descriptor.connections?.includes(runnerConnection(hand)))) return json({ error: "hand is not selected by this grant" }, 403);
+      if (input.hand !== undefined && !handName(input.hand)) return json({ error: "hand must be the name of an attached hand" }, 400);
+      if (input.hand !== undefined && descriptor.grant_id && !descriptor.connections?.includes(runnerConnection(input.hand))) return json({ error: "hand is not selected by this grant" }, 403);
       const streaming = request.headers.get("accept")?.includes("text/event-stream");
       if (streaming) {
         const after = Number(url.searchParams.get("after") ?? "0");
@@ -184,9 +183,7 @@ export class AgentSession extends DurableObject<Env> {
       const executor = input.executor ?? boundExecutor ?? legacyExecutor;
       if (executor && descriptor.grant_id && !descriptor.connections?.includes(runnerConnection(executor)) && !(executor === DEFAULT_EXECUTOR && descriptor.connections?.includes(LEGACY_RUNNER))) return json({ error: "executor is not selected by this grant" }, 403);
       descriptor.executor_id = executor || undefined;
-      const handKey = `hand:${scope}`;
-      const pinned = this.store.row("SELECT value FROM metadata WHERE key = ?", handKey)?.value as string | undefined;
-      descriptor.hand = input.hand === undefined ? pinned && JSON.parse(pinned) : input.hand ?? undefined;
+      descriptor.hand = input.hand;
       const providerKey = `model_provider:${scope}`;
       const boundProvider = this.store.row("SELECT value FROM metadata WHERE key = ?", providerKey)?.value
         ?? (this.store.row("SELECT value FROM metadata WHERE key = ?", scope === "owner" ? "session_id" : `session_id:${scope}`) ? "claude" : undefined);
@@ -195,7 +192,7 @@ export class AgentSession extends DurableObject<Env> {
       if (descriptor.provider === "codex" && descriptor.session_id && descriptor.session_id[14] !== "7") return json({ error: "Codex requires a new thread with a UUIDv7 session" }, 409);
       if (descriptor.provider === "codex") descriptor.subscription = true;
       const existing = this.job(input.request_id);
-      if (existing && (existing.prompt !== input.prompt || existing.scope !== scope || (input.hand !== undefined && JSON.stringify(this.descriptor(existing).hand ?? null) !== JSON.stringify(input.hand)))) return json({ error: "request_id already belongs to different input or authority" }, 409);
+      if (existing && (existing.prompt !== input.prompt || existing.scope !== scope || this.descriptor(existing).hand !== input.hand)) return json({ error: "request_id already belongs to different input or authority" }, 409);
       if (!existing) {
         policy(this.env.RECOVERY_DELAY_MS, "RECOVERY_DELAY_MS");
         this.ctx.storage.transactionSync(() => {
@@ -204,8 +201,6 @@ export class AgentSession extends DurableObject<Env> {
           if (!current) this.ctx.storage.sql.exec("INSERT INTO metadata VALUES ('authority', ?)", identity);
           this.ctx.storage.sql.exec("INSERT INTO metadata VALUES (?, ?) ON CONFLICT(key) DO NOTHING", providerKey, descriptor.provider!);
           this.ctx.storage.sql.exec("INSERT INTO metadata VALUES (?, ?) ON CONFLICT(key) DO NOTHING", executorKey, executor);
-          if (input.hand === null) this.ctx.storage.sql.exec("DELETE FROM metadata WHERE key = ?", handKey);
-          else if (input.hand !== undefined) this.ctx.storage.sql.exec("INSERT INTO metadata VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", handKey, JSON.stringify(input.hand));
           this.sessionId(scope, descriptor.session_id);
           this.ctx.storage.sql.exec("INSERT INTO metadata VALUES (?, ?) ON CONFLICT(key) DO NOTHING", `background:${scope}`, JSON.stringify(descriptor));
           this.ctx.storage.sql.exec("INSERT INTO jobs (request_id, prompt, status, result, scope, descriptor, cancel_requested) VALUES (?, ?, 'queued', NULL, ?, ?, 0)", input.request_id, input.prompt, scope, JSON.stringify(descriptor));
@@ -328,7 +323,7 @@ export class AgentSession extends DurableObject<Env> {
           if (turnTiming) turnTiming.running_sync_ms = performance.now() - runningSync;
           const hand = this.descriptor(activeJob).hand;
           if (hand && !activeJob.cancel_requested) {
-            const waited = await this.awaitHands(scope, hand);
+            const waited = await this.awaitHand(scope, hand);
             if (turnTiming) turnTiming.hand_wait_ms = waited;
           }
           const latest = this.job(activeJob.request_id)!;
@@ -340,7 +335,7 @@ export class AgentSession extends DurableObject<Env> {
           if (!result.waiting) this.finish(activeJob, result);
         } else if (first) {
           const hand = pendingJob ? this.descriptor(pendingJob).hand : undefined;
-          if (hand) await this.awaitHands(scope, hand);
+          if (hand) await this.awaitHand(scope, hand);
           const result = await runtime.resume(first, hand);
           if (result.retry) throw new Error("runtime recovery required");
           waiting = !!result.waiting;
@@ -510,22 +505,16 @@ export class AgentSession extends DurableObject<Env> {
     const entry = hands.get(hand);
     if (entry?.connection !== connection) return;
     entry.ready = true;
-    if (this.handWait?.scope === scope && this.handsReady(scope, this.handWait.selection)) this.handWait.resolve();
+    if (this.handWait?.scope === scope && this.handWait.hand === hand) this.handWait.resolve();
   }
 
-  private handsReady(scope: string, selection: HandSelection): boolean {
-    const hands = this.hands.get(scope);
-    if (selection === "*") return [...(hands?.values() ?? [])].some(entry => entry.ready);
-    return (Array.isArray(selection) ? selection : [selection]).every(hand => hands?.get(hand)?.ready);
-  }
-
-  private async awaitHands(scope: string, selection: HandSelection): Promise<number> {
-    if (this.handsReady(scope, selection)) return 0;
+  private async awaitHand(scope: string, hand: string): Promise<number> {
+    if (this.hands.get(scope)?.get(hand)?.ready) return 0;
     const started = performance.now();
     const grace = policy(this.env.HANDS_ATTACH_GRACE_MS, "HANDS_ATTACH_GRACE_MS");
     let timer: number | undefined;
     await new Promise<void>(resolve => {
-      this.handWait = { scope, selection, resolve };
+      this.handWait = { scope, hand, resolve };
       timer = setTimeout(resolve, grace);
     });
     if (timer !== undefined) clearTimeout(timer);
