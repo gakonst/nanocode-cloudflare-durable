@@ -17,7 +17,7 @@ use std::{
 
 use nanocode::{
     Agent, ClaudeClient, ClaudeModel, CodeModeExecutors, CodeModeHost, ExecutionPolicyDisposition,
-    ExecutorSelection, Model, ModelSelection, Nanocodex, NanocodexError, OpenAi, PromptRequest,
+    ExecutorSelection, Model, ModelSelection, Nanocode, NanocodeError, OpenAi, PromptRequest,
     Tools, TurnControl,
     backend::Prompt,
     codex::{OpenAiAuth, transport::ResponsesTransport},
@@ -116,7 +116,7 @@ enum Command {
 }
 
 struct Session {
-    runtime: Nanocodex,
+    runtime: Nanocode,
     executors: CodeModeExecutors,
     hands: RefCell<HashMap<String, (String, Arc<dyn CodeModeHost>)>>,
     agent: Agent,
@@ -173,7 +173,7 @@ async fn open(config: Configuration) -> Result<Session, String> {
             .await
             .map_err(text)?;
     }
-    let mut builder = Nanocodex::builder();
+    let mut builder = Nanocode::builder();
     builder = match config.provider {
         Provider::Claude => {
             let http = nanocode::claude::transport::HttpClient::new(transport::WorkerTransport);
@@ -322,7 +322,7 @@ impl Session {
         request_id: &str,
         prompt: Prompt,
         cancel: bool,
-    ) -> Result<String, NanocodexError> {
+    ) -> Result<String, NanocodeError> {
         let mut request = PromptRequest::new(prompt).request_id(request_id);
         if cancel || self.cancelled.borrow().contains(request_id) {
             request = request.cancel_on_admission();
@@ -375,7 +375,7 @@ impl Session {
             Ok(Some(TurnStatus::Failed)) => json!({"error": error.to_string()}),
             Ok(Some(TurnStatus::Cancelled)) => json!({"cancelled": true}),
             Ok(Some(TurnStatus::Pending) | None) if blocked => waiting(),
-            Ok(None) if matches!(error, NanocodexError::InvalidRequest(_)) => {
+            Ok(None) if matches!(error, NanocodeError::InvalidRequest(_)) => {
                 json!({"error": error.to_string()})
             }
             _ => json!({"retry": true}),
@@ -531,9 +531,9 @@ impl Session {
     }
 }
 
-fn ignore_inactive(result: Result<(), NanocodexError>) -> Result<(), NanocodexError> {
+fn ignore_inactive(result: Result<(), NanocodeError>) -> Result<(), NanocodeError> {
     match result {
-        Err(NanocodexError::TurnNotCancellable) => Ok(()),
+        Err(NanocodeError::TurnNotCancellable) => Ok(()),
         other => other,
     }
 }

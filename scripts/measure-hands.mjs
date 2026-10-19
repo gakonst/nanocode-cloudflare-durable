@@ -6,7 +6,7 @@ import { performance } from "node:perf_hooks";
 import { localOptions } from "./local-runtime.mjs";
 
 const sdk = resolve(process.env.NANOCODE_SDK_PATH ?? "../nanocodex");
-const binary = resolve(process.env.CARGO_TARGET_DIR ?? resolve(sdk, "target"), "debug/nanocodex");
+const binary = resolve(process.env.CARGO_TARGET_DIR ?? resolve(sdk, "target"), "debug/nanocode");
 const policy = { max_frame_bytes: 1048576, timeout_ms: 30000 };
 const keepaliveMs = Number(process.env.HANDS_KEEPALIVE_MS ?? "45000");
 const graceMs = 2000;
@@ -28,9 +28,9 @@ for (const signal of ["SIGINT", "SIGTERM"]) process.on(signal, () => { stopHands
 
 function buildHand() {
   const start = performance.now();
-  const result = spawnSync("cargo", ["build", "--locked", "-p", "nanocodex", "--bin", "nanocodex"], { cwd: sdk, stdio: "inherit" });
+  const result = spawnSync("cargo", ["build", "--locked", "-p", "nanocode-cli", "--bin", "nanocode"], { cwd: sdk, stdio: "inherit" });
   if (result.error) throw result.error;
-  if (result.status !== 0) throw new Error("nanocodex build failed");
+  if (result.status !== 0) throw new Error("nanocode build failed");
   return performance.now() - start;
 }
 
@@ -270,7 +270,7 @@ try {
   latencies.sort((a, b) => a - b);
 
   const report = {
-    runtime: "local workerd (Miniflare) public + egress Workers, nanocodex hand processes dialing the session Durable Object over loopback",
+    runtime: "local workerd (Miniflare) public + egress Workers, nanocode hand processes dialing the session Durable Object over loopback",
     note: "Local transport and mock provider; not production colo latency.",
     hand_build_ms: buildMs,
     machine_named_hand: laptopName,
