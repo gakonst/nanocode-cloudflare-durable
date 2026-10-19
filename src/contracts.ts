@@ -52,6 +52,8 @@ export type ModelDispatch = {
   subscription: boolean;
 };
 
+export type SocketDispatch = Pick<ModelDispatch, "provider" | "authority" | "headers">;
+
 export type AuthorityCommand = {
   op: string;
   account_id: string;
@@ -94,6 +96,7 @@ export const RECENT_MODEL_LIMIT = 64;
 
 export type ModelTiming = {
   dispatch_id: number;
+  transport?: "websocket";
   started_ms: number;
   headers_ms?: number;
   first_byte_ms?: number;
@@ -102,6 +105,7 @@ export type ModelTiming = {
   body_reads: number;
   bytes: number;
   max_chunk_gap_ms: number;
+  sends?: number;
   duration_ms?: number;
   status?: number;
   outcome?: "eof" | "closed" | "cancelled" | "failed";
@@ -114,6 +118,10 @@ export type RuntimeOptions = {
   event(value: unknown): Promise<void>;
   events?(values: unknown[]): Promise<void>;
   connection?(request: { kind?: string; input?: unknown; op: string }): Promise<unknown>;
+  socket?: {
+    open(request: { headers: [string, string][] }, signal: AbortSignal, timing: ModelTiming & { runtime_id: string }): Promise<Response>;
+    admit(): Promise<void>;
+  };
   remote?: {
     failed?(): boolean;
     execute(request: unknown, id: number): Promise<unknown>;

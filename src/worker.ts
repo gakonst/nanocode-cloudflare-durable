@@ -454,6 +454,15 @@ export class AgentSession extends DurableObject<Env> {
           const response = await this.env.EGRESS.fetch(new Request(`https://egress.internal/${catalog ? "connections" : "connector"}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ ...(request.input && typeof request.input === "object" ? request.input : {}), authority, kind: request.kind }) }));
           return response.json();
         },
+        socket: {
+          open: async (request, signal, timing) => {
+            await this.socketEffect(scope, descriptor);
+            const response = await this.env.EGRESS.fetch(new Request("https://egress.internal/socket", { signal, headers: { upgrade: "websocket", "x-nanocode-socket": headerJson({ authority, provider: descriptor.provider ?? "claude", headers: request.headers }) } }));
+            this.socketDiagnostic(scope, response.headers.get("x-nanocode-model-diagnostic"), timing);
+            return response;
+          },
+          admit: () => this.socketEffect(scope, descriptor),
+        },
       });
           for (const [hand, entry] of this.hands.get(scope) ?? []) await created.attach(hand, entry.connection).catch(() => {});
           return created;
@@ -576,6 +585,21 @@ export class AgentSession extends DurableObject<Env> {
     if (!this.pumping && last) await this.ctx.storage.setAlarm(Date.now());
     await this.ctx.storage.sync();
     return json({ ok: true, revision: input.revision });
+  }
+
+  private async socketEffect(scope: string, descriptor: SessionDescriptor): Promise<void> {
+    await this.durable(scope);
+    if (this.dispatchBlocked(scope, descriptor)) throw new Error("request authority stopped");
+  }
+
+  private socketDiagnostic(scope: string, header: string | null, timing: { runtime_id: string; dispatch_id: number; diagnostic?: unknown }): void {
+    if (!header) return;
+    try {
+      const value = JSON.parse(header);
+      timing.diagnostic = value;
+      this.modelDiagnostics.push({ scope, value: { ...value, runtime_id: timing.runtime_id, dispatch_id: timing.dispatch_id } });
+      if (this.modelDiagnostics.length > RECENT_MODEL_LIMIT) this.modelDiagnostics.shift();
+    } catch {}
   }
 
   private dispatchBlocked(scope: string, descriptor: SessionDescriptor): boolean {

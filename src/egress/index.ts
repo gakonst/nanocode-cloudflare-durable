@@ -1,7 +1,7 @@
 import { WorkerEntrypoint } from "cloudflare:workers";
-import { json, sessionUuid, type AuthorityCommand, type AuthorityResult, type ModelDispatch, type ModelProvider, type SessionAuthority } from "../contracts";
+import { json, sessionUuid, type AuthorityCommand, type AuthorityResult, type ModelDispatch, type ModelProvider, type SessionAuthority, type SocketDispatch } from "../contracts";
 import { AccountAuthority, type Access, type ServiceAccess, type ServiceRequest } from "./account";
-import { modelFetch } from "./model-transport";
+import { modelFetch, socketFetch } from "./model-transport";
 import { ACCOUNT_PATTERN, CODEX, connections, encoder, Failure, FORBIDDEN_HEADERS, mode, modelAccount, modelEndpoint, modelProvider, readLimited, setting, SUBSCRIPTION, type Connection, type EgressEnv } from "./common";
 
 export { AccountAuthority };
@@ -12,6 +12,7 @@ const PUBLIC_OPS = new Set(["health", "register_client", "create_grant", "author
 const MODEL_REQUEST_HEADER = /^(accept|content-type|anthropic-version|anthropic-beta|anthropic-dangerous-direct-browser-access|user-agent|x-app|x-claude-code-session-id|x-stainless-[a-z0-9-]{1,64})$/;
 const MODEL_RESPONSE_HEADER = /^(content-type|request-id|retry-after|x-should-retry|anthropic-ratelimit-[a-z0-9-]{1,64})$/;
 const CODEX_REQUEST_HEADER = /^(accept|content-type|user-agent|originator|version|openai-beta|session-id|thread-id|x-client-request-id|x-codex-turn-state|x-codex-turn-metadata|x-openai-internal-codex-responses-lite)$/;
+const CODEX_SOCKET_HEADER = /^(user-agent|originator|version|openai-beta|session-id|thread-id|x-client-request-id|x-codex-turn-state|x-codex-turn-metadata|x-openai-internal-codex-responses-lite|x-responsesapi-include-timing-metrics)$/;
 const CODEX_RESPONSE_HEADER = /^(content-type|retry-after|x-request-id|x-oai-request-id|openai-model|openai-processing-ms|x-reasoning-included|x-models-etag|x-codex-[a-z0-9-]{1,64})$/;
 const PROVIDER_ERRORS = new Set(["invalid_request_error", "authentication_error", "permission_error", "not_found_error", "request_too_large", "rate_limit_error", "api_error", "overloaded_error", "timeout_error", "billing_error"]);
 const CODEX_ERROR_CODES = new Set(["context_length_exceeded", "insufficient_quota", "usage_not_included", "cyber_policy", "misalignment_policy_violation", "invalid_prompt", "bio_policy", "usage_limit_reached", "rate_limit_exceeded", "invalid_function_parameters", "previous_response_not_found", "invalid_encrypted_content", "server_error", "server_is_overloaded", "slow_down", "websocket_connection_limit_reached", "temporarily_unavailable", "model_not_found"]);
@@ -32,10 +33,11 @@ type CredentialOutcome = "none" | "hit" | "miss" | "coalesced" | "refresh" | "re
 type TransportKind = "direct" | "fixed_binding";
 type AttemptPhase = "authority" | "transport" | "discard" | "projection";
 type AttemptDiagnostic = { attempt: 1 | 2; status: number; origin: DiagnosticOrigin; credential: CredentialOutcome; transport: TransportKind; auth_lookup_ms: number; fetch_header_ms: number; discard_ms: number; error_projection_ms: number; mime: DiagnosticMime; mitigated: boolean; auth_error: boolean; request_id: boolean; error: string };
-type ModelDiagnostic = { provider: "claude" | "codex"; attempt: 1 | 2; status: number; origin: DiagnosticOrigin; auth_lookup_ms: number; fetch_header_ms: number; error_projection_ms: number; mime: DiagnosticMime; mitigated: boolean; auth_error: boolean; request_id: boolean; credential: CredentialOutcome; transport: TransportKind; request_ms: number; total_ms: number; retried: boolean; rotated: boolean; error: string; attempts: AttemptDiagnostic[] };
+type ModelDiagnostic = { provider: "claude" | "codex"; websocket: boolean; attempt: 1 | 2; status: number; origin: DiagnosticOrigin; auth_lookup_ms: number; fetch_header_ms: number; error_projection_ms: number; mime: DiagnosticMime; mitigated: boolean; auth_error: boolean; request_id: boolean; credential: CredentialOutcome; transport: TransportKind; request_ms: number; total_ms: number; retried: boolean; rotated: boolean; error: string; attempts: AttemptDiagnostic[] };
 
 const metrics = {
   model_requests: 0,
+  model_sockets: 0,
   model_cache_hits: 0,
   model_cache_misses: 0,
   model_coalesced: 0,
@@ -98,10 +100,10 @@ function attemptValue(trace: AttemptDiagnostic): AttemptDiagnostic {
   return { attempt: trace.attempt === 2 ? 2 : 1, status: statusOf(trace.status), origin: trace.origin, credential: CREDENTIAL_OUTCOMES.has(trace.credential) ? trace.credential : "none", transport: trace.transport === "fixed_binding" ? "fixed_binding" : "direct", auth_lookup_ms: milliseconds(trace.auth_lookup_ms), fetch_header_ms: milliseconds(trace.fetch_header_ms), discard_ms: milliseconds(trace.discard_ms), error_projection_ms: milliseconds(trace.error_projection_ms), mime: trace.mime, mitigated: trace.mitigated === true, auth_error: trace.auth_error === true, request_id: trace.request_id === true, error: errorOf(trace.error) };
 }
 
-function diagnosticValue(provider: ModelProvider, attempts: AttemptDiagnostic[], request_ms: number, total_ms: number, rotated: boolean): ModelDiagnostic {
+function diagnosticValue(provider: ModelProvider, attempts: AttemptDiagnostic[], request_ms: number, total_ms: number, rotated: boolean, websocket = false): ModelDiagnostic {
   const values = attempts.slice(0, 2).map(attemptValue);
   const last = values[values.length - 1] ?? attemptValue(attemptDiagnostic(1, "local_validation", "direct"));
-  return { provider: provider === "codex" ? "codex" : "claude", attempt: last.attempt, status: last.status, origin: last.origin, auth_lookup_ms: last.auth_lookup_ms, fetch_header_ms: last.fetch_header_ms, error_projection_ms: last.error_projection_ms, mime: last.mime, mitigated: last.mitigated, auth_error: last.auth_error, request_id: last.request_id, credential: last.credential, transport: last.transport, request_ms: milliseconds(request_ms), total_ms: milliseconds(total_ms), retried: values.length > 1, rotated: rotated === true, error: last.error, attempts: values };
+  return { provider: provider === "codex" ? "codex" : "claude", websocket: websocket === true, attempt: last.attempt, status: last.status, origin: last.origin, auth_lookup_ms: last.auth_lookup_ms, fetch_header_ms: last.fetch_header_ms, error_projection_ms: last.error_projection_ms, mime: last.mime, mitigated: last.mitigated, auth_error: last.auth_error, request_id: last.request_id, credential: last.credential, transport: last.transport, request_ms: milliseconds(request_ms), total_ms: milliseconds(total_ms), retried: values.length > 1, rotated: rotated === true, error: last.error, attempts: values };
 }
 
 function record(trace: ModelDiagnostic): void {
@@ -112,7 +114,7 @@ function record(trace: ModelDiagnostic): void {
 function modelResponse(response: Response, trace: ModelDiagnostic): Response {
   const headers = new Headers(response.headers);
   headers.set("x-nanocode-model-diagnostic", JSON.stringify(trace));
-  return new Response(response.body, { status: response.status, statusText: response.statusText, headers });
+  return new Response(response.body, { status: response.status, statusText: response.statusText, headers, webSocket: response.webSocket });
 }
 
 function account(env: EgressEnv, id: string) {
@@ -226,15 +228,20 @@ function modelHeaders(input: unknown, subscription: boolean): Headers {
   return headers;
 }
 
-function codexHeaders(input: unknown): Headers {
+function codexAllowed(input: unknown, allowed: RegExp): Headers {
   if (!Array.isArray(input) || input.length > 128) throw new Failure(400, "invalid_request");
   const headers = new Headers();
   for (const pair of input) {
     if (!Array.isArray(pair) || pair.length !== 2 || typeof pair[0] !== "string" || typeof pair[1] !== "string") throw new Failure(400, "invalid_request");
     const name = pair[0].toLowerCase();
-    if (!CODEX_REQUEST_HEADER.test(name)) continue;
+    if (!allowed.test(name)) continue;
     try { headers.set(name, pair[1]); } catch { throw new Failure(400, "invalid_request"); }
   }
+  return headers;
+}
+
+function codexHeaders(input: unknown): Headers {
+  const headers = codexAllowed(input, CODEX_REQUEST_HEADER);
   headers.set("content-type", "application/json");
   if (!headers.has("accept")) headers.set("accept", "text/event-stream");
   return headers;
@@ -245,6 +252,13 @@ function sendModel(env: EgressEnv, provider: ModelProvider, endpoint: string, he
   for (const [name, value] of access.headers) outgoing.set(name, value);
   const request = new Request(endpoint, { method: "POST", headers: outgoing, body, redirect: "manual", signal });
   return modelFetch(request, outgoing => provider === "codex" && env.CODEX_TRANSPORT ? env.CODEX_TRANSPORT.fetch(outgoing) : fetch(outgoing), setting(env, "MODEL_RESPONSE_HEADERS_TIMEOUT_MS"), setting(env, "MODEL_STREAM_IDLE_TIMEOUT_MS"), () => { metrics.model_timeouts++; });
+}
+
+function sendSocket(env: EgressEnv, headers: Headers, access: Granted, signal: AbortSignal): Promise<Response> {
+  const outgoing = new Headers(headers);
+  for (const [name, value] of access.headers) outgoing.set(name, value);
+  const request = new Request(CODEX.endpoint, { headers: outgoing, redirect: "manual", signal });
+  return socketFetch(request, outgoing => env.CODEX_TRANSPORT ? env.CODEX_TRANSPORT.fetch(outgoing) : fetch(outgoing), setting(env, "MODEL_RESPONSE_HEADERS_TIMEOUT_MS"), () => { metrics.model_timeouts++; });
 }
 
 function codexDetail(parsed: any): Record<string, unknown> {
@@ -291,9 +305,105 @@ async function projectModel(response: Response, provider: ModelProvider = "claud
   return providerError(response.status, type, "Provider request failed", response.headers.get("retry-after"));
 }
 
+async function projectSocket(response: Response): Promise<Response> {
+  if (response.status >= 300) return projectModel(response, "codex");
+  metrics.model_provider_errors++;
+  await response.body?.cancel();
+  return codexError(502, { type: "api_error", message: "Provider did not upgrade the connection" });
+}
+
+async function openSocket(env: EgressEnv, request: Request): Promise<Response> {
+  const entered = clock();
+  metrics.model_sockets++;
+  const transport: TransportKind = env.CODEX_TRANSPORT ? "fixed_binding" : "direct";
+  const attempts: AttemptDiagnostic[] = [];
+  let request_ms = -1;
+  let rotated = false;
+  let mark = entered;
+  const finish = (response: Response): Response => {
+    const total_ms = elapsed(entered);
+    const trace = diagnosticValue("codex", attempts, request_ms < 0 ? total_ms : request_ms, total_ms, rotated, true);
+    record(trace);
+    return modelResponse(response, trace);
+  };
+  try {
+    let dispatch: SocketDispatch;
+    try { dispatch = JSON.parse(request.headers.get("x-nanocode-socket") ?? ""); } catch { throw new Failure(400, "invalid_request"); }
+    if (request.headers.get("upgrade")?.toLowerCase() !== "websocket" || !dispatch || typeof dispatch !== "object") throw new Failure(400, "invalid_request");
+    if (modelProvider(dispatch.provider) !== "codex") throw new Failure(400, "unsupported_provider");
+    const authority = authorityOf(dispatch.authority);
+    if (!env.CODEX_OAUTH_JSON) throw new Failure(500, "configuration_error");
+    const headers = codexAllowed(dispatch.headers, CODEX_SOCKET_HEADER);
+    headers.set("upgrade", "websocket");
+    const idle = setting(env, "MODEL_STREAM_IDLE_TIMEOUT_MS");
+    request_ms = elapsed(entered);
+    let previous: Granted | undefined;
+    for (;;) {
+      const trace = attemptDiagnostic(previous ? 2 : 1, "authority", transport);
+      attempts.push(trace);
+      mark = clock();
+      const access = await resolveModel(env, authority, "codex", previous?.generation, outcome => { trace.credential = outcome; });
+      trace.auth_lookup_ms = elapsed(mark);
+      if (!access.ok) {
+        trace.status = statusOf(access.status);
+        trace.error = errorOf(access.error);
+        return finish(egressError(access, "codex"));
+      }
+      if (previous) {
+        if (access.generation === previous.generation) {
+          trace.status = 401;
+          trace.error = "credential_unchanged";
+          return finish(codexError(401, { type: "authentication_error", message: "Provider request failed" }));
+        }
+        rotated = true;
+        metrics.model_recoveries++;
+      }
+      trace.origin = "transport";
+      mark = clock();
+      const response = await sendSocket(env, headers, access, request.signal);
+      trace.fetch_header_ms = elapsed(mark);
+      classify(trace, response);
+      if (response.status === 101 && response.webSocket) {
+        const allowed = new Headers({ "cache-control": "no-store", "x-nanocode-stream-idle-ms": String(idle) });
+        for (const [name, value] of response.headers) if (CODEX_RESPONSE_HEADER.test(name)) allowed.set(name, value);
+        return finish(new Response(null, { status: 101, headers: allowed, webSocket: response.webSocket }));
+      }
+      if (response.status !== 401 || previous) {
+        const key = cacheKey(authority, "codex");
+        if (response.status === 401 && cache.get(key)?.access.generation === access.generation) cache.delete(key);
+        mark = clock();
+        const projected = await projectSocket(response);
+        trace.error_projection_ms = elapsed(mark);
+        return finish(projected);
+      }
+      metrics.model_unauthorized++;
+      mark = clock();
+      await response.body?.cancel();
+      trace.discard_ms = elapsed(mark);
+      previous = access;
+    }
+  } catch (error) {
+    const failure = denial(error);
+    const trace = attempts[attempts.length - 1];
+    if (trace) {
+      if (trace.origin === "transport" && trace.status === 0) trace.fetch_header_ms = elapsed(mark);
+      trace.status = statusOf(failure.status);
+      trace.error = errorOf(failure.error);
+    } else {
+      if (request_ms < 0) request_ms = elapsed(entered);
+      const local = attemptDiagnostic(1, "local_validation", transport);
+      local.status = statusOf(failure.status);
+      local.error = errorOf(failure.error);
+      attempts.push(local);
+    }
+    return finish(egressError(failure, "codex"));
+  }
+}
+
 export class SessionEgress extends WorkerEntrypoint<EgressEnv> {
   async fetch(request: Request): Promise<Response> {
     if (request.method === "GET") {
+      if (new URL(request.url).pathname === "/socket") return openSocket(this.env, request);
       if (new URL(request.url).pathname === "/probe/codex") {
         const id = sessionUuid();
         const access = await resolveModel(this.env, { account_id: modelAccount(this.env), session_id: id }, "codex");

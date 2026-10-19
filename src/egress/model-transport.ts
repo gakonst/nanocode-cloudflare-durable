@@ -33,6 +33,26 @@ function bounded<T>(pending: Promise<T>, milliseconds: number, signal: AbortSign
   });
 }
 
+export async function socketFetch(request: Request, send: (request: Request) => Promise<Response>, headersMs: number, timedOut: () => void): Promise<Response> {
+  if (!Number.isSafeInteger(headersMs) || headersMs <= 0 || headersMs > 2_147_483_647) throw new Failure(500, "configuration_error");
+  const controller = new AbortController();
+  const abort = () => controller.abort();
+  request.signal.addEventListener("abort", abort, { once: true });
+  if (request.signal.aborted) abort();
+  try {
+    if (controller.signal.aborted) throw new Failure(502, "upstream_cancelled");
+    return await bounded(send(new Request(request, { signal: controller.signal })), headersMs, controller.signal, () => { timedOut(); abort(); }, late => {
+      if (late.webSocket) { late.webSocket.accept(); late.webSocket.close(1000, "handshake deadline elapsed"); }
+      else void late.body?.cancel().catch(() => {});
+    });
+  } catch (error) {
+    abort();
+    throw error instanceof Failure ? error : new Failure(502, "upstream_unavailable");
+  } finally {
+    request.signal.removeEventListener("abort", abort);
+  }
+}
+
 export async function modelFetch(request: Request, send: (request: Request) => Promise<Response>, headersMs: number, idleMs: number, timedOut: () => void): Promise<Response> {
   for (const value of [headersMs, idleMs]) if (!Number.isSafeInteger(value) || value <= 0 || value > 2_147_483_647) throw new Failure(500, "configuration_error");
   const controller = new AbortController();

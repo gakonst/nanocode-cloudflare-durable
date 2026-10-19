@@ -52,7 +52,7 @@ pub enum Reply {
     Bytes(Vec<u8>),
 }
 
-async fn request(request: Value) -> Reply {
+pub async fn request(request: Value) -> Reply {
     let id = NEXT.with_borrow_mut(|next| {
         *next = next
             .checked_add(1)

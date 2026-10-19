@@ -14,6 +14,8 @@ type Exports = {
 
 type Pending = { resolve(value: unknown): void; reject(reason: unknown): void };
 
+type Socket = { socket: WebSocket; idle: number; frames: (string | null)[]; closed?: string; waiter?: { id: number; resolve(value: unknown): void }; watchers: (() => void)[]; timing: ModelTiming };
+
 export type TurnOutcome = AgentResult & { waiting?: boolean };
 
 export type RuntimeActivity = { pending: string[]; quiescent: boolean; activity: unknown };
@@ -33,6 +35,9 @@ export type RuntimeMetrics = {
   host_calls: number;
   store_calls: number;
   model_requests: number;
+  model_sockets: number;
+  socket_sends: number;
+  socket_frames: number;
   body_reads: number;
   event_batches: number;
   events: number;
@@ -57,15 +62,17 @@ export class AgentRuntime {
   private readonly decoder = new TextDecoder();
   private readonly inflight = new Map<number, () => void>();
   private readonly bodies = new Map<number, { reader: ReadableStreamDefaultReader<Uint8Array>; timing: ModelTiming }>();
+  private readonly sockets = new Map<number, Socket>();
   private readonly commands = new Map<number, Pending>();
   private readonly watchers = new Set<() => void>();
   private readonly counters: Omit<RuntimeMetrics, "timing"> = {
     initializations: 0, runs: 0, completed: 0, failed: 0, cancelled: 0, retries: 0, waits: 0, resumes: 0, rejected_runs: 0, cancellations: 0,
-    host_calls: 0, store_calls: 0, model_requests: 0, body_reads: 0, event_batches: 0, events: 0,
+    host_calls: 0, store_calls: 0, model_requests: 0, model_sockets: 0, socket_sends: 0, socket_frames: 0, body_reads: 0, event_batches: 0, events: 0,
     host_cancellations: 0, dropped_replies: 0, disposals: 0,
     bridge_request_bytes: 0, bridge_reply_bytes: 0,
   };
   private nextBody = 0;
+  private nextSocket = 0;
   private nextCommand = 0;
   private depth = 0;
   private stopped = false;
@@ -155,7 +162,8 @@ export class AgentRuntime {
   }
 
   async revoke(): Promise<void> {
-    await this.command({ op: "revoke" });
+    try { await this.command({ op: "revoke" }); }
+    finally { this.closeSockets("runtime revoked", "cancelled"); }
   }
 
   changed(signal?: AbortSignal): Promise<void> {
@@ -347,6 +355,83 @@ export class AgentRuntime {
         }
         return null;
       }
+      case "socket_open": {
+        if (!this.options.socket) throw new Error("model sockets are not configured");
+        this.counters.model_sockets++;
+        const controller = new AbortController();
+        this.onCancel(id, () => controller.abort());
+        const timing: ModelTiming & { runtime_id: string } = { runtime_id: this.runtimeId, dispatch_id: id, transport: "websocket", started_ms: this.elapsed(), body_read_wait_ms: 0, body_reads: 0, bytes: 0, max_chunk_gap_ms: 0, sends: 0 };
+        this.models.push(timing);
+        if (this.models.length > RECENT_MODEL_LIMIT) this.models.shift();
+        let response: Response;
+        try { response = await this.options.socket.open({ headers: request.headers }, controller.signal, timing); }
+        catch (error) { this.finishModel(timing, controller.signal.aborted ? "cancelled" : "failed"); throw error; }
+        timing.headers_ms = this.elapsed() - timing.started_ms;
+        timing.status = response.status;
+        const socket = response.webSocket;
+        if (response.status !== 101 || !socket) {
+          this.finishModel(timing, "failed");
+          return { status: response.status, headers: [...response.headers], body: await response.text() };
+        }
+        socket.accept();
+        if (!this.live(id)) {
+          socket.close(1000, "handshake cancelled");
+          this.finishModel(timing, "cancelled");
+          return null;
+        }
+        const handle = ++this.nextSocket;
+        const idle = Number(response.headers.get("x-nanocode-stream-idle-ms"));
+        const entry: Socket = { socket, idle: Number.isSafeInteger(idle) && idle > 0 ? idle : 0, frames: [], watchers: [], timing };
+        this.sockets.set(handle, entry);
+        socket.addEventListener("message", event => this.receive(entry, event.data));
+        socket.addEventListener("close", event => this.closeSocket(handle, `with code ${event.code}: ${event.reason}`, "eof"));
+        socket.addEventListener("error", () => this.closeSocket(handle, "after a transport error", "failed"));
+        return { id: handle, status: response.status, headers: [...response.headers] };
+      }
+      case "socket_send": {
+        const entry = this.sockets.get(request.id);
+        if (entry?.closed !== undefined) return { closed: entry.closed };
+        if (!entry) return { closed: "after the client released it" };
+        await this.options.socket!.admit();
+        if (entry.closed !== undefined) return { closed: entry.closed };
+        try { entry.socket.send(request.text); }
+        catch { this.closeSocket(request.id, "before request dispatch", "failed"); return { closed: entry.closed }; }
+        entry.timing.sends = (entry.timing.sends ?? 0) + 1;
+        this.counters.socket_sends++;
+        return null;
+      }
+      case "socket_next": {
+        const entry = this.sockets.get(request.id);
+        if (!entry) return { closed: "after the client released it" };
+        if (entry.frames.length) return this.frame(entry);
+        if (entry.closed !== undefined) return { closed: entry.closed };
+        if (entry.waiter) throw new Error("socket_next is already pending");
+        const readStarted = performance.now();
+        try {
+          return await new Promise(resolve => {
+            const timer = entry.idle ? setTimeout(() => this.closeSocket(request.id, "after the stream idle deadline elapsed", "failed"), entry.idle) : null;
+            entry.waiter = { id, resolve: value => { clearTimeout(timer); resolve(value); } };
+            this.onCancel(id, () => {
+              clearTimeout(timer);
+              if (entry.waiter?.id === id) entry.waiter = undefined;
+              resolve(null);
+            });
+          });
+        } finally { entry.timing.body_read_wait_ms += performance.now() - readStarted; }
+      }
+      case "socket_wait": {
+        const entry = this.sockets.get(request.id);
+        if (!entry || entry.closed !== undefined) return null;
+        return new Promise(resolve => {
+          entry.watchers.push(() => resolve(null));
+          this.onCancel(id, () => resolve(null));
+        });
+      }
+      case "socket_close": {
+        this.closeSocket(request.id, "by the client", "closed");
+        this.sockets.delete(request.id);
+        return null;
+      }
       case "events": {
         this.counters.event_batches++;
         if (this.options.events) {
@@ -377,6 +462,44 @@ export class AgentRuntime {
 
   private notify() {
     for (const watcher of [...this.watchers]) watcher();
+  }
+
+  private receive(entry: Socket, data: unknown) {
+    if (entry.closed !== undefined) return;
+    const at = this.elapsed() - entry.timing.started_ms;
+    entry.timing.first_byte_ms ??= at;
+    entry.timing.last_byte_ms = at;
+    entry.timing.body_reads++;
+    this.counters.socket_frames++;
+    entry.frames.push(typeof data === "string" ? data : null);
+    const waiter = entry.waiter;
+    if (!waiter) return;
+    entry.waiter = undefined;
+    waiter.resolve(this.frame(entry));
+  }
+
+  private frame(entry: Socket): unknown {
+    const frame = entry.frames.shift();
+    if (frame === null || frame === undefined) return { binary: true };
+    const bytes = this.encoder.encode(frame);
+    entry.timing.bytes += bytes.byteLength;
+    return bytes;
+  }
+
+  private closeSocket(handle: number, detail: string, outcome: ModelTiming["outcome"]) {
+    const entry = this.sockets.get(handle);
+    if (!entry || entry.closed !== undefined) return;
+    entry.closed = detail;
+    this.finishModel(entry.timing, outcome);
+    try { entry.socket.close(1000, "closed"); } catch {}
+    const waiter = entry.waiter;
+    entry.waiter = undefined;
+    waiter?.resolve({ closed: detail });
+    for (const watcher of entry.watchers.splice(0)) watcher();
+  }
+
+  private closeSockets(detail: string, outcome: ModelTiming["outcome"]) {
+    for (const handle of [...this.sockets.keys()]) this.closeSocket(handle, detail, outcome);
   }
 
   private complete(id: number, reply: { ok: unknown } | { error: unknown }) {
@@ -433,6 +556,8 @@ export class AgentRuntime {
     for (const cancel of cancellations) cancel();
     for (const { reader, timing } of this.bodies.values()) { this.finishModel(timing, "cancelled"); void reader.cancel().catch(() => undefined); }
     this.bodies.clear();
+    this.closeSockets("agent runtime disposed", "cancelled");
+    this.sockets.clear();
     const commands = [...this.commands.values()];
     this.commands.clear();
     for (const pending of commands) pending.reject(reason);

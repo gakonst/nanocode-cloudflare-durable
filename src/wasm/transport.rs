@@ -1,4 +1,10 @@
-use std::time::Duration;
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 
 use http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
 use nanocode::{
@@ -6,14 +12,14 @@ use nanocode::{
     codex::transport::{
         RetryAfter,
         host::{
-            ConnectedHost, HostConnectRequest, HostConnectionMetadata, HostError, HostFuture,
-            HostHttpBody, HostHttpResponse, HostTransport,
+            ConnectedHost, HostConnectRequest, HostConnection, HostConnectionMetadata, HostError,
+            HostFuture, HostHttpBody, HostHttpResponse, HostMessage, HostTransport,
         },
     },
 };
-use serde_json::json;
+use serde_json::{Value, json};
 
-use super::bridge::call;
+use super::bridge::{Reply, call};
 
 pub struct WorkerTransport;
 
@@ -59,22 +65,30 @@ async fn start(endpoint: &str, headers: &[(&str, &str)], body: &str) -> Result<S
         call(json!({"op": "http_start", "endpoint": endpoint, "headers": headers, "body": body}))
             .await
             .map_err(text)?;
+    let id = serde_json::from_value(value["id"].clone()).map_err(text)?;
+    Ok(Started {
+        status: status(&value)?,
+        headers: header_map(&value)?,
+        body: Body(id),
+    })
+}
+
+fn status(value: &Value) -> Result<StatusCode, String> {
     let status = serde_json::from_value::<u16>(value["status"].clone()).map_err(text)?;
+    StatusCode::from_u16(status).map_err(text)
+}
+
+fn header_map(value: &Value) -> Result<HeaderMap, String> {
     let pairs: Vec<(String, String)> =
         serde_json::from_value(value["headers"].clone()).map_err(text)?;
-    let mut response = HeaderMap::new();
+    let mut headers = HeaderMap::new();
     for (name, value) in pairs {
-        response.append(
+        headers.append(
             HeaderName::try_from(name).map_err(text)?,
             HeaderValue::try_from(value).map_err(text)?,
         );
     }
-    let id = serde_json::from_value(value["id"].clone()).map_err(text)?;
-    Ok(Started {
-        status: StatusCode::from_u16(status).map_err(text)?,
-        headers: response,
-        body: Body(id),
-    })
+    Ok(headers)
 }
 
 fn text(error: impl std::fmt::Display) -> String {
@@ -86,6 +100,28 @@ fn header_text(headers: &HeaderMap, name: &str) -> Option<String> {
         .get(name)
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned)
+}
+
+fn retry_after(headers: &HeaderMap) -> Option<RetryAfter> {
+    headers
+        .get(header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(RetryAfter::from_header)
+}
+
+fn connection_metadata(status: StatusCode, headers: &HeaderMap) -> HostConnectionMetadata {
+    let mut metadata = HostConnectionMetadata::new(status.as_u16())
+        .with_reasoning_included(headers.contains_key("x-reasoning-included"));
+    if let Some(request_id) = header_text(headers, "x-request-id") {
+        metadata = metadata.with_request_id(request_id);
+    }
+    if let Some(model) = header_text(headers, "openai-model") {
+        metadata = metadata.with_server_model(model);
+    }
+    if let Some(turn_state) = header_text(headers, "x-codex-turn-state") {
+        metadata = metadata.with_turn_state(turn_state);
+    }
+    metadata
 }
 
 impl HttpTransport for WorkerTransport {
@@ -118,14 +154,113 @@ impl HostHttpBody for Body {
     }
 }
 
+struct Socket {
+    id: u32,
+    open: bool,
+    closed: Arc<AtomicBool>,
+}
+
+impl HostConnection for Socket {
+    fn send<'a>(&'a self, message: &'a str) -> HostFuture<'a, Result<(), HostError>> {
+        Box::pin(async move {
+            match call(json!({"op": "socket_send", "id": self.id, "text": message})).await {
+                Ok(Value::Null) => Ok(()),
+                Ok(closed) => Err(
+                    HostError::new(closed["closed"].as_str().unwrap_or_default())
+                        .with_reconnectable(true),
+                ),
+                Err(error) => Err(host_error(error)),
+            }
+        })
+    }
+
+    fn next(&mut self) -> HostFuture<'_, Result<HostMessage, HostError>> {
+        Box::pin(async move {
+            match super::bridge::request(json!({"op": "socket_next", "id": self.id})).await {
+                Reply::Bytes(bytes) => String::from_utf8(bytes)
+                    .map(HostMessage::Text)
+                    .map_err(host_error),
+                Reply::Json(reply) => match reply.get("ok") {
+                    Some(frame) if frame.get("binary").is_some() => Ok(HostMessage::Binary),
+                    Some(frame) => {
+                        self.closed.store(true, Ordering::Release);
+                        Ok(HostMessage::Closed {
+                            detail: frame["closed"].as_str().unwrap_or_default().to_owned(),
+                        })
+                    }
+                    None => Err(host_error(&reply["error"]).with_reconnectable(true)),
+                },
+            }
+        })
+    }
+
+    fn is_closed(&self) -> bool {
+        !self.open || self.closed.load(Ordering::Acquire)
+    }
+
+    fn close(&mut self) {
+        if std::mem::replace(&mut self.open, false) {
+            let id = self.id;
+            super::bridge::spawn(async move {
+                let _ = call(json!({"op": "socket_close", "id": id})).await;
+            });
+        }
+    }
+}
+
+impl Drop for Socket {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
 impl HostTransport for WorkerTransport {
     fn connect<'a>(
         &'a self,
-        _request: HostConnectRequest<'a>,
+        request: HostConnectRequest<'a>,
     ) -> HostFuture<'a, Result<ConnectedHost, HostError>> {
-        Box::pin(async {
-            Err(HostError::new(
-                "the Worker uses the HTTPS Responses transport",
+        Box::pin(async move {
+            let mut headers = vec![
+                (
+                    "user-agent",
+                    concat!("nanocode-worker/", env!("CARGO_PKG_VERSION")),
+                ),
+                ("openai-beta", "responses_websockets=2026-02-06"),
+                ("x-openai-internal-codex-responses-lite", "true"),
+                ("x-responsesapi-include-timing-metrics", "true"),
+                ("session-id", request.session_id()),
+                ("thread-id", request.thread_id()),
+                ("x-client-request-id", request.thread_id()),
+            ];
+            if let Some(turn_state) = request.turn_state() {
+                headers.push(("x-codex-turn-state", turn_state));
+            }
+            let opened = call(json!({"op": "socket_open", "headers": headers}))
+                .await
+                .map_err(host_error)?;
+            let status = status(&opened).map_err(host_error)?;
+            let headers = header_map(&opened).map_err(host_error)?;
+            if status != StatusCode::SWITCHING_PROTOCOLS {
+                return Err(HostError::handshake_rejected(
+                    status.as_u16(),
+                    opened["body"].as_str().unwrap_or_default(),
+                    retry_after(&headers),
+                ));
+            }
+            let id = serde_json::from_value(opened["id"].clone()).map_err(host_error)?;
+            let closed = Arc::new(AtomicBool::new(false));
+            let watched = Arc::clone(&closed);
+            super::bridge::spawn(async move {
+                let _ = call(json!({"op": "socket_wait", "id": id})).await;
+                watched.store(true, Ordering::Release);
+            });
+            Ok(ConnectedHost::new(
+                Socket {
+                    id,
+                    open: true,
+                    closed,
+                },
+                connection_metadata(status, &headers),
             ))
         })
     }
@@ -161,11 +296,6 @@ impl HostTransport for WorkerTransport {
                 .await
                 .map_err(host_error)?;
             if !started.status.is_success() {
-                let retry_after = started
-                    .headers
-                    .get(header::RETRY_AFTER)
-                    .and_then(|value| value.to_str().ok())
-                    .and_then(RetryAfter::from_header);
                 let mut rejected = Vec::new();
                 while let Some(chunk) = started.body.read().await.map_err(host_error)? {
                     rejected.extend_from_slice(&chunk);
@@ -173,23 +303,12 @@ impl HostTransport for WorkerTransport {
                 return Err(HostError::handshake_rejected(
                     started.status.as_u16(),
                     String::from_utf8_lossy(&rejected),
-                    retry_after,
+                    retry_after(&started.headers),
                 ));
-            }
-            let mut metadata = HostConnectionMetadata::new(started.status.as_u16())
-                .with_reasoning_included(started.headers.contains_key("x-reasoning-included"));
-            if let Some(request_id) = header_text(&started.headers, "x-request-id") {
-                metadata = metadata.with_request_id(request_id);
-            }
-            if let Some(model) = header_text(&started.headers, "openai-model") {
-                metadata = metadata.with_server_model(model);
-            }
-            if let Some(turn_state) = header_text(&started.headers, "x-codex-turn-state") {
-                metadata = metadata.with_turn_state(turn_state);
             }
             Ok(HostHttpResponse {
                 body: Box::new(started.body),
-                metadata,
+                metadata: connection_metadata(started.status, &started.headers),
             })
         })
     }
