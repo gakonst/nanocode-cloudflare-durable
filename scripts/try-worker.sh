@@ -4,7 +4,7 @@ set -euo pipefail
 
 usage() {
   printf 'Usage: %s [claude|codex] [paradigm-a|paradigm-b|here] [prompt]\n' "$0"
-  printf 'here attaches this machine as the hand for its own prompt with nanocodex runner --code-mode while the prompt is submitted.\n'
+  printf 'here attaches this machine as the hand for its own prompt with nanocodex hand while the prompt is submitted.\n'
 }
 
 if [[ ${1:-} == --help || ${1:-} == -h ]]; then
@@ -51,11 +51,11 @@ stop_hand() {
 }
 trap stop_hand EXIT
 if [[ $executor == here ]]; then
-  hand="cli-$(uuidgen | tr '[:upper:]' '[:lower:]' | cut -c1-8)"
+  hand="*"
   hand_log="${TMPDIR:-/tmp}/nanocode-hand-$session.log"
-  NANOCODEX_RUNNER_TOKEN=$worker_token "${NANOCODEX_BIN:-nanocodex}" runner --code-mode --connect "wss://$origin/sessions/$session/hands/$hand" --name "$hand" -C "$PWD" 2>"$hand_log" &
+  NANOCODE_RUNNER_TOKEN=$worker_token "${NANOCODE_BIN:-nanocodex}" hand "wss://$origin/sessions/$session/hands" 2>"$hand_log" &
   hand_pid=$!
-  executor="$hand (this machine)"
+  executor="this machine"
 fi
 request_data=$(node --input-type=module -e '
 const [provider, executor, prompt, hand] = process.argv.slice(1);

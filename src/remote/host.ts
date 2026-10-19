@@ -14,6 +14,7 @@ export class RemoteExecutor {
   #socket: WebSocket;
   #policy: RemotePolicy;
   #catalog: string | undefined;
+  #name: string | undefined;
   #catalogWaiter: { resolve(): void; reject(error: Error): void } | undefined;
   #frames: string[] = [];
   #waiter: { id: number; resolve(value: unknown): void } | undefined;
@@ -78,6 +79,10 @@ export class RemoteExecutor {
     return this.#failure;
   }
 
+  get name(): string | undefined {
+    return this.#name;
+  }
+
   async execute(request: any, id: number): Promise<unknown> {
     switch (request.op) {
       case "remote_catalog":
@@ -120,10 +125,11 @@ export class RemoteExecutor {
     if (typeof data !== "string") return this.#fail("remote code mode requires JSON text frames", 1003);
     if (encoder.encode(data).byteLength > this.#policy.max_frame_bytes) return this.#fail("remote code mode frame exceeds caller max_frame_bytes policy", 1009);
     if (this.#catalog === undefined) {
-      let type: unknown;
-      try { type = JSON.parse(data)?.type; } catch {}
-      if (type !== "catalog") return this.#fail("runner did not publish a code mode catalog", 1002);
+      let catalog: any;
+      try { catalog = JSON.parse(data); } catch {}
+      if (catalog?.type !== "catalog") return this.#fail("runner did not publish a code mode catalog", 1002);
       this.#catalog = data;
+      if (typeof catalog.name === "string") this.#name = catalog.name;
       this.#catalogWaiter?.resolve();
       this.#catalogWaiter = undefined;
       return;

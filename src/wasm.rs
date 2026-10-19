@@ -46,8 +46,6 @@ struct Configuration {
     remote: bool,
     #[serde(default)]
     executor: Option<String>,
-    #[serde(default)]
-    hands: bool,
 }
 
 impl Configuration {
@@ -60,11 +58,30 @@ impl Configuration {
 }
 
 #[derive(Deserialize)]
+#[serde(untagged)]
+enum Hands {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl Hands {
+    fn selection(self) -> ExecutorSelection {
+        match self {
+            Self::One(name) if name == "*" => ExecutorSelection::All,
+            Self::One(name) => ExecutorSelection::Executor(name.into()),
+            Self::Many(names) => {
+                ExecutorSelection::Executors(names.into_iter().map(Arc::from).collect())
+            }
+        }
+    }
+}
+
+#[derive(Deserialize)]
 struct Input {
     request_id: String,
     prompt: String,
     #[serde(default)]
-    hand: Option<String>,
+    hand: Option<Hands>,
 }
 
 #[derive(Deserialize)]
@@ -80,7 +97,7 @@ enum Command {
     Resume {
         request_id: String,
         #[serde(default)]
-        hand: Option<String>,
+        hand: Option<Hands>,
     },
     Attach {
         hand: String,
@@ -192,17 +209,15 @@ async fn open(config: Configuration) -> Result<Session, String> {
         )
         .durability(store.clone());
     let executors = CodeModeExecutors::new();
-    if config.remote || config.hands {
-        if config.remote {
-            let name: Arc<str> = config.executor.as_deref().unwrap_or("default").into();
-            executors.insert(Arc::clone(&name), Arc::new(remote::host(None).await?));
-            executors.set_default(Some(name));
-        }
-        builder = builder
-            .instructions("Shell, filesystem, and Code Mode tools execute on the selected remote host: the hand that sent the current prompt when it is attached, otherwise the session's configured executor. Use paths relative to its configured workspace. Query pwd through the remote shell when an absolute remote path is needed.")
-            .code_mode_host(executors.clone())
-            .map_err(text)?;
+    if config.remote {
+        let name: Arc<str> = config.executor.as_deref().unwrap_or("default").into();
+        executors.insert(Arc::clone(&name), Arc::new(remote::host(None).await?));
+        executors.set_default(Some(name));
     }
+    builder = builder
+        .instructions("Code Mode runs on the hands this thread is pinned to: one machine attached to the session, several of them, or the session's configured executor. With several hands each cell runs on every one of them concurrently and its output is labelled per hand. Relative paths resolve from each hand's working directory; query pwd through the shell when an absolute path is needed.")
+        .code_mode_host(executors.clone())
+        .map_err(text)?;
     let runtime = builder
         .build()
         .map_err(|error| format!("build runtime: {error}"))?;
@@ -371,16 +386,14 @@ impl Session {
         &self,
         request_id: &str,
         prompt: Prompt,
-        hand: Option<String>,
+        hand: Option<Hands>,
     ) -> Result<Value, String> {
         if self.busy.replace(true) {
             return Ok(waiting());
         }
         let _busy = Busy(self);
-        self.executors.select(
-            self.root(),
-            hand.map(|hand| ExecutorSelection::Executor(hand.into())),
-        );
+        self.executors
+            .select(self.root(), hand.map(Hands::selection));
         self.execute(request_id, prompt, false).await
     }
 
@@ -414,7 +427,7 @@ impl Session {
         }
     }
 
-    async fn resume(&self, request_id: &str, hand: Option<String>) -> Result<Value, String> {
+    async fn resume(&self, request_id: &str, hand: Option<Hands>) -> Result<Value, String> {
         if self.busy.get() || self.live.borrow().contains_key(request_id) {
             return Ok(waiting());
         }

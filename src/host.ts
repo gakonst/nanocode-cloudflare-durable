@@ -1,5 +1,5 @@
 import module from "../dist/nanocode_worker.wasm";
-import { RECENT_MODEL_LIMIT, type AgentConfiguration, type AgentInput, type AgentResult, type ModelTiming, type RuntimeOptions } from "./contracts";
+import { RECENT_MODEL_LIMIT, type AgentConfiguration, type AgentInput, type AgentResult, type HandSelection, type ModelTiming, type RuntimeOptions } from "./contracts";
 import { CheckpointStore, StoreFailure } from "./store";
 import { Timings, type TimingSnapshot } from "./timing";
 
@@ -85,7 +85,7 @@ export class AgentRuntime {
     runtime.wasm = instance.exports as unknown as Exports;
     try {
       const initStarted = performance.now();
-      const opened = await runtime.command({ op: "init", config: { session_id: config.session_id, provider: config.provider ?? "claude", subscription: config.subscription, endpoint: config.endpoint, remote: config.remote ?? false, executor: config.executor, hands: config.hands ?? false } }) as { pending: string[] };
+      const opened = await runtime.command({ op: "init", config: { session_id: config.session_id, provider: config.provider ?? "claude", subscription: config.subscription, endpoint: config.endpoint, remote: config.remote ?? false, executor: config.executor } }) as { pending: string[] };
       runtime.timings.record("sdk.open", performance.now() - initStarted);
       runtime.pendingAtOpen = opened.pending;
     } catch (error) {
@@ -117,7 +117,7 @@ export class AgentRuntime {
     return this.turn({ op: "run", input: { request_id: input.request_id, prompt: input.prompt, hand: input.hand } });
   }
 
-  resume(request_id: string, hand?: string): Promise<TurnOutcome> {
+  resume(request_id: string, hand?: HandSelection): Promise<TurnOutcome> {
     this.counters.resumes++;
     return this.turn({ op: "resume", request_id, hand });
   }

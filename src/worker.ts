@@ -5,7 +5,7 @@ import { EventHub } from "./events";
 import { RemoteExecutor } from "./remote/host";
 import { handleConnect } from "./connect/index";
 export { SubscriptionAuth } from "./auth";
-import { DEFAULT_EXECUTOR, EXECUTOR_ID, LEGACY_RUNNER, RECENT_MODEL_LIMIT, runnerConnection, headerJson, json, sessionUuid, type AgentResult, type PrivateBinding, type SessionDescriptor } from "./contracts";
+import { DEFAULT_EXECUTOR, EXECUTOR_ID, LEGACY_RUNNER, RECENT_MODEL_LIMIT, runnerConnection, headerJson, json, sessionUuid, type AgentResult, type HandSelection, type PrivateBinding, type SessionDescriptor } from "./contracts";
 import { Timings, timingDifference, type TimingSnapshot } from "./timing";
 
 export interface Env {
@@ -21,7 +21,6 @@ export interface Env {
   CONNECT_STREAM_REVALIDATE_MS: string;
   EVENT_PAGE_SIZE: string;
   RUNNER_ENABLED: string;
-  HANDS_ENABLED?: string;
   HANDS_ATTACH_GRACE_MS: string;
   REMOTE_MAX_FRAME_BYTES: string;
   REMOTE_TIMEOUT_MS: string;
@@ -38,6 +37,8 @@ function policy(value: string, name: string): number {
   if (!Number.isSafeInteger(number) || number <= 0) throw new Error(`${name} must be a positive integer`);
   return number;
 }
+
+const handName = (value: unknown): value is string => typeof value === "string" && EXECUTOR_ID.test(value);
 
 async function ownerAuthorized(request: Request, env: Env): Promise<boolean> {
   if (!env.WORKER_TOKEN) return false;
@@ -101,7 +102,7 @@ export class AgentSession extends DurableObject<Env> {
   private readonly hands = new Map<string, Map<string, { connection: string; executor: RemoteExecutor; ready: boolean }>>();
   private readonly connections = new Map<string, RemoteExecutor>();
   private nextConnection = 0;
-  private handWait?: { scope: string; hand: string; resolve(): void };
+  private handWait?: { scope: string; selection: HandSelection; resolve(): void };
   private running?: Running;
   private pumping = false;
   private readonly eventHub = new EventHub();
@@ -148,10 +149,9 @@ export class AgentSession extends DurableObject<Env> {
       if (request.method === "GET" && parts[2] === "events") return this.events(scope, url, request.headers.get("accept")?.includes("text/event-stream"), descriptor);
       if (parts[2] === "socket") return json({ error: "use the authenticated event stream" }, 405);
       if (parts[2] === "hands") {
-        if (this.env.HANDS_ENABLED !== "true") return json({ error: "hands are not enabled" }, 404);
-        if (request.method === "GET" && parts.length === 3) return json({ hands: [...(this.hands.get(scope) ?? [])].filter(([, entry]) => entry.ready).map(([hand]) => hand) });
-        if (request.method === "GET" && parts.length === 4) return this.attachHand(scope, decodeURIComponent(parts[3]), request, descriptor);
-        return json({ error: "method not allowed" }, 405);
+        if (request.method !== "GET") return json({ error: "method not allowed" }, 405);
+        if (parts.length === 3 && request.headers.get("upgrade")?.toLowerCase() !== "websocket") return json({ hands: [...(this.hands.get(scope) ?? [])].filter(([, entry]) => entry.ready).map(([hand]) => hand) });
+        return this.attachHand(scope, parts.length === 4 ? decodeURIComponent(parts[3]) : undefined, request, descriptor);
       }
       if (parts[2] === "cancel" && parts.length === 4 && request.method === "POST") return await this.cancel(decodeURIComponent(parts[3]), scope);
       if (parts[2] !== "turns") return json({ error: "route not found" }, 404);
@@ -166,9 +166,9 @@ export class AgentSession extends DurableObject<Env> {
       if (input.request_id.startsWith("subagent-completion:")) return json({ error: "request_id prefix is reserved" }, 400);
       if (input.provider !== undefined && input.provider !== "claude" && input.provider !== "codex") return json({ error: "provider must be claude or codex" }, 400);
       if (input.executor !== undefined && (typeof input.executor !== "string" || !EXECUTOR_ID.test(input.executor))) return json({ error: "invalid executor" }, 400);
-      if (input.hand !== undefined && (typeof input.hand !== "string" || !EXECUTOR_ID.test(input.hand))) return json({ error: "invalid hand" }, 400);
-      if (input.hand !== undefined && this.env.HANDS_ENABLED !== "true") return json({ error: "hands are not enabled" }, 400);
-      if (input.hand !== undefined && descriptor.grant_id && !descriptor.connections?.includes(runnerConnection(input.hand))) return json({ error: "hand is not selected by this grant" }, 403);
+      const named: unknown[] = input.hand === "*" || input.hand == null ? [] : Array.isArray(input.hand) ? input.hand : [input.hand];
+      if (!named.every(handName) || (Array.isArray(input.hand) && (!named.length || new Set(named).size !== named.length))) return json({ error: "hand must be a hand name, \"*\" for every attached hand, a list of distinct names, or null" }, 400);
+      if (descriptor.grant_id && named.some(hand => !descriptor.connections?.includes(runnerConnection(hand)))) return json({ error: "hand is not selected by this grant" }, 403);
       const streaming = request.headers.get("accept")?.includes("text/event-stream");
       if (streaming) {
         const after = Number(url.searchParams.get("after") ?? "0");
@@ -184,7 +184,9 @@ export class AgentSession extends DurableObject<Env> {
       const executor = input.executor ?? boundExecutor ?? legacyExecutor;
       if (executor && descriptor.grant_id && !descriptor.connections?.includes(runnerConnection(executor)) && !(executor === DEFAULT_EXECUTOR && descriptor.connections?.includes(LEGACY_RUNNER))) return json({ error: "executor is not selected by this grant" }, 403);
       descriptor.executor_id = executor || undefined;
-      descriptor.hand = input.hand;
+      const handKey = `hand:${scope}`;
+      const pinned = this.store.row("SELECT value FROM metadata WHERE key = ?", handKey)?.value as string | undefined;
+      descriptor.hand = input.hand === undefined ? pinned && JSON.parse(pinned) : input.hand ?? undefined;
       const providerKey = `model_provider:${scope}`;
       const boundProvider = this.store.row("SELECT value FROM metadata WHERE key = ?", providerKey)?.value
         ?? (this.store.row("SELECT value FROM metadata WHERE key = ?", scope === "owner" ? "session_id" : `session_id:${scope}`) ? "claude" : undefined);
@@ -193,7 +195,7 @@ export class AgentSession extends DurableObject<Env> {
       if (descriptor.provider === "codex" && descriptor.session_id && descriptor.session_id[14] !== "7") return json({ error: "Codex requires a new thread with a UUIDv7 session" }, 409);
       if (descriptor.provider === "codex") descriptor.subscription = true;
       const existing = this.job(input.request_id);
-      if (existing && (existing.prompt !== input.prompt || existing.scope !== scope || this.descriptor(existing).hand !== input.hand)) return json({ error: "request_id already belongs to different input or authority" }, 409);
+      if (existing && (existing.prompt !== input.prompt || existing.scope !== scope || (input.hand !== undefined && JSON.stringify(this.descriptor(existing).hand ?? null) !== JSON.stringify(input.hand)))) return json({ error: "request_id already belongs to different input or authority" }, 409);
       if (!existing) {
         policy(this.env.RECOVERY_DELAY_MS, "RECOVERY_DELAY_MS");
         this.ctx.storage.transactionSync(() => {
@@ -202,6 +204,8 @@ export class AgentSession extends DurableObject<Env> {
           if (!current) this.ctx.storage.sql.exec("INSERT INTO metadata VALUES ('authority', ?)", identity);
           this.ctx.storage.sql.exec("INSERT INTO metadata VALUES (?, ?) ON CONFLICT(key) DO NOTHING", providerKey, descriptor.provider!);
           this.ctx.storage.sql.exec("INSERT INTO metadata VALUES (?, ?) ON CONFLICT(key) DO NOTHING", executorKey, executor);
+          if (input.hand === null) this.ctx.storage.sql.exec("DELETE FROM metadata WHERE key = ?", handKey);
+          else if (input.hand !== undefined) this.ctx.storage.sql.exec("INSERT INTO metadata VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", handKey, JSON.stringify(input.hand));
           this.sessionId(scope, descriptor.session_id);
           this.ctx.storage.sql.exec("INSERT INTO metadata VALUES (?, ?) ON CONFLICT(key) DO NOTHING", `background:${scope}`, JSON.stringify(descriptor));
           this.ctx.storage.sql.exec("INSERT INTO jobs (request_id, prompt, status, result, scope, descriptor, cancel_requested) VALUES (?, ?, 'queued', NULL, ?, ?, 0)", input.request_id, input.prompt, scope, JSON.stringify(descriptor));
@@ -324,7 +328,7 @@ export class AgentSession extends DurableObject<Env> {
           if (turnTiming) turnTiming.running_sync_ms = performance.now() - runningSync;
           const hand = this.descriptor(activeJob).hand;
           if (hand && !activeJob.cancel_requested) {
-            const waited = await this.awaitHand(scope, hand);
+            const waited = await this.awaitHands(scope, hand);
             if (turnTiming) turnTiming.hand_wait_ms = waited;
           }
           const latest = this.job(activeJob.request_id)!;
@@ -336,7 +340,7 @@ export class AgentSession extends DurableObject<Env> {
           if (!result.waiting) this.finish(activeJob, result);
         } else if (first) {
           const hand = pendingJob ? this.descriptor(pendingJob).hand : undefined;
-          if (hand) await this.awaitHand(scope, hand);
+          if (hand) await this.awaitHands(scope, hand);
           const result = await runtime.resume(first, hand);
           if (result.retry) throw new Error("runtime recovery required");
           waiting = !!result.waiting;
@@ -404,7 +408,6 @@ export class AgentSession extends DurableObject<Env> {
       resident = (async () => {
         const authority = { account_id: descriptor.account_id, session_id: sessionId, grant_id: descriptor.grant_id, grant_revision: descriptor.grant_revision, connections: descriptor.connections, catalog_digest: descriptor.catalog_digest, grant_expires_at: descriptor.grant_expires_at, executor_id: descriptor.executor_id };
         const enabled = !!descriptor.executor_id || (this.env.RUNNER_ENABLED === "true" && (!descriptor.grant_id || descriptor.connections?.includes(LEGACY_RUNNER)));
-        const handsEnabled = this.env.HANDS_ENABLED === "true";
         let remote: RemoteExecutor | undefined;
         let remoteFailed = false;
         const connectStarted = performance.now();
@@ -413,8 +416,8 @@ export class AgentSession extends DurableObject<Env> {
           : undefined;
         void connecting?.catch(() => {});
         try {
-          const created = await AgentRuntime.create({ session_id: sessionId, provider: descriptor.provider ?? "claude", subscription: descriptor.subscription, endpoint: descriptor.provider === "codex" ? "https://chatgpt.com/backend-api/codex" : `https://api.anthropic.com/v1/messages${descriptor.subscription ? "?beta=true" : ""}`, remote: enabled, executor: descriptor.executor_id, hands: handsEnabled }, this.store, {
-        remote: connecting || handsEnabled ? {
+          const created = await AgentRuntime.create({ session_id: sessionId, provider: descriptor.provider ?? "claude", subscription: descriptor.subscription, endpoint: descriptor.provider === "codex" ? "https://chatgpt.com/backend-api/codex" : `https://api.anthropic.com/v1/messages${descriptor.subscription ? "?beta=true" : ""}`, remote: enabled, executor: descriptor.executor_id }, this.store, {
+        remote: {
           failed: () => remoteFailed || remote?.failure !== undefined,
           execute: async (request: any, id: number) => {
             const executor = request.connection != null ? this.connections.get(request.connection) : await connecting;
@@ -436,7 +439,7 @@ export class AgentSession extends DurableObject<Env> {
             for (const executor of this.connections.values()) executor.cancel(id);
           },
           dispose: async () => { await connecting?.then(value => value.dispose(), () => {}); },
-        } : undefined,
+        },
         dispatch: async (request, signal, timing) => {
           if (this.dispatchBlocked(scope, descriptor)) throw new Error("request authority stopped");
           this.counts.model_dispatches++;
@@ -478,19 +481,22 @@ export class AgentSession extends DurableObject<Env> {
     return resident;
   }
 
-  private attachHand(scope: string, hand: string, request: Request, descriptor: SessionDescriptor): Response {
-    if (!EXECUTOR_ID.test(hand)) return json({ error: "invalid hand" }, 400);
+  private attachHand(scope: string, requested: string | undefined, request: Request, descriptor: SessionDescriptor): Response {
+    if (requested !== undefined && !handName(requested)) return json({ error: "invalid hand" }, 400);
     if (request.headers.get("upgrade")?.toLowerCase() !== "websocket") return json({ error: "hands attach over WebSocket" }, 426);
-    if (descriptor.grant_id && !descriptor.connections?.includes(runnerConnection(hand))) return json({ error: "hand is not selected by this grant" }, 403);
+    if (requested !== undefined && descriptor.grant_id && !descriptor.connections?.includes(runnerConnection(requested))) return json({ error: "hand is not selected by this grant" }, 403);
     const limits = { max_frame_bytes: policy(this.env.REMOTE_MAX_FRAME_BYTES, "REMOTE_MAX_FRAME_BYTES"), timeout_ms: policy(this.env.REMOTE_TIMEOUT_MS, "REMOTE_TIMEOUT_MS") };
     const [client, server] = Object.values(new WebSocketPair());
-    this.ctx.waitUntil(this.registerHand(scope, hand, `${hand}#${++this.nextConnection}`, server, limits));
+    this.ctx.waitUntil(this.registerHand(scope, requested, server, limits, descriptor));
     return new Response(null, { status: 101, webSocket: client });
   }
 
-  private async registerHand(scope: string, hand: string, connection: string, socket: WebSocket, limits: { max_frame_bytes: number; timeout_ms: number }): Promise<void> {
+  private async registerHand(scope: string, requested: string | undefined, socket: WebSocket, limits: { max_frame_bytes: number; timeout_ms: number }, descriptor: SessionDescriptor): Promise<void> {
     let executor: RemoteExecutor;
     try { executor = await RemoteExecutor.accept(socket, limits); } catch { return; }
+    const hand = requested ?? executor.name;
+    if (!handName(hand) || (descriptor.grant_id && !descriptor.connections?.includes(runnerConnection(hand)))) return executor.dispose();
+    const connection = `${hand}#${++this.nextConnection}`;
     let hands = this.hands.get(scope);
     if (!hands) this.hands.set(scope, hands = new Map());
     const previous = hands.get(hand);
@@ -504,16 +510,22 @@ export class AgentSession extends DurableObject<Env> {
     const entry = hands.get(hand);
     if (entry?.connection !== connection) return;
     entry.ready = true;
-    if (this.handWait?.scope === scope && this.handWait.hand === hand) this.handWait.resolve();
+    if (this.handWait?.scope === scope && this.handsReady(scope, this.handWait.selection)) this.handWait.resolve();
   }
 
-  private async awaitHand(scope: string, hand: string): Promise<number> {
-    if (this.hands.get(scope)?.get(hand)?.ready) return 0;
+  private handsReady(scope: string, selection: HandSelection): boolean {
+    const hands = this.hands.get(scope);
+    if (selection === "*") return [...(hands?.values() ?? [])].some(entry => entry.ready);
+    return (Array.isArray(selection) ? selection : [selection]).every(hand => hands?.get(hand)?.ready);
+  }
+
+  private async awaitHands(scope: string, selection: HandSelection): Promise<number> {
+    if (this.handsReady(scope, selection)) return 0;
     const started = performance.now();
     const grace = policy(this.env.HANDS_ATTACH_GRACE_MS, "HANDS_ATTACH_GRACE_MS");
     let timer: number | undefined;
     await new Promise<void>(resolve => {
-      this.handWait = { scope, hand, resolve };
+      this.handWait = { scope, selection, resolve };
       timer = setTimeout(resolve, grace);
     });
     if (timer !== undefined) clearTimeout(timer);
