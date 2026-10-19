@@ -406,11 +406,11 @@ export class AgentSession extends DurableObject<Env> {
               if (request.op === "remote_send") throw new Error("hand connection moved to a newer runtime");
               return request.op === "remote_poll" ? { closed: "connection moved to a newer runtime" } : null;
             }
-            if (request.op === "remote_send") await this.durable(scope);
+            if (request.op === "remote_send" && request.durable !== false) await this.durable(scope);
             if (request.op === "remote_send" && this.dispatchBlocked(scope, descriptor)) {
               const forbidden = request.frames.some((text: string) => {
                 const frame = JSON.parse(text);
-                return frame.type === "request" && ["Execute", "Wait"].includes(Object.keys(frame.operation)[0]);
+                return frame.type === "request" && ["Execute", "Wait", "Call"].includes(Object.keys(frame.operation)[0]);
               });
               if (forbidden) {
                 await executor.dispose();

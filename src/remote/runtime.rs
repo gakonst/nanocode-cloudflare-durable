@@ -34,7 +34,7 @@ struct CallbackState {
 }
 
 struct Client {
-    outgoing: mpsc::UnboundedSender<Frame>,
+    outgoing: mpsc::UnboundedSender<(Frame, bool)>,
     pending: Mutex<HashMap<u64, mpsc::UnboundedSender<Frame>>>,
     callbacks: Mutex<HashMap<(String, String), CallbackState>>,
     running: Mutex<HashMap<u64, (String, AbortHandle)>>,
@@ -87,7 +87,7 @@ fn wake() {
 }
 
 impl Client {
-    fn dispatch(&self, frame: Frame) -> Result<(), CodeModeHostError> {
+    fn dispatch(&self, frame: Frame, durable: bool) -> Result<(), CodeModeHostError> {
         if let Frame::Request {
             operation: RemoteOperation::Cancel { session_id },
             ..
@@ -107,7 +107,9 @@ impl Client {
                 }
             });
         }
-        self.outgoing.unbounded_send(frame).map_err(error)
+        self.outgoing
+            .unbounded_send((frame, durable))
+            .map_err(error)
     }
 
     fn callback(
@@ -140,6 +142,7 @@ impl Client {
                 )
             });
         let hands = self.hands.lock().unwrap().clone();
+        let durable = hand.is_none();
         let (abort, registration) = AbortHandle::new_pair();
         self.running
             .lock()
@@ -185,10 +188,13 @@ impl Client {
                 registration,
             );
             if let Ok(result) = execution.await {
-                let _ = outgoing.unbounded_send(Frame::CallbackResult {
-                    id,
-                    result: result.map_err(|issue: CodeModeHostError| issue.to_string()),
-                });
+                let _ = outgoing.unbounded_send((
+                    Frame::CallbackResult {
+                        id,
+                        result: result.map_err(|issue: CodeModeHostError| issue.to_string()),
+                    },
+                    durable,
+                ));
             }
             if let Some(client) = client.upgrade() {
                 client.running.lock().unwrap().remove(&id);
@@ -267,16 +273,17 @@ impl Client {
 }
 
 async fn write(
-    mut frames: mpsc::UnboundedReceiver<Frame>,
+    mut frames: mpsc::UnboundedReceiver<(Frame, bool)>,
     max_frame_bytes: usize,
     connection: Option<&str>,
 ) -> Result<(), CodeModeHostError> {
-    while let Some(frame) = frames.next().await {
+    while let Some((frame, mut durable)) = frames.next().await {
         let mut batch = vec![frame.encode(max_frame_bytes)?];
-        while let Ok(frame) = frames.try_recv() {
+        while let Ok((frame, needs)) = frames.try_recv() {
             batch.push(frame.encode(max_frame_bytes)?);
+            durable |= needs;
         }
-        call(json!({"op": "remote_send", "connection": connection, "frames": batch}))
+        call(json!({"op": "remote_send", "connection": connection, "frames": batch, "durable": durable}))
             .await
             .map_err(host_error)?;
     }
@@ -309,7 +316,7 @@ async fn read(
 
 async fn drive(
     client: Weak<Client>,
-    frames: mpsc::UnboundedReceiver<Frame>,
+    frames: mpsc::UnboundedReceiver<(Frame, bool)>,
     closed: oneshot::Receiver<()>,
     max_frame_bytes: usize,
     connection: Option<String>,
@@ -401,10 +408,13 @@ impl Drop for Pending {
             }
             if let Some(session_id) = self.session_id.take() {
                 let id = self.client.next.fetch_add(1, Ordering::Relaxed);
-                let _ = self.client.outgoing.unbounded_send(Frame::Request {
-                    id,
-                    operation: RemoteOperation::CancelTurn { session_id },
-                });
+                let _ = self.client.outgoing.unbounded_send((
+                    Frame::Request {
+                        id,
+                        operation: RemoteOperation::CancelTurn { session_id },
+                    },
+                    true,
+                ));
             }
         }
     }
@@ -466,7 +476,7 @@ impl RemoteTransport for WorkerTransport {
                 complete: false,
             };
             self.client
-                .dispatch(Frame::Request { id, operation })
+                .dispatch(Frame::Request { id, operation }, true)
                 .map_err(|_| error("remote connection closed; the operation was not dispatched"))?;
             let receive = pin!(async {
                 while let Some(frame) = replies.next().await {
@@ -558,7 +568,7 @@ impl RemoteTransport for WorkerTransport {
                 complete: false,
             };
             self.client
-                .dispatch(Frame::Request { id, operation })
+                .dispatch(Frame::Request { id, operation }, false)
                 .map_err(|_| error("remote connection closed; the operation was not dispatched"))?;
             let receive = pin!(async {
                 while let Some(frame) = replies.next().await {
@@ -607,10 +617,13 @@ impl RemoteTransport for WorkerTransport {
         if let Some(failure) = self.client.failure.lock().unwrap().clone() {
             return Err(error(failure));
         }
-        self.client.dispatch(Frame::Request {
-            id: self.client.next.fetch_add(1, Ordering::Relaxed),
-            operation,
-        })
+        self.client.dispatch(
+            Frame::Request {
+                id: self.client.next.fetch_add(1, Ordering::Relaxed),
+                operation,
+            },
+            true,
+        )
     }
 
     fn detach_turn(
