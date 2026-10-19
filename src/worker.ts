@@ -21,6 +21,8 @@ export interface Env {
   CONNECT_STREAM_REVALIDATE_MS: string;
   EVENT_PAGE_SIZE: string;
   EVENT_COALESCE_MS: string;
+  MODEL_SOCKET_LINGER_MS: string;
+  RUNTIME_MEMORY_BUDGET_BYTES: string;
   RUNNER_ENABLED: string;
   REMOTE_MAX_FRAME_BYTES: string;
   REMOTE_TIMEOUT_MS: string;
@@ -109,6 +111,7 @@ export class AgentSession extends DurableObject<Env> {
   private readonly hands = new Map<string, Map<string, { connection: string; executor: RemoteExecutor; ready: boolean }>>();
   private readonly connections = new Map<string, RemoteExecutor>();
   private readonly handSockets = new Map<WebSocket, RemoteExecutor>();
+  private linger?: ReturnType<typeof setTimeout>;
   private running?: Running;
   private pumping = false;
   private readonly eventHub = new EventHub();
@@ -116,7 +119,7 @@ export class AgentSession extends DurableObject<Env> {
   private readonly timings = new Map<string, Timings>();
   private readonly turnTimings = new Map<string, TurnTiming>();
   private readonly eventTurns = new Map<string, string>();
-  private readonly counts = { runtime_initializations: 0, model_dispatches: 0, events_written: 0, event_turn_queries: 0, event_turn_cache_hits: 0, preparation_writes: 0, preparation_writes_skipped: 0, effect_syncs: 0, alarms: 0, direct_starts: 0, recoveries: 0 };
+  private readonly counts = { runtime_initializations: 0, model_dispatches: 0, events_written: 0, event_turn_queries: 0, event_turn_cache_hits: 0, preparation_writes: 0, preparation_writes_skipped: 0, effect_syncs: 0, alarms: 0, direct_starts: 0, recoveries: 0, runtime_retirements: 0 };
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -254,6 +257,8 @@ export class AgentSession extends DurableObject<Env> {
     const delay = policy(this.env.RECOVERY_DELAY_MS, "RECOVERY_DELAY_MS");
     if (this.pumping) { await this.ctx.storage.setAlarm(Date.now() + delay); return; }
     this.pumping = true;
+    if (this.linger !== undefined) clearTimeout(this.linger);
+    this.linger = undefined;
     let scope: string | undefined;
     let runtime: AgentRuntime | undefined;
     let immediate = false;
@@ -576,13 +581,31 @@ export class AgentSession extends DurableObject<Env> {
   }
 
   private releaseIdle(): void {
+    const budget = policy(this.env.RUNTIME_MEMORY_BUDGET_BYTES, "RUNTIME_MEMORY_BUDGET_BYTES");
     for (const [scope, runtime] of this.residents) {
-      if (!runtime.remote) { runtime.releaseConnections(); continue; }
-      this.runtimes.delete(scope);
-      this.residents.delete(scope);
-      this.releaseHands(scope);
-      void runtime.dispose().catch(() => {});
+      if (runtime.memoryBytes > budget) this.retire(scope, runtime);
     }
+    if (this.linger !== undefined) clearTimeout(this.linger);
+    this.linger = setTimeout(() => {
+      this.linger = undefined;
+      if (this.pumping || this.store.row("SELECT request_id FROM jobs WHERE status IN ('queued', 'running') LIMIT 1")) return;
+      this.releaseConnections();
+    }, duration(this.env.MODEL_SOCKET_LINGER_MS, "MODEL_SOCKET_LINGER_MS"));
+  }
+
+  private releaseConnections(): void {
+    for (const [scope, runtime] of this.residents) {
+      if (runtime.remote) this.retire(scope, runtime);
+      else runtime.releaseConnections();
+    }
+  }
+
+  private retire(scope: string, runtime: AgentRuntime): void {
+    this.counts.runtime_retirements++;
+    this.runtimes.delete(scope);
+    this.residents.delete(scope);
+    this.releaseHands(scope);
+    void runtime.dispose().catch(() => {});
   }
 
   private handsMode(scope: string, descriptor: SessionDescriptor): boolean {

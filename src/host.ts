@@ -120,6 +120,10 @@ export class AgentRuntime {
     return !this.closed && !this.options.remote?.failed?.();
   }
 
+  get memoryBytes(): number {
+    return this.wasm.memory.buffer.byteLength;
+  }
+
   get opened(): readonly string[] {
     return this.pendingAtOpen;
   }
