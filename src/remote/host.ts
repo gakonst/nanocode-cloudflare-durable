@@ -19,6 +19,7 @@ export class RemoteExecutor {
   #frames: string[] = [];
   #waiter: { id: number; resolve(value: unknown): void } | undefined;
   #failure: string | undefined;
+  #owner: object | undefined;
   #closed!: (reason: string) => void;
   readonly closed = new Promise<string>(resolve => { this.#closed = resolve; });
 
@@ -102,6 +103,22 @@ export class RemoteExecutor {
       default:
         throw new Error(`unsupported remote operation ${request.op}`);
     }
+  }
+
+  claim(owner: object): void {
+    if (this.#owner === owner) return;
+    this.#owner = owner;
+    const waiter = this.#waiter;
+    this.#waiter = undefined;
+    waiter?.resolve({ closed: "connection moved to a newer runtime" });
+  }
+
+  release(): void {
+    this.#owner = {};
+  }
+
+  owns(owner: object): boolean {
+    return this.#owner === owner;
   }
 
   cancel(id: number): void {

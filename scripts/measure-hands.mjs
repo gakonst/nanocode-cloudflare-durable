@@ -9,7 +9,6 @@ const sdk = resolve(process.env.NANOCODE_SDK_PATH ?? "../nanocodex");
 const binary = resolve(process.env.CARGO_TARGET_DIR ?? resolve(sdk, "target"), "debug/nanocode");
 const policy = { max_frame_bytes: 1048576, timeout_ms: 30000 };
 const keepaliveMs = Number(process.env.HANDS_KEEPALIVE_MS ?? "45000");
-const graceMs = 2000;
 const latencyTurns = 10;
 const token = "local-measurement";
 const persistence = resolve(mkdtempSync("output/hands-state-"));
@@ -118,7 +117,7 @@ const outbound = async request => {
 };
 
 const buildMs = process.env.HANDS_SKIP_BUILD ? 0 : buildHand();
-const options = localOptions({ persistence, agent: { HANDS_ATTACH_GRACE_MS: String(graceMs), REMOTE_MAX_FRAME_BYTES: String(policy.max_frame_bytes), REMOTE_TIMEOUT_MS: String(policy.timeout_ms) } });
+const options = localOptions({ persistence, agent: { REMOTE_MAX_FRAME_BYTES: String(policy.max_frame_bytes), REMOTE_TIMEOUT_MS: String(policy.timeout_ms) } });
 options.workers[1].outboundService = outbound;
 const mf = new Miniflare(convertV4MiniflareOptions(options));
 const name = `hands-${Date.now()}`;
@@ -184,6 +183,8 @@ function output(result) {
 
 try {
   const base = String(await mf.ready);
+  const direct = await turn("direct", "hands-where");
+  expect(/not available in the admitted catalog/.test(direct.results[0]?.text ?? ""), `turn without hands or executor kept Code Mode: ${JSON.stringify(direct.results)}`);
   const attachStart = performance.now();
   startHand("laptop", base, false);
   startHand("desk", base);
@@ -239,17 +240,6 @@ try {
   const detachMs = await until(async () => !(await attached()).includes(laptopName), "Killed hand stayed attached");
   const departed = await turn("where-departed", "hands-where", laptopName);
   expect(/not connected; nothing was dispatched/.test(departed.results[0]?.text ?? ""), `departed hand: ${JSON.stringify(departed.results)}`);
-  expect(departed.timing?.hand_wait_ms >= graceMs, `departed hand did not wait for its grace period: ${JSON.stringify(departed.timing)}`);
-
-  const lateTurn = turn("where-late", "hands-where", "late");
-  await new Promise(resolve => setTimeout(resolve, 300));
-  const lateStart = performance.now();
-  startHand("late", base);
-  const late = await lateTurn;
-  const lateAttachedMs = performance.now() - lateStart;
-  expect(late.results[0]?.text.includes(workspaces.late), `late hand: ${JSON.stringify(late.results)}`);
-  expect(late.timing?.hand_wait_ms > 0 && late.timing.hand_wait_ms < graceMs, `late hand wait: ${JSON.stringify(late.timing)}`);
-  await stopHand("late");
 
   const reconnectStart = performance.now();
   logs.laptop = "";
@@ -285,11 +275,9 @@ try {
     killed_hand_detached_ms: deskLeftMs,
     after_departure: outcomes,
     reattached_ms: deskReturnMs,
-    turn_ms: { list: listed.milliseconds, desk: switched.milliseconds, sole_hand: sole.milliseconds, callback: callback.milliseconds },
+    turn_ms: { direct: direct.milliseconds, list: listed.milliseconds, desk: switched.milliseconds, sole_hand: sole.milliseconds, callback: callback.milliseconds },
     departed_home_result: departed.results[0]?.text,
-    departed_home_wait_ms: departed.timing?.hand_wait_ms,
     home_left_registry_ms: detachMs,
-    late_hand: { submitted_before_spawn_ms: 300, spawn_to_turn_complete_ms: lateAttachedMs, hand_wait_ms: late.timing?.hand_wait_ms, turn_ms: late.milliseconds },
     reconnect_to_attached_ms: reconnectMs,
     idle_ms: keepaliveMs,
     idle_reconnects: reconnects - 1,

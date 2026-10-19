@@ -39,16 +39,6 @@ export class CheckpointStore {
     }
   }
 
-  private async sync(operation: string, observer?: Timings): Promise<void> {
-    const started = performance.now();
-    try { await this.storage.sync(); }
-    finally {
-      const elapsed = performance.now() - started;
-      this.timings.record(`${operation}.sync`, elapsed);
-      observer?.record(`${operation}.sync`, elapsed);
-    }
-  }
-
   private async operation(request: any, observer?: Timings): Promise<unknown> {
     this.metrics.operations[request.op] = (this.metrics.operations[request.op] ?? 0) + 1;
     const id = request.state_id;
@@ -68,7 +58,6 @@ export class CheckpointStore {
           this.storage.sql.exec("INSERT INTO owners VALUES (?, ?, ?) ON CONFLICT(id) DO UPDATE SET owner = excluded.owner, fence = excluded.fence", id, request.owner_id, fence);
           return { ...this.peek(id), fence };
         });
-        await this.sync("acquire", observer);
         return value;
       }
       case "replace": {
@@ -85,7 +74,6 @@ export class CheckpointStore {
           this.storage.sql.exec("INSERT INTO states VALUES (?, ?, ?) ON CONFLICT(id) DO UPDATE SET revision = excluded.revision, payload = excluded.payload", id, revision, request.payload);
           return { revision };
         });
-        await this.sync("replace", observer);
         return value;
       }
       default: throw new Error("unknown checkpoint operation");

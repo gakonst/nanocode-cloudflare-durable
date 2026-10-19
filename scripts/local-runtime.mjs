@@ -37,7 +37,7 @@ export function localOptions({ provider, live = false, agent = {}, egress = {}, 
           SERVICE_EGRESS: { name: "nanocode-egress", entrypoint: "ConnectServiceEgress" },
           REMOTE: { name: "nanocode-egress", entrypoint: "RemoteExecutorEgress" },
         },
-        bindings: { WORKER_TOKEN: "local-measurement", ACCOUNT_ID: "default", MODEL_AUTH: live && secretBindings.OAUTH_JSON ? "subscription" : "api_key", RECOVERY_DELAY_MS: "1000", EVENT_PAGE_SIZE: "128", CONNECT_STREAM_REVALIDATE_MS: "100", RUNNER_ENABLED: "false", HANDS_ATTACH_GRACE_MS: "10000", REMOTE_MAX_FRAME_BYTES: "1048576", REMOTE_TIMEOUT_MS: "30000", ...agent },
+        bindings: { WORKER_TOKEN: "local-measurement", ACCOUNT_ID: "default", MODEL_AUTH: live && secretBindings.OAUTH_JSON ? "subscription" : "api_key", RECOVERY_DELAY_MS: "1000", EVENT_PAGE_SIZE: "128", CONNECT_STREAM_REVALIDATE_MS: "100", RUNNER_ENABLED: "false",  REMOTE_MAX_FRAME_BYTES: "1048576", REMOTE_TIMEOUT_MS: "30000", ...agent },
         outboundService: async () => { throw new Error("Public Worker attempted direct outbound network access"); },
       },
       {

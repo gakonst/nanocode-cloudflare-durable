@@ -77,6 +77,7 @@ export type AgentConfiguration = {
   endpoint: string;
   remote?: boolean;
   executor?: string;
+  hands?: boolean;
 };
 
 export type AgentInput = { request_id: string; prompt: string; hand?: string };

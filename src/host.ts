@@ -74,18 +74,20 @@ export class AgentRuntime {
   private disposal?: Promise<void>;
   private pendingAtOpen: string[] = [];
   private readonly attached = new Set<string>();
+  hands = false;
 
   private constructor(private readonly store: CheckpointStore, private readonly options: RuntimeOptions) {}
 
   static async create(config: AgentConfiguration, store: CheckpointStore, options: RuntimeOptions): Promise<AgentRuntime> {
     const runtime = new AgentRuntime(store, options);
+    runtime.hands = config.hands ?? false;
     const instantiateStarted = performance.now();
     const instance = await WebAssembly.instantiate(module, { host: runtime.imports() });
     runtime.timings.record("wasm.instantiate", performance.now() - instantiateStarted);
     runtime.wasm = instance.exports as unknown as Exports;
     try {
       const initStarted = performance.now();
-      const opened = await runtime.command({ op: "init", config: { session_id: config.session_id, provider: config.provider ?? "claude", subscription: config.subscription, endpoint: config.endpoint, remote: config.remote ?? false, executor: config.executor } }) as { pending: string[] };
+      const opened = await runtime.command({ op: "init", config: { session_id: config.session_id, provider: config.provider ?? "claude", subscription: config.subscription, endpoint: config.endpoint, remote: config.remote ?? false, executor: config.executor, hands: runtime.hands } }) as { pending: string[] };
       runtime.timings.record("sdk.open", performance.now() - initStarted);
       runtime.pendingAtOpen = opened.pending;
     } catch (error) {

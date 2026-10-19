@@ -46,6 +46,8 @@ struct Configuration {
     remote: bool,
     #[serde(default)]
     executor: Option<String>,
+    #[serde(default)]
+    hands: bool,
 }
 
 impl Configuration {
@@ -196,10 +198,12 @@ async fn open(config: Configuration) -> Result<Session, String> {
         executors.insert(Arc::clone(&name), Arc::new(remote::host(None).await?));
         executors.set_default(Some(name));
     }
-    builder = builder
-        .instructions("Code Mode scripts run on one machine: the hand that sent the prompt, the only attached hand, or the session's configured executor. Inside a script any tool call runs on another attached hand when its arguments include hand: \"<name>\", so one script can work on several machines at once, for example with Promise.all; tools.hands() lists them. Relative paths resolve from each hand's working directory; query pwd through the shell when an absolute path is needed.")
-        .code_mode_host(executors.clone())
-        .map_err(text)?;
+    if config.remote || config.hands {
+        builder = builder
+            .instructions("Code Mode scripts run on one machine: the hand that sent the prompt, the only attached hand, or the session's configured executor. Inside a script any tool call runs on another attached hand when its arguments include hand: \"<name>\", so one script can work on several machines at once, for example with Promise.all; tools.hands() lists them. Relative paths resolve from each hand's working directory; query pwd through the shell when an absolute path is needed.")
+            .code_mode_host(executors.clone())
+            .map_err(text)?;
+    }
     let runtime = builder
         .build()
         .map_err(|error| format!("build runtime: {error}"))?;
