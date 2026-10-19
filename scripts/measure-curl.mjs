@@ -1,6 +1,8 @@
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { performance } from "node:perf_hooks";
 import { parseArgs } from "node:util";
 
@@ -26,20 +28,23 @@ const summarize = values => {
 mkdirSync("output", { recursive: true });
 const output = `output/curl-${values.provider}-${values.executor ?? "inference"}-${values.tools ? "tools" : values.reasoning ? "reasoning" : "text"}-${Date.now()}.json`;
 const save = () => writeFileSync(output, JSON.stringify(report, null, 2));
+const headerDirectory = mkdtempSync(join(tmpdir(), "measure-curl-"));
+process.on("exit", () => rmSync(headerDirectory, { recursive: true, force: true }));
+let headerFiles = 0;
 
 function curl(route, { body, accept, event } = {}) {
-  const config = [`url = ${JSON.stringify(new URL(route, origin).href)}`, "max-time = 300", "connect-timeout = 15", `header = ${JSON.stringify(`Authorization: Bearer ${token}`)}`, 'header = "Content-Type: application/json"', 'write-out = "%{stderr}%{json}\\n"', 'dump-header = "/dev/fd/3"'];
+  const config = [`url = ${JSON.stringify(new URL(route, origin).href)}`, "max-time = 300", "connect-timeout = 15", `header = ${JSON.stringify(`Authorization: Bearer ${token}`)}`, 'header = "Content-Type: application/json"', 'write-out = "%{stderr}%{json}\\n"'];
+  const headerFile = join(headerDirectory, String(++headerFiles));
+  config.push(`dump-header = ${JSON.stringify(headerFile)}`);
   if (accept) config.push(`header = ${JSON.stringify(`Accept: ${accept}`)}`);
   if (body !== undefined) config.push(`data = ${JSON.stringify(JSON.stringify(body))}`);
   const start = performance.now();
-  const child = spawn("curl", ["--silent", "--show-error", "--no-buffer", "--config", "-"], { stdio: ["pipe", "pipe", "pipe", "pipe"] });
+  const child = spawn("curl", ["--silent", "--show-error", "--no-buffer", "--config", "-"], { stdio: ["pipe", "pipe", "pipe"] });
   let stdout = "";
   let stderr = "";
   let buffer = "";
   let parseError;
   let responseHeaders = "";
-  child.stdio[3].setEncoding("utf8");
-  child.stdio[3].on("data", chunk => responseHeaders += chunk);
   child.stdout.setEncoding("utf8");
   child.stderr.setEncoding("utf8");
   child.stderr.on("data", chunk => stderr += chunk);
@@ -61,6 +66,7 @@ function curl(route, { body, accept, event } = {}) {
     child.once("close", code => {
       let meta;
       try { meta = JSON.parse(stderr.trim().split("\n").at(-1)); } catch {}
+      try { responseHeaders = readFileSync(headerFile, "utf8"); rmSync(headerFile); } catch {}
       if (code !== 0 || !meta || parseError) { reject(new Error(`curl measurement failed (${code})`)); return; }
       const serverTiming = Object.fromEntries([...responseHeaders.matchAll(/(?:^|[,\s])([a-z_]+);dur=([0-9.]+)/g)].map(([, name, duration]) => [name, Number(duration)]));
       const timing = { status: meta.http_code, http_version: meta.http_version, dns_ms: meta.time_namelookup * 1000, tcp_ms: (meta.time_connect - meta.time_namelookup) * 1000, tls_ms: (meta.time_appconnect - meta.time_connect) * 1000, http_ttfb_ms: meta.time_starttransfer * 1000, total_ms: meta.time_total * 1000, wall_ms: performance.now() - start, server_timing: serverTiming };

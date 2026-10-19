@@ -1,6 +1,8 @@
 import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { performance } from "node:perf_hooks";
 import { parseArgs } from "node:util";
 
@@ -26,6 +28,9 @@ try { report.deployment = JSON.parse(readFileSync("output/production-deployment.
 mkdirSync("output", { recursive: true });
 const output = `output/concurrency-${scenario}-${Date.now()}.json`;
 const save = () => writeFileSync(output, JSON.stringify(report, null, 2));
+const headerDirectory = mkdtempSync(join(tmpdir(), "measure-concurrency-"));
+process.on("exit", () => rmSync(headerDirectory, { recursive: true, force: true }));
+let headerFiles = 0;
 const numeric = value => Object.fromEntries(Object.entries(value ?? {}).flatMap(([key, item]) => typeof item === "number" || typeof item === "boolean" ? [[key, item]] : item && typeof item === "object" && !Array.isArray(item) ? [[key, numeric(item)]] : []));
 const stats = values => {
   const sorted = values.filter(Number.isFinite).sort((a, b) => a - b);
@@ -34,14 +39,14 @@ const stats = values => {
 };
 
 function curl(route, { body, event, seconds = timeout } = {}) {
-  const config = [`url = ${JSON.stringify(new URL(route, origin).href)}`, `max-time = ${seconds}`, "connect-timeout = 15", `header = ${JSON.stringify(`Authorization: Bearer ${token}`)}`, 'header = "Content-Type: application/json"', 'write-out = "%{stderr}%{json}\\n"', 'dump-header = "/dev/fd/3"'];
+  const config = [`url = ${JSON.stringify(new URL(route, origin).href)}`, `max-time = ${seconds}`, "connect-timeout = 15", `header = ${JSON.stringify(`Authorization: Bearer ${token}`)}`, 'header = "Content-Type: application/json"', 'write-out = "%{stderr}%{json}\\n"'];
+  const headerFile = join(headerDirectory, String(++headerFiles));
+  config.push(`dump-header = ${JSON.stringify(headerFile)}`);
   if (event) config.push('header = "Accept: text/event-stream"');
   if (body !== undefined) config.push(`data = ${JSON.stringify(JSON.stringify(body))}`);
   const started = performance.now();
-  const child = spawn("curl", ["--silent", "--show-error", "--no-buffer", "--config", "-"], { stdio: ["pipe", "pipe", "pipe", "pipe"] });
+  const child = spawn("curl", ["--silent", "--show-error", "--no-buffer", "--config", "-"], { stdio: ["pipe", "pipe", "pipe"] });
   let stdout = "", stderr = "", buffer = "", headers = "", parseErrors = 0;
-  child.stdio[3].setEncoding("utf8");
-  child.stdio[3].on("data", chunk => headers += chunk);
   child.stderr.setEncoding("utf8");
   child.stderr.on("data", chunk => stderr += chunk);
   child.stdout.setEncoding("utf8");
@@ -63,6 +68,7 @@ function curl(route, { body, event, seconds = timeout } = {}) {
       let meta, value;
       try { meta = JSON.parse(stderr.trim().split("\n").at(-1)); } catch {}
       try { value = stdout ? JSON.parse(stdout) : undefined; } catch {}
+      try { headers = readFileSync(headerFile, "utf8"); rmSync(headerFile); } catch {}
       resolve({ exit_code: code, parse_errors: parseErrors, status: meta?.http_code, http_version: meta?.http_version, wall_ms: performance.now() - started, dns_ms: meta?.time_namelookup * 1000, tcp_ms: (meta?.time_connect - meta?.time_namelookup) * 1000, tls_ms: (meta?.time_appconnect - meta?.time_connect) * 1000, http_ttfb_ms: meta?.time_starttransfer * 1000, server_timing: Object.fromEntries([...headers.matchAll(/(?:^|[,\s])([a-z_]+);dur=([0-9.]+)/g)].map(([, key, value]) => [key, Number(value)])), value });
     });
   });
