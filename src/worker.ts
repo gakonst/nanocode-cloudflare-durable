@@ -470,7 +470,7 @@ export class AgentSession extends DurableObject<Env> {
         },
         socket: {
           open: async (request, signal, timing) => {
-            await this.socketEffect(scope, descriptor);
+            if (this.dispatchBlocked(scope, descriptor)) throw new Error("request authority stopped");
             const response = await this.env.EGRESS.fetch(new Request("https://egress.internal/socket", { signal, headers: { upgrade: "websocket", "x-nanocode-socket": headerJson({ authority, provider: descriptor.provider ?? "claude", headers: request.headers }) } }));
             this.socketDiagnostic(scope, response.headers.get("x-nanocode-model-diagnostic"), timing);
             return response;
