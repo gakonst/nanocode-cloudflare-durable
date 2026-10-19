@@ -23,24 +23,33 @@ export class RemoteExecutor {
   #closed!: (reason: string) => void;
   readonly closed = new Promise<string>(resolve => { this.#closed = resolve; });
 
-  private constructor(socket: WebSocket, policy: RemotePolicy) {
+  private constructor(socket: WebSocket, policy: RemotePolicy, listen: boolean) {
     this.#socket = socket;
     this.#policy = policy;
-    socket.addEventListener("message", event => this.#receive(event.data));
-    socket.addEventListener("close", () => this.#fail("runner disconnected", 1000));
-    socket.addEventListener("error", () => this.#fail("runner connection failed", 1011));
+    if (!listen) return;
+    socket.addEventListener("message", event => this.receive(event.data));
+    socket.addEventListener("close", () => this.disconnected());
+    socket.addEventListener("error", () => this.disconnected("runner connection failed"));
   }
 
-  static async accept(socket: WebSocket, policy: RemotePolicy): Promise<RemoteExecutor> {
+  static hibernatable(socket: WebSocket, policy: RemotePolicy): RemoteExecutor {
     validate(policy);
-    const executor = new RemoteExecutor(socket, policy);
-    socket.accept();
+    return new RemoteExecutor(socket, policy, false);
+  }
+
+  static restore(socket: WebSocket, policy: RemotePolicy, catalog: string, name: string): RemoteExecutor {
+    const executor = RemoteExecutor.hibernatable(socket, policy);
+    executor.#catalog = catalog;
+    executor.#name = name;
+    return executor;
+  }
+
+  async ready(): Promise<void> {
     let timer: number | undefined;
     try {
-      await Promise.race([executor.#catalogReady(), new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error("hand catalog deadline elapsed")), policy.timeout_ms); })]);
-      return executor;
+      await Promise.race([this.#catalogReady(), new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error("hand catalog deadline elapsed")), this.#policy.timeout_ms); })]);
     } catch (error) {
-      executor.#fail(error instanceof Error ? error.message : String(error), 1011);
+      this.#fail(error instanceof Error ? error.message : String(error), 1011);
       throw error;
     } finally {
       if (timer !== undefined) clearTimeout(timer);
@@ -64,7 +73,7 @@ export class RemoteExecutor {
         const detail = await response.json<{ error?: string }>().then(body => body.error, () => undefined);
         throw new Error(`remote executor connection rejected with status ${response.status}${detail ? `: ${detail}` : ""}`);
       }
-      executor = new RemoteExecutor(socket, policy);
+      executor = new RemoteExecutor(socket, policy, true);
       socket.accept();
       await Promise.race([executor.#catalogReady(), deadline]);
       return executor;
@@ -82,6 +91,18 @@ export class RemoteExecutor {
 
   get name(): string | undefined {
     return this.#name;
+  }
+
+  get catalog(): string | undefined {
+    return this.#catalog;
+  }
+
+  get socket(): WebSocket {
+    return this.#socket;
+  }
+
+  disconnected(reason = "runner disconnected"): void {
+    this.#fail(reason, reason === "runner disconnected" ? 1000 : 1011);
   }
 
   async execute(request: any, id: number): Promise<unknown> {
@@ -137,7 +158,7 @@ export class RemoteExecutor {
     return new Promise((resolve, reject) => { this.#catalogWaiter = { resolve, reject }; });
   }
 
-  #receive(data: unknown) {
+  receive(data: unknown): void {
     if (this.#failure !== undefined) return;
     if (typeof data !== "string") return this.#fail("remote code mode requires JSON text frames", 1003);
     if (encoder.encode(data).byteLength > this.#policy.max_frame_bytes) return this.#fail("remote code mode frame exceeds caller max_frame_bytes policy", 1009);

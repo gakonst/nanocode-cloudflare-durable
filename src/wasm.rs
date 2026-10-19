@@ -171,6 +171,7 @@ async fn open(config: Configuration) -> Result<Session, String> {
             OpenAi::builder(OpenAiAuth::managed_chatgpt(Arc::new(auth::WorkerAuth)))
                 .model(Model::Sol)
                 .transport(ResponsesTransport::WebSocket)
+                .raw_api_events(false)
                 .store(false)
                 .websocket_warmup(false)
                 .api_base_url(config.endpoint)

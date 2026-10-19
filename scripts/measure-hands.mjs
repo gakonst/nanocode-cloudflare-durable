@@ -255,6 +255,16 @@ try {
   const idle = await turn("where-idle", "hands-where", laptopName);
   expect(idle.results[0]?.text.includes(workspaces.laptop), `idle hand: ${JSON.stringify(idle.results)}`);
 
+  await mf.unsafeEvictDurableObject("nanocode-worker", "AgentSession", { name });
+  const hibernated = await attached();
+  expect(hibernated.includes(laptopName) && hibernated.includes("desk"), `hands after the session left memory: ${JSON.stringify(hibernated)}`);
+  const woken = await turn("where-woken", "hands-where", laptopName);
+  expect(woken.results[0]?.text.includes(workspaces.laptop), `hand after the session left memory: ${JSON.stringify(woken.results)}`);
+  const wokenFanout = await turn("fanout-woken", "hands-fanout", "desk");
+  expect(output(wokenFanout.results[0]).length === 2, `fan-out after the session left memory: ${JSON.stringify(wokenFanout.results)}`);
+  const hibernationReconnects = (logs.laptop.match(/hand: connected/g) ?? []).length - reconnects;
+  expect(hibernationReconnects === 0, `hand reconnected when the session left memory: ${logs.laptop}`);
+
   const latencies = [];
   for (let index = 0; index < latencyTurns; index++) latencies.push((await turn(`latency-${index}`, "hands-latency", index % 2 ? "desk" : laptopName)).milliseconds);
   latencies.sort((a, b) => a - b);
@@ -281,6 +291,7 @@ try {
     reconnect_to_attached_ms: reconnectMs,
     idle_ms: keepaliveMs,
     idle_reconnects: reconnects - 1,
+    hibernation: { hands_listed_after_eviction: hibernated, home_turn_ms: woken.milliseconds, fan_out_turn_ms: wokenFanout.milliseconds, reconnects: hibernationReconnects },
     single_exec_turn_ms: { median: latencies[Math.floor(latencies.length / 2)], min: latencies[0], max: latencies.at(-1) },
     model_calls: modelCalls,
     measurements,

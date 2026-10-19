@@ -82,12 +82,14 @@ export class AgentRuntime {
   private pendingAtOpen: string[] = [];
   private readonly attached = new Set<string>();
   hands = false;
+  remote = false;
 
   private constructor(private readonly store: CheckpointStore, private readonly options: RuntimeOptions) {}
 
   static async create(config: AgentConfiguration, store: CheckpointStore, options: RuntimeOptions): Promise<AgentRuntime> {
     const runtime = new AgentRuntime(store, options);
     runtime.hands = config.hands ?? false;
+    runtime.remote = config.remote ?? false;
     const instantiateStarted = performance.now();
     const instance = await WebAssembly.instantiate(module, { host: runtime.imports() });
     runtime.timings.record("wasm.instantiate", performance.now() - instantiateStarted);
@@ -496,6 +498,10 @@ export class AgentRuntime {
     entry.waiter = undefined;
     waiter?.resolve({ closed: detail });
     for (const watcher of entry.watchers.splice(0)) watcher();
+  }
+
+  releaseConnections(): void {
+    this.closeSockets("released while the session is idle", "closed");
   }
 
   private closeSockets(detail: string, outcome: ModelTiming["outcome"]) {

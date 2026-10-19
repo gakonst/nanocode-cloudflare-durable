@@ -27,7 +27,7 @@ export interface Env {
   SESSION_LOCATION_HINT?: DurableObjectLocationHint;
 }
 
-type Job = { request_id: string; prompt: string; status: string; result: string | null; scope: string; descriptor: string; cancel_requested: number };
+type Job = { request_id: string; prompt: string; status: string; result: string | null; scope: string; descriptor: string; cancel_requested: number; first_seq: number | null; last_seq: number | null };
 type Running = { job: Job; runtime: AgentRuntime };
 type TurnTiming = { started: number; admitted_at?: number; admission_ms?: number; pump_wait_ms?: number; runtime_open_ms?: number; runtime_reused?: boolean; run_ms?: number; recovered?: boolean; checkpoints: TimingSnapshot; runtime?: TimingSnapshot };
 
@@ -38,6 +38,7 @@ function policy(value: string, name: string): number {
 }
 
 const handName = (value: unknown): value is string => typeof value === "string" && EXECUTOR_ID.test(value);
+const HAND_TAG = "hand";
 
 async function ownerAuthorized(request: Request, env: Env): Promise<boolean> {
   if (!env.WORKER_TOKEN) return false;
@@ -100,7 +101,7 @@ export class AgentSession extends DurableObject<Env> {
   private readonly residents = new Map<string, AgentRuntime>();
   private readonly hands = new Map<string, Map<string, { connection: string; executor: RemoteExecutor; ready: boolean }>>();
   private readonly connections = new Map<string, RemoteExecutor>();
-  private nextConnection = 0;
+  private readonly handSockets = new Map<WebSocket, RemoteExecutor>();
   private running?: Running;
   private pumping = false;
   private readonly eventHub = new EventHub();
@@ -116,17 +117,21 @@ export class AgentSession extends DurableObject<Env> {
     ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS jobs (request_id TEXT PRIMARY KEY, prompt TEXT NOT NULL, status TEXT NOT NULL, result TEXT);
       CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-      CREATE TABLE IF NOT EXISTS events (seq INTEGER PRIMARY KEY AUTOINCREMENT, scope TEXT NOT NULL, request_id TEXT, body TEXT NOT NULL, created_at INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS events (seq INTEGER PRIMARY KEY, scope TEXT NOT NULL, request_id TEXT, body TEXT NOT NULL, created_at INTEGER NOT NULL);
       CREATE INDEX IF NOT EXISTS unfinished_jobs ON jobs(status);
-      CREATE INDEX IF NOT EXISTS scoped_events ON events(scope, seq);
-      CREATE INDEX IF NOT EXISTS scoped_request_events ON events(scope, request_id, seq);
+      DROP INDEX IF EXISTS scoped_events;
+      DROP INDEX IF EXISTS scoped_request_events;
       CREATE TABLE IF NOT EXISTS grant_fences (grant_id TEXT PRIMARY KEY, revision INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS event_turns (scope TEXT NOT NULL, turn_id TEXT NOT NULL, request_id TEXT NOT NULL, PRIMARY KEY (scope, turn_id));
+      CREATE TABLE IF NOT EXISTS hand_sockets (connection TEXT PRIMARY KEY, scope TEXT NOT NULL, hand TEXT NOT NULL, catalog TEXT NOT NULL) WITHOUT ROWID;
     `);
     const columns = new Set(ctx.storage.sql.exec("PRAGMA table_info(jobs)").toArray().map(row => row.name));
     if (!columns.has("scope")) ctx.storage.sql.exec("ALTER TABLE jobs ADD COLUMN scope TEXT NOT NULL DEFAULT 'owner'");
     if (!columns.has("descriptor")) ctx.storage.sql.exec("ALTER TABLE jobs ADD COLUMN descriptor TEXT NOT NULL DEFAULT '{}'");
     if (!columns.has("cancel_requested")) ctx.storage.sql.exec("ALTER TABLE jobs ADD COLUMN cancel_requested INTEGER NOT NULL DEFAULT 0");
+    if (!columns.has("first_seq")) ctx.storage.sql.exec("ALTER TABLE jobs ADD COLUMN first_seq INTEGER");
+    if (!columns.has("last_seq")) ctx.storage.sql.exec("ALTER TABLE jobs ADD COLUMN last_seq INTEGER");
+    this.restoreHands();
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -143,7 +148,7 @@ export class AgentSession extends DurableObject<Env> {
       if (this.isFenced(descriptor)) return json({ error: "grant revoked" }, 403);
       const scope = descriptor.grant_id ?? "owner";
       const parts = url.pathname.split("/");
-      if (request.method === "GET" && parts[2] === "metrics") return json({ ...this.counts, model_diagnostics: this.modelDiagnostics.filter(entry => entry.scope === scope).map(entry => entry.value), timing: this.timings.get(scope)?.snapshot() ?? {}, checkpoints: { ...this.store.metrics, timing: this.residents.get(scope)?.metrics.timing.checkpoints ?? {} }, resident_runtimes: this.runtimes.size, runtime: this.residents.get(scope)?.metrics, persisted: this.store.row("SELECT (SELECT COUNT(*) FROM states) AS states, (SELECT COUNT(*) FROM records) AS records, (SELECT COUNT(*) FROM jobs WHERE scope = ? AND status IN ('queued', 'running')) AS unfinished", scope) });
+      if (request.method === "GET" && parts[2] === "metrics") return json({ ...this.counts, object_id: this.ctx.id.toString(), database_bytes: this.ctx.storage.sql.databaseSize, model_diagnostics: this.modelDiagnostics.filter(entry => entry.scope === scope).map(entry => entry.value), timing: this.timings.get(scope)?.snapshot() ?? {}, checkpoints: { ...this.store.metrics, timing: this.residents.get(scope)?.metrics.timing.checkpoints ?? {} }, resident_runtimes: this.runtimes.size, runtime: this.residents.get(scope)?.metrics, persisted: this.store.row("SELECT (SELECT COUNT(*) FROM states) AS states, (SELECT COUNT(*) FROM records) AS records, (SELECT COUNT(*) FROM jobs WHERE scope = ? AND status IN ('queued', 'running')) AS unfinished", scope) });
       if (request.method === "GET" && parts[2] === "events") return this.events(scope, url, request.headers.get("accept")?.includes("text/event-stream"), descriptor);
       if (parts[2] === "socket") return json({ error: "use the authenticated event stream" }, 405);
       if (parts[2] === "hands") {
@@ -201,8 +206,8 @@ export class AgentSession extends DurableObject<Env> {
           this.ctx.storage.sql.exec("INSERT INTO metadata VALUES (?, ?) ON CONFLICT(key) DO NOTHING", executorKey, executor);
           this.sessionId(scope, descriptor.session_id);
           this.ctx.storage.sql.exec("INSERT INTO metadata VALUES (?, ?) ON CONFLICT(key) DO NOTHING", `background:${scope}`, JSON.stringify(descriptor));
-          this.ctx.storage.sql.exec("INSERT INTO jobs (request_id, prompt, status, result, scope, descriptor, cancel_requested) VALUES (?, ?, 'queued', NULL, ?, ?, 0)", input.request_id, input.prompt, scope, JSON.stringify(descriptor));
-          this.insertEvent(scope, input.request_id, { type: "queued", request_id: input.request_id });
+          const queued = this.insertEvent(scope, input.request_id, { type: "queued", request_id: input.request_id });
+          this.ctx.storage.sql.exec("INSERT INTO jobs (request_id, prompt, status, result, scope, descriptor, cancel_requested, first_seq) VALUES (?, ?, 'queued', NULL, ?, ?, 0, ?)", input.request_id, input.prompt, scope, JSON.stringify(descriptor), queued);
         });
         this.turnTimings.set(input.request_id, { started: admitted, checkpoints: {} });
       }
@@ -222,7 +227,7 @@ export class AgentSession extends DurableObject<Env> {
       if (streaming) {
         const cursor = Number(url.searchParams.get("after") ?? "0");
         const terminal = !["queued", "running"].includes(job.status);
-        const last = terminal ? this.store.row("SELECT seq FROM events WHERE scope = ? AND request_id = ? ORDER BY seq DESC LIMIT 1", scope, input.request_id)?.seq : undefined;
+        const last = terminal ? job.last_seq ?? this.store.row("SELECT seq FROM events WHERE scope = ? AND request_id = ? ORDER BY seq DESC LIMIT 1", scope, input.request_id)?.seq : undefined;
         if (terminal && (last === undefined || cursor >= Number(last))) return new Response(null, { headers: { "content-type": "text/event-stream", "cache-control": "no-store" } });
         return this.events(scope, url, true, descriptor, input.request_id);
       }
@@ -345,9 +350,10 @@ export class AgentSession extends DurableObject<Env> {
       if (runtime) await runtime.dispose().catch(() => {});
     } finally {
       this.running = undefined;
-      this.pumping = false;
       const unfinished = this.store.row("SELECT request_id FROM jobs WHERE status IN ('queued', 'running') LIMIT 1");
       const background = this.store.row("SELECT key FROM metadata WHERE key LIKE 'background:%' LIMIT 1");
+      if (!unfinished && !background) this.releaseIdle();
+      this.pumping = false;
       if (unfinished || background) await this.ctx.storage.setAlarm(Date.now() + delay);
       else await this.ctx.storage.deleteAlarm();
       if (immediate && unfinished) this.ctx.waitUntil(this.pump(true));
@@ -385,7 +391,7 @@ export class AgentSession extends DurableObject<Env> {
       this.counts.runtime_initializations++;
       resident = (async () => {
         const authority = { account_id: descriptor.account_id, session_id: sessionId, grant_id: descriptor.grant_id, grant_revision: descriptor.grant_revision, connections: descriptor.connections, catalog_digest: descriptor.catalog_digest, grant_expires_at: descriptor.grant_expires_at, executor_id: descriptor.executor_id };
-        const enabled = !!descriptor.executor_id || (this.env.RUNNER_ENABLED === "true" && (!descriptor.grant_id || descriptor.connections?.includes(LEGACY_RUNNER)));
+        const enabled = this.executorEnabled(descriptor);
         let remote: RemoteExecutor | undefined;
         let remoteFailed = false;
         const owner = {};
@@ -481,24 +487,31 @@ export class AgentSession extends DurableObject<Env> {
     if (requested !== undefined && !handName(requested)) return json({ error: "invalid hand" }, 400);
     if (request.headers.get("upgrade")?.toLowerCase() !== "websocket") return json({ error: "hands attach over WebSocket" }, 426);
     if (requested !== undefined && descriptor.grant_id && !descriptor.connections?.includes(runnerConnection(requested))) return json({ error: "hand is not selected by this grant" }, 403);
-    const limits = { max_frame_bytes: policy(this.env.REMOTE_MAX_FRAME_BYTES, "REMOTE_MAX_FRAME_BYTES"), timeout_ms: policy(this.env.REMOTE_TIMEOUT_MS, "REMOTE_TIMEOUT_MS") };
     const [client, server] = Object.values(new WebSocketPair());
-    this.ctx.waitUntil(this.registerHand(scope, requested, server, limits, descriptor));
+    this.ctx.acceptWebSocket(server, [HAND_TAG]);
+    const executor = RemoteExecutor.hibernatable(server, this.handLimits());
+    this.handSockets.set(server, executor);
+    this.ctx.waitUntil(this.registerHand(scope, requested, executor, descriptor));
     return new Response(null, { status: 101, webSocket: client });
   }
 
-  private async registerHand(scope: string, requested: string | undefined, socket: WebSocket, limits: { max_frame_bytes: number; timeout_ms: number }, descriptor: SessionDescriptor): Promise<void> {
-    let executor: RemoteExecutor;
-    try { executor = await RemoteExecutor.accept(socket, limits); } catch { return; }
+  private handLimits() {
+    return { max_frame_bytes: policy(this.env.REMOTE_MAX_FRAME_BYTES, "REMOTE_MAX_FRAME_BYTES"), timeout_ms: policy(this.env.REMOTE_TIMEOUT_MS, "REMOTE_TIMEOUT_MS") };
+  }
+
+  private async registerHand(scope: string, requested: string | undefined, executor: RemoteExecutor, descriptor: SessionDescriptor): Promise<void> {
+    try { await executor.ready(); } catch { this.handSockets.delete(executor.socket); return; }
     const hand = requested ?? executor.name;
-    if (!handName(hand) || (descriptor.grant_id && !descriptor.connections?.includes(runnerConnection(hand)))) return executor.dispose();
-    const connection = `${hand}#${++this.nextConnection}`;
-    let hands = this.hands.get(scope);
-    if (!hands) this.hands.set(scope, hands = new Map());
-    const previous = hands.get(hand);
-    hands.set(hand, { connection, executor, ready: false });
-    this.connections.set(connection, executor);
-    void executor.closed.then(() => this.detachHand(scope, hand, connection));
+    if (!handName(hand) || (descriptor.grant_id && !descriptor.connections?.includes(runnerConnection(hand)))) {
+      this.handSockets.delete(executor.socket);
+      return executor.dispose();
+    }
+    const connection = `${hand}#${crypto.randomUUID()}`;
+    this.ctx.storage.sql.exec("INSERT INTO hand_sockets VALUES (?, ?, ?, ?)", connection, scope, hand, executor.catalog!);
+    executor.socket.serializeAttachment({ connection });
+    const previous = this.hands.get(scope)?.get(hand);
+    this.indexHand(scope, hand, connection, executor, false);
+    const hands = this.hands.get(scope)!;
     if (previous) await previous.executor.dispose();
     const resident = this.runtimes.get(scope);
     const runtime = resident && await resident.catch(() => undefined);
@@ -506,6 +519,62 @@ export class AgentSession extends DurableObject<Env> {
     const entry = hands.get(hand);
     if (entry?.connection !== connection) return;
     entry.ready = true;
+  }
+
+  private indexHand(scope: string, hand: string, connection: string, executor: RemoteExecutor, ready: boolean): void {
+    let hands = this.hands.get(scope);
+    if (!hands) this.hands.set(scope, hands = new Map());
+    hands.set(hand, { connection, executor, ready });
+    this.connections.set(connection, executor);
+    void executor.closed.then(() => this.detachHand(scope, hand, connection));
+  }
+
+  private restoreHands(): void {
+    const sockets = this.ctx.getWebSockets(HAND_TAG);
+    const live: string[] = [];
+    for (const socket of sockets) {
+      const connection = (socket.deserializeAttachment() as { connection?: string } | null)?.connection;
+      const row = connection ? this.store.row("SELECT scope, hand, catalog FROM hand_sockets WHERE connection = ?", connection) : undefined;
+      if (!connection || !row) {
+        try { socket.close(1011, "hand registration was lost"); } catch {}
+        continue;
+      }
+      live.push(connection);
+      const executor = RemoteExecutor.restore(socket, this.handLimits(), String(row.catalog), String(row.hand));
+      this.handSockets.set(socket, executor);
+      this.indexHand(String(row.scope), String(row.hand), connection, executor, true);
+    }
+    this.ctx.storage.sql.exec("DELETE FROM hand_sockets WHERE connection NOT IN (SELECT value FROM json_each(?))", JSON.stringify(live));
+  }
+
+  async webSocketMessage(socket: WebSocket, message: string | ArrayBuffer): Promise<void> {
+    const executor = this.handSockets.get(socket);
+    if (executor) executor.receive(message);
+    else try { socket.close(1011, "unknown hand connection"); } catch {}
+  }
+
+  async webSocketClose(socket: WebSocket): Promise<void> {
+    this.handSockets.get(socket)?.disconnected();
+    this.handSockets.delete(socket);
+  }
+
+  async webSocketError(socket: WebSocket): Promise<void> {
+    this.handSockets.get(socket)?.disconnected("runner connection failed");
+    this.handSockets.delete(socket);
+  }
+
+  private executorEnabled(descriptor: SessionDescriptor): boolean {
+    return !!descriptor.executor_id || (this.env.RUNNER_ENABLED === "true" && (!descriptor.grant_id || !!descriptor.connections?.includes(LEGACY_RUNNER)));
+  }
+
+  private releaseIdle(): void {
+    for (const [scope, runtime] of this.residents) {
+      if (!runtime.remote) { runtime.releaseConnections(); continue; }
+      this.runtimes.delete(scope);
+      this.residents.delete(scope);
+      this.releaseHands(scope);
+      void runtime.dispose().catch(() => {});
+    }
   }
 
   private handsMode(scope: string, descriptor: SessionDescriptor): boolean {
@@ -524,6 +593,9 @@ export class AgentSession extends DurableObject<Env> {
   }
 
   private detachHand(scope: string, hand: string, connection: string): void {
+    const executor = this.connections.get(connection);
+    if (executor) this.handSockets.delete(executor.socket);
+    this.ctx.storage.sql.exec("DELETE FROM hand_sockets WHERE connection = ?", connection);
     this.connections.delete(connection);
     const hands = this.hands.get(scope);
     if (hands?.get(hand)?.connection === connection) hands.delete(hand);
@@ -537,8 +609,8 @@ export class AgentSession extends DurableObject<Env> {
     const { started, admitted_at, checkpoints, runtime: before, ...phases } = timing ?? { started: performance.now(), checkpoints: {} };
     const measured = { ...result, timing: { ...phases, observed_ms: performance.now() - started, runtime_id: runtime?.runtime_id, checkpoint_spans: timingDifference(runtime?.checkpoints ?? {}, checkpoints), runtime_spans: runtime ? timingDifference(runtime.spans, before ?? {}) : undefined } };
     this.ctx.storage.transactionSync(() => {
-      this.ctx.storage.sql.exec("UPDATE jobs SET status = ?, result = ? WHERE request_id = ?", status, JSON.stringify(measured), job.request_id);
-      this.insertEvent(job.scope, job.request_id, { type: "result", request_id: job.request_id, status, ...measured });
+      const last = this.insertEvent(job.scope, job.request_id, { type: "result", request_id: job.request_id, status, ...measured });
+      this.ctx.storage.sql.exec("UPDATE jobs SET status = ?, result = ?, last_seq = ? WHERE request_id = ?", status, JSON.stringify(measured), last, job.request_id);
     });
     this.turnTimings.delete(job.request_id);
   }
@@ -615,7 +687,9 @@ export class AgentSession extends DurableObject<Env> {
     const limit = Number(url.searchParams.get("limit") ?? this.env.EVENT_PAGE_SIZE);
     const maximum = policy(this.env.EVENT_PAGE_SIZE, "EVENT_PAGE_SIZE");
     if (!Number.isSafeInteger(after) || after < 0 || !Number.isSafeInteger(limit) || limit < 1 || limit > maximum) return json({ error: `after must be a nonnegative integer and limit must be between 1 and ${maximum}` }, 400);
+    const first = requestId === undefined ? null : this.job(requestId)?.first_seq ?? null;
     const read = (cursor: number) => {
+      if (first !== null) cursor = Math.max(cursor, first - 1);
       const query = requestId === undefined
         ? this.ctx.storage.sql.exec<{ seq: number; request_id: string | null; body: string; created_at: number }>("SELECT seq, request_id, body, created_at FROM events WHERE scope = ? AND seq > ? ORDER BY seq LIMIT ?", scope, cursor, limit)
         : this.ctx.storage.sql.exec<{ seq: number; request_id: string | null; body: string; created_at: number }>("SELECT seq, request_id, body, created_at FROM events WHERE scope = ? AND request_id = ? AND seq > ? ORDER BY seq LIMIT ?", scope, requestId, cursor, limit);
@@ -626,7 +700,7 @@ export class AgentSession extends DurableObject<Env> {
     return json(read(after));
   }
 
-  private insertEvent(scope: string, requestId: string | null, event: unknown, turns?: Map<string, string>): void {
+  private insertEvent(scope: string, requestId: string | null, event: unknown, turns?: Map<string, string>): number {
     const value = event as any;
     const sdk = value?.source === "agent" ? value.event : value?.source === "subagent" ? value.update?.event : undefined;
     const turnId = sdk?.payload?.turn_id;
@@ -653,9 +727,10 @@ export class AgentSession extends DurableObject<Env> {
       }
     }
     else if (typeof acceptedId === "string") requestId = acceptedId;
-    this.ctx.storage.sql.exec("INSERT INTO events (scope, request_id, body, created_at) VALUES (?, ?, ?, ?)", scope, requestId, JSON.stringify(event), Date.now());
+    const seq = this.ctx.storage.sql.exec<{ seq: number }>("INSERT INTO events (scope, request_id, body, created_at) VALUES (?, ?, ?, ?) RETURNING seq", scope, requestId, JSON.stringify(event), Date.now()).one().seq;
     this.counts.events_written++;
     this.eventHub.notify();
+    return seq;
   }
 
   private async appendEvent(scope: string, requestId: string | null, event: unknown): Promise<void> {

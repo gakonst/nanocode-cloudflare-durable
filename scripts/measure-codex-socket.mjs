@@ -254,62 +254,76 @@ const calls = (list, ids) => kinds(list, "model.call.completed").filter(entry =>
 try {
   await launch();
   const name = `codex-socket-${stamp}`;
+  const closedByClient = async session => (await stats()).closed.filter(entry => entry.session === session && entry.by === "client").length;
+  const released = async () => until(async () => (await stats()).open === 0, "The idle session kept its socket open");
   const turns = [await turn(name, "first", "Say hello"), await turn(name, "tool", "Please use a tool to list connections")];
   for (let index = 0; index < SAMPLES; index++) turns.push(await turn(name, `warm-${index}`, "Say hello again"));
   const session = turns[0].session;
+  await released();
   let state = await stats();
   let list = await events(name);
   const handshakes = ofSession(state.handshakes, session);
   const requests = ofSession(state.requests, session);
   const socketMetrics = await metrics(name);
-  check(handshakes.length === 1 && requests.length === turns.length + 1, "Eleven model calls across ten turns of one session used exactly one upstream WebSocket handshake");
-  check(requests.every(entry => entry.transport === "websocket" && entry.connection === requests[0].connection && entry.type === "response.create" && entry.store === false && entry.lite_metadata === "true"), "Every model call was a response.create frame on the same socket");
-  check(requests[0].previous === null && requests.slice(1).every(entry => entry.continued && !entry.missing), "Calls after the first send only new input with a previous_response_id the socket already holds");
+  check(handshakes.length === turns.length && requests.length === turns.length + 1, "Each of ten turns opened one upstream WebSocket and the tool turn's two model calls shared it");
+  check(requests.every(entry => entry.transport === "websocket" && entry.type === "response.create" && entry.store === false && entry.lite_metadata === "true"), "Every model call was a response.create frame on a socket");
+  check(requests[2].connection === requests[1].connection && requests[2].continued && !requests[2].missing && requests.filter((_, index) => index !== 2).every(entry => entry.previous === null), "Calls within a turn send only new input on that turn's socket, and each turn's first call replays the full history on a fresh socket");
   check(handshakes.every(entry => entry.authorized && entry.original && entry.beta === BETA && entry.lite === "true" && entry.timing_metrics === "true" && entry.thread && entry.user_agent?.startsWith("nanocode-worker/") && !entry.header_names.some(header => header.startsWith("x-nanocode"))), "The handshake carries egress-injected credentials, the native SDK WebSocket headers and no internal headers");
   const connected = kinds(list, "model.connection.completed");
-  check(connected.length === 1 && connected[0].payload.http_status === 101 && connected[0].payload.request_id === "req_ws_1" && connected[0].payload.server_model === "gpt-6.1-sol", "Handshake metadata from the projected 101 response reached the SDK");
+  check(connected.length === turns.length && connected.every(entry => entry.payload.http_status === 101 && entry.payload.server_model === "gpt-6.1-sol") && connected[0].payload.request_id === "req_ws_1", "Handshake metadata from each projected 101 response reached the SDK");
   const toolRequest = requests.find(entry => entry.last === "tool_output");
   check(turns[1].message === "tool-ok" && toolRequest?.tool_call_known && toolRequest.tool_output_ok && toolRequest.continued && kinds(list, "tool.result", "tool").length === 1, "A list_connections tool-call loop completed over the socket with incremental tool output");
-  check(socketMetrics.runtime.model_sockets === 1 && socketMetrics.runtime.model_requests === 0 && socketMetrics.runtime.socket_sends === requests.length, "The resident runtime opened one socket and sent no HTTPS model requests");
-  check(socketMetrics.model_diagnostics.length === 1 && socketMetrics.model_diagnostics[0].websocket && socketMetrics.model_diagnostics[0].status === 101 && socketMetrics.model_diagnostics[0].transport === "fixed_binding", "The handshake recorded one safe websocket diagnostic through the fixed binding");
+  check(socketMetrics.runtime.model_sockets === turns.length && socketMetrics.runtime.model_requests === 0 && socketMetrics.runtime.socket_sends === requests.length, "The resident runtime opened one socket per turn and sent no HTTPS model requests");
+  check(socketMetrics.model_diagnostics.length === turns.length && socketMetrics.model_diagnostics.every(entry => entry.websocket && entry.status === 101 && entry.transport === "fixed_binding"), "Each handshake recorded one safe websocket diagnostic through the fixed binding");
+  check(await closedByClient(session) === turns.length, "The session closed its socket each time it went idle");
+  const evictable = await mf.unsafeEvictDurableObject("nanocode-worker", "AgentSession", { name }).then(() => true, () => false);
+  check(evictable, "An idle session holds no Codex socket, so ordinary eviction proceeds");
   const socketCalls = calls(list, turns.slice(2).map(entry => entry.id));
   const firstCall = calls(list, ["first"]);
 
+  let before = ofSession((await stats()).handshakes, session).length;
   await turn(name, "upstream-close", "Say hello then close the socket");
-  await until(async () => (await metrics(name)).runtime?.timing.models.some(model => model.transport === "websocket" && model.outcome === "eof"), "The session did not observe the upstream close");
   const reopened = await turn(name, "after-upstream-close", "Say hello after close");
   state = await stats();
   list = await events(name);
   const afterClose = ofSession(state.requests, session).at(-1);
   const closeRun = kinds(list, "run.completed", "after-upstream-close")[0]?.payload;
-  check(ofSession(state.handshakes, session).length === 2 && afterClose.connection !== requests[0].connection && afterClose.previous === null && closeRun?.response_retries === 0, "An idle socket closed by upstream is replaced before the next send with a full replay and no retry");
+  check(ofSession(state.handshakes, session).length === before + 2 && afterClose.previous === null && closeRun?.response_retries === 0, "A socket closed by upstream is replaced by the next turn with a full replay and no retry");
 
+  await released();
+  before = ofSession((await stats()).handshakes, session).length;
+  const closedBefore = await closedByClient(session);
   await submit(name, "held", "Please hold the response");
   await until(async () => ofSession((await stats()).requests, session).some(entry => entry.held), "Held request did not reach the socket");
+  await submit(name, "queued-1", "Say hello again");
+  await submit(name, "queued-2", "Say hello again");
   const cancelStarted = performance.now();
   await request(`http://worker/sessions/${name}/turns/held/cancel`, { method: "POST" });
   await settled(name, "held", "cancelled");
-  await until(async () => (await stats()).closed.filter(entry => entry.session === session && entry.by === "client").length === 1, "Cancellation did not close the in-flight socket");
+  await until(async () => await closedByClient(session) > closedBefore, "Cancellation did not close the in-flight socket");
   const cancelMs = performance.now() - cancelStarted;
-  const afterCancel = await turn(name, "after-cancel", "Say hello after cancellation");
+  const afterCancel = await settled(name, "queued-1");
+  await settled(name, "queued-2");
   state = await stats();
-  check(ofSession(state.handshakes, session).length === 3 && ofSession(state.requests, session).at(-1).previous === null && afterCancel.message === "socket-ok", "Cancelling an in-flight call closes its socket and the next turn reconnects");
+  const queued = ofSession(state.requests, session).slice(-2);
+  check(ofSession(state.handshakes, session).length === before + 2 && queued[0].previous === null && queued[1].connection === queued[0].connection && queued[1].continued && afterCancel.ok?.message === "socket-ok", "Cancelling an in-flight call closes its socket, and the turns queued behind it share one new socket without releasing it between them");
 
+  await released();
+  before = ofSession((await stats()).handshakes, session).length;
   const stalled = await turn(name, "stall", "Please stall the stream once");
   state = await stats();
   list = await events(name);
   const stallRequests = ofSession(state.requests, session).slice(-2);
-  check(stalled.message === "socket-ok" && stalled.milliseconds >= 1000 && ofSession(state.handshakes, session).length === 4 && stallRequests[0].stalled && stallRequests[1].connection !== stallRequests[0].connection && stallRequests[1].previous === null && kinds(list, "model.attempt.retrying", "stall").some(entry => entry.payload.error_class === "premature_close"), "A stalled socket response is closed at the private stream idle deadline and retried on a fresh socket");
+  check(stalled.message === "socket-ok" && stalled.milliseconds >= 1000 && ofSession(state.handshakes, session).length === before + 2 && stallRequests[0].stalled && stallRequests[1].connection !== stallRequests[0].connection && stallRequests[1].previous === null && kinds(list, "model.attempt.retrying", "stall").some(entry => entry.payload.error_class === "premature_close"), "A stalled socket response is closed at the private stream idle deadline and retried on a fresh socket");
 
-  const pinned = await mf.unsafeEvictDurableObject("nanocode-worker", "AgentSession", { name }).then(() => false, () => true);
-  check(pinned, "An open Codex socket keeps the session Durable Object resident, so ordinary eviction waits for it");
-  await turn(name, "before-eviction", "Say hello then close the socket");
-  await until(async () => (await metrics(name)).runtime?.timing.models.filter(model => model.transport === "websocket" && model.outcome === "eof").length === 2, "The session did not observe the second upstream close");
+  await released();
   await mf.unsafeEvictDurableObject("nanocode-worker", "AgentSession", { name });
+  before = ofSession((await stats()).handshakes, session).length;
   const evicted = await turn(name, "after-eviction", "Say hello after eviction");
   state = await stats();
   const evictedMetrics = await metrics(name);
-  check(ofSession(state.handshakes, session).length === 5 && ofSession(state.requests, session).at(-1).previous === null && evicted.session === session && evictedMetrics.runtime_initializations === 1 && evictedMetrics.runtime.model_sockets === 1, "Once upstream closed the socket the session was evicted, and the restored session reconnects once and completes");
+  const handshakesTotal = ofSession(state.handshakes, session).length;
+  check(handshakesTotal === before + 1 && ofSession(state.requests, session).at(-1).previous === null && evicted.session === session && evictedMetrics.runtime_initializations === 1 && evictedMetrics.runtime.model_sockets === 1, "The evicted session restores, reconnects once with a full replay and completes");
 
   const framesBeforeRestart = (await stats()).requests;
   await mf.dispose();
@@ -386,11 +400,11 @@ try {
       tool_loop: { message: turns[1].message, tool_output_on_socket: !!toolRequest },
       runtime: { model_sockets: socketMetrics.runtime.model_sockets, socket_sends: socketMetrics.runtime.socket_sends, socket_frames: socketMetrics.runtime.socket_frames, model_requests: socketMetrics.runtime.model_requests },
       diagnostic: socketMetrics.model_diagnostics[0],
-      after_upstream_close: { handshakes: 2, full_replay: afterClose.previous === null, response_retries: closeRun.response_retries, milliseconds: round(reopened.milliseconds) },
-      cancellation: { socket_closed_by_client: true, milliseconds: round(cancelMs), next_turn_ms: round(afterCancel.milliseconds) },
-      eviction_with_open_socket: "waits for active references",
+      after_upstream_close: { full_replay: afterClose.previous === null, response_retries: closeRun.response_retries, milliseconds: round(reopened.milliseconds) },
+      cancellation: { socket_closed_by_client: true, milliseconds: round(cancelMs), queued_turns_on_one_socket: queued[1].connection === queued[0].connection },
+      idle_release: { sockets_closed_when_idle: turns.length, evictable_when_idle: evictable },
       stream_idle_deadline: { idle_ms: 1000, milliseconds: round(stalled.milliseconds) },
-      after_eviction: { handshakes_total: 5, runtime_initializations: evictedMetrics.runtime_initializations, milliseconds: round(evicted.milliseconds) },
+      after_eviction: { handshakes_total: handshakesTotal, runtime_initializations: evictedMetrics.runtime_initializations, milliseconds: round(evicted.milliseconds) },
       after_restart: { handshakes: 1, full_replay_input_items: restartRequest.input_items, milliseconds: round(restarted.milliseconds) },
     },
     fallback: {
