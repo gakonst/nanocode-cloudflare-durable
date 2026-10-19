@@ -52,7 +52,7 @@ for (let after = 0; ;) {
   if (!page.has_more) break;
   after = page.next_cursor;
 }
-const sdk = events.filter(entry => entry.event?.source === "agent").map(entry => ({ request_id: entry.request_id, type: entry.event.event?.type, payload: entry.event.event?.payload ?? {} }));
+const sdk = events.filter(entry => entry.event?.source === "agent").map(entry => ({ request_id: entry.request_id, runtime_id: entry.event.host_timing?.runtime_id, type: entry.event.event?.type, payload: entry.event.event?.payload ?? {} }));
 const dispatches = [...diagnostics].filter(([key]) => !prior.has(key)).map(([, entry]) => {
   const attempt = Array.isArray(entry.attempts) ? entry.attempts.at(-1) : entry;
   const timing = timings.get(entry.runtime_id + ":" + entry.dispatch_id);
@@ -64,18 +64,20 @@ const turns = results.map(result => {
   const attempts = own.filter(entry => entry.type === "model.attempt.started").length;
   const sent = dispatches.slice(next, next + attempts);
   next += attempts;
-  const started = own.filter(entry => entry.type === "model.call.started");
+  const replays = new Map(own.filter(entry => entry.type === "model.attempt.started").map(entry => [entry.payload.model_call_index ?? entry.payload.call_index, entry.payload.replay_mode]));
   const calls = own.filter(entry => entry.type === "model.call.completed").map((entry, index) => {
     const usage = entry.payload.usage ?? {};
     const dispatch = sent.filter(value => value.status === 200)[index];
-    return { call_index: entry.payload.call_index, attempt: entry.payload.attempt, previous_response_id: dispatch?.previous_response_id ?? !!started[index]?.payload.previous_response_id, request_bytes: dispatch?.request_bytes ?? null, input_items: dispatch?.input_items ?? null, model_call_ms: Math.round((entry.payload.duration_ns ?? 0) / 1e6), first_output_ms: entry.payload.time_to_first_output_ns == null ? null : Math.round(entry.payload.time_to_first_output_ns / 1e6), input_tokens: usage.input_tokens ?? null, cached_tokens: usage.input_tokens_details?.cached_tokens ?? null, output_tokens: usage.output_tokens ?? null };
+    const replay_mode = replays.get(entry.payload.call_index) ?? null;
+    return { call_index: entry.payload.call_index, attempt: entry.payload.attempt, replay_mode, previous_response_id: dispatch?.previous_response_id ?? (replay_mode === null ? null : replay_mode === "incremental"), request_bytes: dispatch?.request_bytes ?? null, input_items: dispatch?.input_items ?? null, model_call_ms: Math.round((entry.payload.duration_ns ?? 0) / 1e6), first_output_ms: entry.payload.time_to_first_output_ns == null ? null : Math.round(entry.payload.time_to_first_output_ns / 1e6), input_tokens: usage.input_tokens ?? null, cached_tokens: usage.input_tokens_details?.cached_tokens ?? null, output_tokens: usage.output_tokens ?? null };
   });
   const retries = own.filter(entry => entry.type === "model.attempt.retrying").map(entry => ({ call_index: entry.payload.model_call_index, error_class: entry.payload.error_class, replay_mode: entry.payload.replay_mode }));
   const sum = key => calls.reduce((total, call) => total + (call[key] ?? 0), 0);
-  return { ...result, dispatches: sent, retries, calls, summary: { model_calls: calls.length, dispatches: sent.length, request_bytes: sent.reduce((total, value) => total + (value.request_bytes ?? 0), 0), max_input_items: Math.max(0, ...calls.map(call => call.input_items ?? 0)), continued_calls: calls.filter(call => call.previous_response_id).length, model_call_ms: sum("model_call_ms"), input_tokens: sum("input_tokens"), cached_tokens: sum("cached_tokens"), output_tokens: sum("output_tokens") } };
+  return { ...result, runtimes: [...new Set(own.map(entry => entry.runtime_id).filter(Boolean))], dispatches: sent, retries, calls, summary: { model_calls: calls.length, dispatches: sent.length, request_bytes: sent.reduce((total, value) => total + (value.request_bytes ?? 0), 0), max_input_items: Math.max(0, ...calls.map(call => call.input_items ?? 0)), continued_calls: calls.filter(call => call.previous_response_id).length, model_call_ms: sum("model_call_ms"), input_tokens: sum("input_tokens"), cached_tokens: sum("cached_tokens"), output_tokens: sum("output_tokens") } };
 });
 const report = { origin: origin.origin, session, at: new Date().toISOString(), runtime_initializations: initializations, turns };
+const runtimes = turns.map(value => value.runtimes.join(","));
 mkdirSync("output", { recursive: true });
 const file = "output/codex-history-" + (values.label ?? origin.hostname) + "-" + Date.now() + ".json";
 writeFileSync(file, JSON.stringify(report, null, 2));
-console.log(JSON.stringify({ file, session, runtime_initializations: initializations, turns: turns.map(({ request_id, status, ms, summary, retries, calls }) => ({ request_id, status, ms, summary, retries, calls: calls.map(call => [call.request_bytes, call.input_items, call.previous_response_id, call.model_call_ms, call.cached_tokens + "/" + call.input_tokens]) })) }, null, 2));
+console.log(JSON.stringify({ file, session, runtimes, turns: turns.map(({ request_id, status, ms, summary, retries, calls }) => ({ request_id, status, ms, summary, retries, calls: calls.map(call => [call.request_bytes, call.input_items, call.replay_mode, call.model_call_ms, call.cached_tokens + "/" + call.input_tokens]) })) }, null, 2));
