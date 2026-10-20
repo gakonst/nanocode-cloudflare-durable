@@ -48,6 +48,11 @@ function codexReply(item) {
   ];
 }
 
+function completionStatus(texts) {
+  const found = texts.find(value => value.includes("<subagent_completion"));
+  return found === undefined ? false : /<subagent_completion [^>]*status="(\w+)"/.exec(found)?.[1] ?? true;
+}
+
 function parse(provider, input) {
   if (provider === "claude") {
     const messages = input.messages ?? [];
@@ -56,7 +61,7 @@ function parse(provider, input) {
     const results = messages.slice(index + 1).flatMap(message => Array.isArray(message.content) ? message.content.filter(block => block.type === "tool_result") : []);
     const names = (input.tools ?? []).map(entry => entry.name);
     const tool = suffix => names.find(name => name === suffix || name?.endsWith(`__${suffix}`)) ?? suffix;
-    const completion = messages.slice(index + 1).some(message => message.role === "user" && claudeText(message.content).includes("<subagent_completion"));
+    const completion = completionStatus(messages.slice(index + 1).filter(message => message.role === "user").map(message => claudeText(message.content)));
     const output = results.map(block => typeof block.content === "string" ? block.content : claudeText(block.content)).join("\n");
     return { prompt, round: results.length, errors: results.filter(block => block.is_error).length, tool, completion, output };
   }
@@ -65,7 +70,7 @@ function parse(provider, input) {
   const index = items.findLastIndex(item => item.type === "message" && item.role === "user" && /turn=[\w-]+/.test(text(item)));
   const prompt = index < 0 ? "" : text(items[index]);
   const outputs = items.slice(index + 1).filter(item => item.type === "function_call_output" || item.type === "custom_tool_call_output");
-  const completion = items.slice(index + 1).some(item => item.type === "message" && text(item).includes("<subagent_completion"));
+  const completion = completionStatus(items.slice(index + 1).filter(item => item.type === "message").map(text));
   return { prompt, round: outputs.length, errors: 0, tool: suffix => suffix, completion, output: outputs.map(item => typeof item.output === "string" ? item.output : JSON.stringify(item.output)).join("\n") };
 }
 
@@ -104,13 +109,15 @@ const provider = globalThis.faultProvider = async request => {
   const input = JSON.parse(body);
   const { prompt, round, errors, tool, completion, output } = parse(kind, input);
   const turn = /turn=([\w-]+)/.exec(prompt)?.[1] ?? "unknown";
-  const entry = { turn, provider: kind, round, errors, at: performance.now(), ...(completion ? { completion } : {}), ...(output ? { output: output.slice(0, 600) } : {}) };
+  const entry = { turn, provider: kind, round, errors, at: performance.now(), ...(completion ? { completion } : {}), ...(output ? { output: output.slice(0, 2000) } : {}) };
   calls.push(entry);
   const slow = /\[slow:(\d+)\]/.exec(prompt);
   if (slow) await sleep(Number(slow[1]));
   const use = (name, value) => ({ type: "tool_use", id: `toolu_${calls.length}`, name: tool(name), input: value });
   const block = completion ? { type: "text", text: `completion for ${turn}` }
     : prompt.includes("[tool]") && round === 0 ? use("list_agents", kind === "claude" ? { include_completed: true } : {})
+    : prompt.includes("[list]") && round === 0 ? use("list_agents", { include_completed: true })
+    : prompt.includes("[wait]") && round === 0 ? use("wait_agent", { agent_ids: [1], timeout_ms: 1000 })
     : prompt.includes("[spawn]") && round === 0 ? use("spawn_agent", { role: "background child", task: `turn=kid-${turn} [child] [hold]${prompt.includes("[large]") ? ` ${"Context the child needs for its task. ".repeat(600)}` : ""}`, harness: null, model: null, thinking: null, reasoning_mode: null, output_contract: { kind: "string" } })
     : prompt.includes("[child]") && round === 0 ? use("submit_result", { output: "child-ok" })
     : prompt.includes("[exec]") && round === 0 ? { type: "tool_use", id: `toolu_${calls.length}`, name: "exec", input: { code: cells[turn] } }
@@ -131,19 +138,26 @@ let generation = 0;
 const authorization = `Bearer ${LOCAL_TOKEN}`;
 
 const PORT = 20000 + Math.floor(Math.random() * 20000);
-async function boot() {
-  mf = new Miniflare({ ...convertV4MiniflareOptions(baseOptions), port: PORT });
+function bundleOptions(bundle) {
+  const wasm = process.env.NANOCODE_WASM_PATH;
+  delete process.env.NANOCODE_WASM_PATH;
+  try { return localOptions({ provider, agent: { RECOVERY_DELAY_MS: String(DELAY) }, bundle, persistence: baseOptions.resourcePersistencePath }); }
+  finally { if (wasm !== undefined) process.env.NANOCODE_WASM_PATH = wasm; }
+}
+
+async function boot(bundle) {
+  mf = new Miniflare({ ...convertV4MiniflareOptions(bundle ? bundleOptions(bundle) : baseOptions), port: PORT });
   await mf.ready;
   generation++;
 }
 
-async function restart() {
+async function restart(bundle) {
   const started = performance.now();
   const previous = mf;
   mf = undefined;
   await previous.dispose();
   for (const [key, entry] of holds) { entry.release(undefined); holds.delete(key); }
-  await boot();
+  await boot(bundle);
   for (const watcher of watchers) await watcher.reconnect();
   return performance.now() - started;
 }
@@ -573,6 +587,30 @@ const scenarios = {
   async cell(provider) {
     return cellRun(provider);
   },
+
+  async cancelHeld(provider) {
+    return cancelHeldRun(provider);
+  },
+
+  async binding(provider) {
+    return bindingRun(provider);
+  },
+
+  async replyOrder(provider) {
+    return replyOrderRun(provider);
+  },
+
+  async pumpFault(provider) {
+    return pumpFaultRun(provider);
+  },
+
+  async legacy(provider) {
+    const bundle = process.env.FAULTS_LEGACY_BUNDLE;
+    if (!bundle) throw new Error("set FAULTS_LEGACY_BUNDLE to an output/deploy bundle built from an SDK between b22a444ae and 405fff643");
+    const outcomes = {};
+    for (const size of ["small", "large"]) for (const manifests of ["kept", "lost"]) outcomes[`${size}/${manifests}`] = await legacyRun(provider, size, manifests, bundle);
+    return outcomes;
+  },
 };
 
 async function backgroundRun(provider, size) {
@@ -613,6 +651,226 @@ async function backgroundRun(provider, size) {
   check("background", final.status === "completed" && modelCalls(after) === 1, `${label}: a later turn completes once`, final);
   await invariants("background", session);
   watcher.close();
+}
+
+function patched(patch) {
+  const options = localOptions({ provider: async request => globalThis.faultProvider(request), agent: { RECOVERY_DELAY_MS: String(DELAY) } });
+  const shim = options.workers[0].modules[0];
+  const original = "this.sqlTotals = sql;";
+  if (!shim.contents.includes(original)) throw new Error("the local shim changed; update the fault probes");
+  shim.contents = shim.contents.replace(original, `${original}\n${patch}`);
+  return new Miniflare(convertV4MiniflareOptions(options));
+}
+
+function client(local, name) {
+  const call = (path, init = {}) => local.dispatchFetch(`http://worker/sessions/${name}${path}`, { ...init, headers: { authorization, "content-type": "application/json", ...init.headers } });
+  const post = async (id, prompt, extra = {}) => { const response = await call("/turns", { method: "POST", body: JSON.stringify({ request_id: id, prompt: `turn=${id} ${prompt}`, ...extra }) }); return { status: response.status, body: await response.json() }; };
+  const read = async id => (await call(`/turns/${encodeURIComponent(id)}`)).json();
+  const finished = async id => { let last; await until(async () => { last = await read(id); return TERMINAL.has(last.status); }, `turn ${id} did not finish (last ${JSON.stringify(last)})`); return last; };
+  return { call, post, read, finished };
+}
+
+async function cancelHeldRun(provider) {
+  const local = patched(`
+    const instance = this.instance.bind(this);
+    this.instance = (...args) => instance(...args).then(runtime => {
+      if (runtime.cancelHeld) return runtime;
+      runtime.cancelHeld = true;
+      const cancel = runtime.cancel.bind(runtime);
+      runtime.cancel = async (scope, id, fields) => {
+        const answer = await cancel(scope, id, fields);
+        if (answer.turn?.report.status !== "running") return answer;
+        for (let waited = 0; waited < 10000; waited += 5) {
+          if ((await runtime.pending(scope)).some(turn => turn.report.request_id !== id && turn.report.status === "running")) break;
+          await new Promise(resolve => setTimeout(resolve, 5));
+        }
+        return answer;
+      };
+      return runtime;
+    });`);
+  const outcomes = [];
+  try {
+    await local.ready;
+    const { call, post, finished } = client(local, `faults-cancel-held-${provider}-${Date.now()}`);
+    for (let round = 0; round < ROUNDS; round++) {
+      const held = `chx-${round}-${provider}`;
+      const next = `chy-${round}-${provider}`;
+      await post(held, "[hold]", { provider });
+      await until(() => holds.has(`${held}:0`), "held model call");
+      const cancelling = call(`/turns/${encodeURIComponent(held)}/cancel`, { method: "POST" });
+      await post(next, "[tool] [slow:100]", { provider });
+      const answered = await cancelling;
+      const cancelled = await finished(held);
+      const done = await finished(next);
+      const outcome = { round, cancel_status: answered.status, cancelled: cancelled.status, next: done.status, next_error: done.error, next_calls: modelCalls(next) };
+      outcomes.push(outcome);
+      check("cancelHeld", cancelled.status === "cancelled" && done.status === "completed" && modelCalls(next) === 2, `${provider}/round ${round}: a turn that starts while a cancel reply is held runs its model calls`, outcome);
+    }
+  } finally { await local.dispose(); }
+  return outcomes;
+}
+
+async function bindingRun(provider) {
+  const other = provider === "claude" ? "codex" : "claude";
+  const local = patched(`
+    const instance = this.instance.bind(this);
+    const cold = new Promise(resolve => setTimeout(resolve, 100));
+    this.instance = (...args) => cold.then(() => instance(...args));`);
+  const outcomes = [];
+  try {
+    await local.ready;
+    for (let round = 0; round < ROUNDS; round++) {
+      for (const [field, values] of [["provider", [provider, other]], ["executor", ["alpha", "beta"]]]) {
+        const name = `faults-binding-${field}-${round}-${provider}-${Date.now()}`;
+        const session = client(local, name);
+        const ids = values.map((_, index) => `bd-${field}-${round}-${index}-${provider}`);
+        const answers = await Promise.all(values.map((value, index) => session.post(ids[index], "plain", { provider, [field]: value })));
+        const accepted = answers.map((answer, index) => answer.status === 202 ? index : -1).filter(index => index >= 0);
+        const storage = await local.unsafeGetDurableObjectStorage("nanocode", "AgentSession", { name: objectName(name) });
+        const [bound] = await storage.exec("SELECT value FROM metadata WHERE key = ?", field === "provider" ? "model_provider:owner" : "executor:owner");
+        const results = [];
+        for (const id of accepted.map(index => ids[index])) results.push(await session.finished(id).catch(error => ({ status: String(error) })));
+        const ran = ids.map(id => [...new Set(calls.filter(entry => entry.turn === id).map(entry => entry.provider))]);
+        const outcome = { field, round, statuses: answers.map(answer => answer.status), errors: answers.map(answer => answer.body?.error ?? null), bound: bound?.value, ran, results: results.map(result => result.status) };
+        outcomes.push(outcome);
+        check("binding", accepted.length === 1 && answers.every(answer => answer.status === 202 || answer.status === 409) && bound?.value === values[accepted[0]], `${provider}/${field} round ${round}: of two first turns with different ${field}s one is accepted and binds the session and the other gets 409`, outcome);
+        if (field === "provider") check("binding", ran.every((providers, index) => providers.every(value => value === values[index])), `${provider}/${field} round ${round}: every turn ran on the provider it was admitted with`, outcome);
+      }
+    }
+  } finally { await local.dispose(); }
+  return outcomes;
+}
+
+async function replyOrderRun(provider) {
+  const local = patched(`
+    const instance = this.instance.bind(this);
+    this.instance = (...args) => instance(...args).then(runtime => {
+      if (runtime.lateReads) return runtime;
+      runtime.lateReads = true;
+      const pending = runtime.pending.bind(runtime);
+      runtime.pending = async scope => {
+        const answer = await pending(scope);
+        await new Promise(resolve => setTimeout(resolve, 50));
+        return answer;
+      };
+      return runtime;
+    });`);
+  const outcomes = [];
+  try {
+    await local.ready;
+    const session = client(local, `faults-reply-order-${provider}-${Date.now()}`);
+    for (let round = 0; round < ROUNDS; round++) {
+      const first = `ro-a-${round}-${provider}`;
+      const second = `ro-b-${round}-${provider}`;
+      const admitted = [await session.post(first, "plain", { provider })];
+      await sleep(10);
+      admitted.push(await session.post(second, "plain", { provider }));
+      const done = await Promise.all([first, second].map(id => session.finished(id).catch(error => ({ status: String(error).slice(0, 120) }))));
+      const outcome = { round, admitted: admitted.map(answer => answer.status), finished: done.map(turn => turn.status) };
+      outcomes.push(outcome);
+      check("replyOrder", done.every(turn => turn.status === "completed"), `${provider}/round ${round}: a turn admitted while the pump's pending read is answered late still runs`, outcome);
+    }
+  } finally { await local.dispose(); }
+  return outcomes;
+}
+
+async function pumpFaultRun(provider) {
+  const session = await newSession(provider, "pump-fault");
+  const watcher = await watch(session);
+  const root = `pf-${provider}`;
+  const child = `kid-${root}`;
+  await submit(session, root, "[spawn]");
+  await until(() => holds.has(`${child}:0`), "child held in inference");
+  await settled(session, root);
+  await sleep(3 * DELAY);
+  const before = await metrics(session);
+  await sql(session.name, "CREATE TRIGGER fault_injection BEFORE INSERT ON metadata WHEN NEW.key LIKE 'background:%' BEGIN SELECT RAISE(ABORT, 'injected fault'); END");
+  await until(async () => (await metrics(session)).alarms >= before.alarms + 2, "alarm pumps failed under the fault", 10 * DELAY + 5000);
+  const during = await metrics(session);
+  await sql(session.name, "DROP TRIGGER fault_injection");
+  await sleep(2 * DELAY);
+  const entry = holds.get(`${child}:0`);
+  if (entry) { holds.delete(`${child}:0`); entry.release(entry.reply()); }
+  await until(() => calls.some(call => call.turn === root && call.completion), "completion turn after the fault", 20000);
+  await invariants("pumpFault", session);
+  const after = await metrics(session);
+  const outcome = { resident_runtimes: [before.resident_runtimes, during.resident_runtimes], runtime_initializations: [before.runtime_initializations, during.runtime_initializations, after.runtime_initializations], child_calls: modelCalls(child, 0), released_held_call: !!entry };
+  check("pumpFault", during.resident_runtimes === before.resident_runtimes, `${provider}: a pump that fails before it has a runtime keeps the resident runtime`, outcome);
+  check("pumpFault", outcome.child_calls === 1 && after.runtime_initializations === before.runtime_initializations, `${provider}: the background child's held call finished on the resident runtime without being repeated`, outcome);
+  watcher.close();
+  return outcome;
+}
+
+const LARGE_RECORDS = "FROM records WHERE state_id = ? AND key LIKE 'b3:%' AND substr(value, 1, 1) IN ('%', '^')";
+
+async function legacyRun(provider, size, manifests, bundle) {
+  const label = `${provider}/${size}/${manifests}`;
+  await restart(bundle);
+  const session = await newSession(provider, `legacy-${size}-${manifests}`);
+  const watcher = await watch(session);
+  const root = `lg-${size}-${manifests}-${provider}`;
+  const child = `kid-${root}`;
+  await submit(session, root, size === "large" ? "[spawn] [large]" : "[spawn]");
+  await until(() => holds.has(`${child}:0`), "child held in inference");
+  const done = await settled(session, root);
+  check("legacy", done.status === "completed", `${label}: root turn completed on the affected build while its child runs`, done);
+  await sleep(3 * DELAY);
+  const [{ value: rootId }] = await sql(session.name, "SELECT value FROM metadata WHERE key = 'session_id'");
+  const journal = `${rootId}:subagents`;
+  const large = await sql(session.name, `SELECT key ${LARGE_RECORDS}`, journal);
+  const outcome = { large_records: large.length };
+  if (manifests === "lost") {
+    if (!large.length) { await restart(); await invariants("legacy", session); watcher.close(); return { ...outcome, skipped: "the affected build wrote no record of 16 KiB or more" }; }
+    await sql(session.name, `DELETE ${LARGE_RECORDS}`, journal);
+  }
+  const before = calls.length;
+  await restart();
+  outcome.quiet = await until(async () => {
+    const [marker] = await sql(session.name, "SELECT COUNT(*) AS count FROM metadata WHERE key LIKE 'background:%'");
+    return marker.count === 0 && (await metrics(session)).alarm_at === null ? true : undefined;
+  }, "quiescence after the restart", 20 * DELAY + 5000).then(() => true, () => false);
+  const window = await metrics(session);
+  await sleep(5 * DELAY);
+  const later = await metrics(session);
+  outcome.alarms_after = later.alarms - window.alarms;
+  outcome.alarm_at = later.alarm_at;
+  const completions = () => calls.slice(before).filter(call => call.turn === root && call.completion).map(call => call.completion);
+  const childCalls = calls.slice(before).filter(call => call.turn === child);
+  outcome.completions = completions();
+  outcome.child_calls = childCalls.length;
+  const probe = async kind => {
+    const id = `lgp-${kind}-${size}-${manifests}-${provider}`;
+    await submit(session, id, `[${kind}]`);
+    await settled(session, id).catch(() => undefined);
+    return calls.find(call => call.turn === id && call.round === 1)?.output ?? "";
+  };
+  const listed = await probe("list");
+  const waited = await probe("wait");
+  outcome.list_agents = listed.slice(0, 600);
+  outcome.wait_agent = waited.slice(0, 600);
+  const lost = manifests === "lost";
+  const unreadable = lost && size === "large";
+  if (!lost) {
+    check("legacy", completions().length === 1 && completions()[0] === "completed", `${label}: the child resumed from the affected journal and the root ran one completion turn`, outcome);
+    check("legacy", childCalls.length >= 1 && childCalls.length <= 3, `${label}: the child made its interrupted call again after the restart`, outcome);
+    check("legacy", /"state":"completed"/.test(listed) && !/missing payload record|could not/.test(listed + waited), `${label}: list_agents and wait_agent report the resumed child as completed`, outcome);
+  } else if (!unreadable) {
+    check("legacy", completions().length === 1 && completions()[0] === "failed", `${label}: the child whose checkpoint is unreadable failed and the root ran one completion turn for it`, outcome);
+    check("legacy", childCalls.length === 0, `${label}: the child with an unreadable checkpoint made no model call`, outcome);
+    for (const [tool, output] of [["list_agents", listed], ["wait_agent", waited]]) check("legacy", /"state":"failed"/.test(output) && /checkpoint [^ ]+ is unreadable/.test(output), `${label}: ${tool} reports the child as failed because its checkpoint is unreadable`, outcome);
+  } else {
+    check("legacy", completions().length === 0 && childCalls.length === 0, `${label}: an unreadable journal resumed nothing`, outcome);
+    check("legacy", /could not restore subagent journal/.test(listed) && /could not restore subagent journal/.test(waited), `${label}: list_agents and wait_agent report the unreadable journal`, outcome);
+  }
+  check("legacy", outcome.quiet && outcome.alarms_after === 0, `${label}: the session becomes quiescent and its alarms stop after the restart`, outcome);
+  const after = `lga-${size}-${manifests}-${provider}`;
+  await submit(session, after, "plain");
+  const final = await settled(session, after);
+  check("legacy", final.status === "completed" && modelCalls(after) === 1, `${label}: a later turn completes once`, final);
+  check("legacy", modelCalls(root, 0) === 1, `${label}: root spawn call was not repeated`, modelCalls(root, 0));
+  await invariants("legacy", session);
+  watcher.close();
+  return outcome;
 }
 
 const handBinary = resolve(process.env.NANOCODE_SDK_PATH ?? "../nanocodex", "target/debug/nanocode");

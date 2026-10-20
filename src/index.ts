@@ -77,6 +77,8 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
     private readonly runtimes = new Map<string, Promise<AgentRuntime>>();
     private readonly residents = new Map<string, AgentRuntime>();
     private readonly blocked = new Set<string>();
+    private readonly driving = new Map<string, string>();
+    private binding?: Promise<void>;
     private readonly watchers = new Map<WebSocket, Watcher>();
     private unfinished?: boolean;
     private admissions = 0;
@@ -194,38 +196,48 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
           if (!Number.isSafeInteger(after) || after < 0 || !Number.isSafeInteger(limit) || limit < 1 || limit > policy(this.env.EVENT_PAGE_SIZE, "EVENT_PAGE_SIZE")) return json({ error: "invalid event cursor" }, 400);
         }
         const executorKey = `executor:${scope}`;
-        const storedExecutor = this.metadata.get(executorKey);
-        const initialized = this.metadata.get(scope === "owner" ? "session_id" : `session_id:${scope}`) !== undefined;
-        const legacyExecutor = this.env.RUNNER_ENABLED === "true" ? DEFAULT_EXECUTOR : "";
-        const boundExecutor = storedExecutor ?? (initialized ? legacyExecutor : undefined);
-        if (boundExecutor !== undefined && input.executor !== undefined && input.executor !== boundExecutor) return json({ error: "session executor is immutable; create a new session" }, 409);
-        const executor = input.executor ?? boundExecutor ?? legacyExecutor;
-        descriptor.executor_id = executor || undefined;
-        descriptor.hand = input.hand;
         const providerKey = `model_provider:${scope}`;
-        const boundProvider = this.metadata.get(providerKey) ?? (initialized ? "claude" : undefined);
-        descriptor.provider = input.provider ?? boundProvider ?? "claude";
-        const rejected = await (await this.instance(scope)).admit(input.request_id, boundProvider === undefined ? null : String(boundProvider), descriptor.provider!);
-        if (rejected === "reserved_request_id") return json({ error: "request_id prefix is reserved" }, 400);
-        if (rejected === "provider_changed") return json({ error: "session provider is immutable; create a new session" }, 409);
-        if (descriptor.provider === "codex") descriptor.subscription = descriptor.codex_subscription ?? true;
-        policy(this.env.RECOVERY_DELAY_MS, "RECOVERY_DELAY_MS");
-        const current = this.metadata.get("authority");
-        if (current && current !== identity) throw new Error("session authority mismatch");
-        const submitted = await (await this.instance(scope)).submit(scope, { request_id: input.request_id, prompt: input.prompt, hand: input.hand, metadata: descriptor });
-        if (submitted.submitted === "conflict") return json({ error: "request_id already belongs to different input or authority" }, 409);
-        const turn = submitted.turn;
-        if (submitted.submitted === "accepted") {
-          this.metadata.transaction(() => {
-            this.metadata.insert("authority", identity);
-            this.metadata.insert(providerKey, descriptor.provider!);
-            this.metadata.insert(executorKey, executor);
-            this.sessionId(scope, descriptor.session_id);
-          });
-          this.unfinished = true;
-          this.admissions++;
-          this.turnTimings.set(input.request_id, { started: admitted, checkpoints: {} });
+        const sessionKey = scope === "owner" ? "session_id" : `session_id:${scope}`;
+        const unbound = () => this.metadata.get(executorKey) === undefined && this.metadata.get(providerKey) === undefined && this.metadata.get(sessionKey) === undefined;
+        while (this.binding && unbound()) await this.binding;
+        let bound: (() => void) | undefined;
+        if (unbound()) this.binding = new Promise<void>(resolve => { bound = resolve; });
+        let submitted: Awaited<ReturnType<AgentRuntime["submit"]>>;
+        try {
+          const storedExecutor = this.metadata.get(executorKey);
+          const initialized = this.metadata.get(sessionKey) !== undefined;
+          const legacyExecutor = this.env.RUNNER_ENABLED === "true" ? DEFAULT_EXECUTOR : "";
+          const boundExecutor = storedExecutor ?? (initialized ? legacyExecutor : undefined);
+          if (boundExecutor !== undefined && input.executor !== undefined && input.executor !== boundExecutor) return json({ error: "session executor is immutable; create a new session" }, 409);
+          const executor = input.executor ?? boundExecutor ?? legacyExecutor;
+          descriptor.executor_id = executor || undefined;
+          descriptor.hand = input.hand;
+          const boundProvider = this.metadata.get(providerKey) ?? (initialized ? "claude" : undefined);
+          descriptor.provider = input.provider ?? boundProvider ?? "claude";
+          const rejected = await (await this.instance(scope)).admit(input.request_id, boundProvider === undefined ? null : String(boundProvider), descriptor.provider!);
+          if (rejected === "reserved_request_id") return json({ error: "request_id prefix is reserved" }, 400);
+          if (rejected === "provider_changed") return json({ error: "session provider is immutable; create a new session" }, 409);
+          if (descriptor.provider === "codex") descriptor.subscription = descriptor.codex_subscription ?? true;
+          policy(this.env.RECOVERY_DELAY_MS, "RECOVERY_DELAY_MS");
+          const current = this.metadata.get("authority");
+          if (current && current !== identity) throw new Error("session authority mismatch");
+          submitted = await (await this.instance(scope)).submit(scope, { request_id: input.request_id, prompt: input.prompt, hand: input.hand, metadata: descriptor });
+          if (submitted.submitted === "conflict") return json({ error: "request_id already belongs to different input or authority" }, 409);
+          if (submitted.submitted === "accepted") {
+            this.metadata.transaction(() => {
+              this.metadata.insert("authority", identity);
+              this.metadata.insert(providerKey, descriptor.provider!);
+              this.metadata.insert(executorKey, executor);
+              this.sessionId(scope, descriptor.session_id);
+            });
+            this.unfinished = true;
+            this.admissions++;
+            this.turnTimings.set(input.request_id, { started: admitted, checkpoints: {} });
+          }
+        } finally {
+          if (bound) { this.binding = undefined; bound(); }
         }
+        const turn = submitted.turn;
         const unfinished = UNFINISHED.has(turn.report.status);
         if (unfinished && !this.pumping) await this.ctx.storage.setAlarm(Date.now() + policy(this.env.RECOVERY_DELAY_MS, "RECOVERY_DELAY_MS"));
         if (submitted.submitted === "accepted") {
@@ -272,12 +284,13 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
       let retryAt: number | undefined;
       try {
         if (!watchdogArmed) await this.ctx.storage.setAlarm(Date.now() + delay);
-        const pending = await (await this.instance(OWNER)).pending(OWNER);
+        const reader = await this.instance(OWNER);
         const admissions = this.admissions;
+        const pending = await reader.pending(OWNER);
         const next = pending[0];
-        this.unfinished = !!next;
+        this.unfinished = next ? true : admissions === this.admissions ? false : undefined;
         const background = this.metadata.first("background:");
-        if (!next && !background) return;
+        if (!next && !background) { immediate = admissions !== this.admissions; return; }
         scope = next ? OWNER : background![0].slice("background:".length);
         const descriptor: SessionDescriptor = next ? this.descriptorOf(next.metadata) : JSON.parse(background![1]);
         const serialized = JSON.stringify(descriptor);
@@ -319,7 +332,7 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
         try {
           runtime = await this.runtime(scope, sessionId, descriptor);
         } catch (error) {
-          this.blocked.delete(scope);
+          if (active) this.blocked.delete(active);
           retryAt = await this.unavailable(scope, next, error instanceof HostFailure ? error : new HostFailure(error instanceof Error ? error.message : String(error), "runtime", false), delay);
           immediate = retryAt === undefined;
           return;
@@ -334,9 +347,12 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
           timing.checkpoints = timing.runtime_reused ? runtime.metrics.timing.checkpoints : {};
           timing.run_started = performance.now();
         }
-        if (next?.cancel_requested && next.report.status === "running") this.blocked.add(scope);
+        for (const id of this.blocked) if (id !== active) this.blocked.delete(id);
+        if (active && next?.cancel_requested && next.report.status === "running") this.blocked.add(active);
+        if (active) this.driving.set(scope, active);
         const driven = await runtime.drive(active);
-        this.blocked.delete(scope);
+        this.driving.delete(scope);
+        if (active) this.blocked.delete(active);
         if (driven.retry) throw new Error("runtime recovery required");
         if (driven.finished) {
           this.turnTimings.delete(driven.finished.report.request_id);
@@ -352,9 +368,12 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
         }
         immediate = !this.queueKnownEmpty();
       } catch {
-        if (scope) this.blocked.delete(scope);
-        if (scope) { this.runtimes.delete(scope); this.residents.delete(scope); this.releaseHands(scope); }
-        if (runtime) await runtime.dispose().catch(() => {});
+        if (scope) this.driving.delete(scope);
+        if (active) this.blocked.delete(active);
+        if (scope && runtime) {
+          if (this.residents.get(scope) === runtime) { this.runtimes.delete(scope); this.residents.delete(scope); this.releaseHands(scope); }
+          await runtime.dispose().catch(() => {});
+        }
         if (active) {
           this.turnTimings.delete(active);
           this.unfinished = true;
@@ -815,7 +834,11 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
       const current = resident && busy ? await resident.catch(() => undefined) : undefined;
       const runtime = current?.reusable ? current : await this.runtime(scope, sessionId, descriptor);
       await runtime.preconnect();
-      this.unfinished ??= (await runtime.pending(scope)).length > 0;
+      if (this.unfinished === undefined) {
+        const admissions = this.admissions;
+        const pending = await runtime.pending(scope);
+        if (this.unfinished === undefined && admissions === this.admissions) this.unfinished = pending.length > 0;
+      }
       if (!this.pumping && !this.unfinished && !this.metadata.first("background:")) this.releaseIdle();
       return true;
     }
@@ -916,7 +939,7 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
       if (!turn) return json({ error: "request not found" }, 404);
       const running = turn.report.status === "running";
       if (!running && !dequeued) return json(turn.report);
-      if (running) this.blocked.add(scope);
+      if (running) this.blocked.add(id);
       else this.turnTimings.delete(id);
       if (!this.pumping) await this.ctx.storage.setAlarm(Date.now());
       await this.ctx.storage.sync();
@@ -939,7 +962,8 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
     }
 
     private dispatchBlocked(scope: string): boolean {
-      return this.blocked.has(scope);
+      const id = this.driving.get(scope);
+      return id !== undefined && this.blocked.has(id);
     }
 
     private instance(scope: string, unopened = false): Promise<AgentRuntime> {
