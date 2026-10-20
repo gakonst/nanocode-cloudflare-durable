@@ -10,7 +10,7 @@ const TURNS = Number(values.turns);
 const DELTAS = Number(values.deltas);
 const CODEX_TURNS = Number(values["codex-turns"]);
 const ROUNDS = 3;
-const KEYS = ["store_calls", "log_calls", "statements", "bridge_request_bytes", "bridge_reply_bytes", "rows_written", "rows_read", "object_statements", "object_rows_written", "object_rows_read"];
+const KEYS = ["store_calls", "log_calls", "statements", "bridge_request_bytes", "bridge_reply_bytes", "rows_written", "rows_read", "object_statements", "object_rows_written", "object_rows_read", "object_alarm_writes"];
 const STORE_PATHS = ["nanocode_wasm::wasm::store", "nanocode_durability_core::sql", "nanocode_durability_core::store"];
 const IDLE = new Set(["(idle)", "(program)", "(garbage collector)"]);
 let calls = 0;
@@ -150,7 +150,7 @@ async function turn(session, provider, id) {
 async function sample(session) {
   const value = await (await request("http://worker/sessions/" + session + "/metrics")).json();
   const runtime = value.runtime ?? {};
-  return { store_calls: runtime.store_calls ?? 0, log_calls: runtime.log_calls ?? 0, statements: value.checkpoints?.statements ?? 0, bridge_request_bytes: runtime.bridge_request_bytes ?? 0, bridge_reply_bytes: runtime.bridge_reply_bytes ?? 0, rows_written: value.checkpoints?.rows_written ?? 0, rows_read: value.checkpoints?.rows_read ?? 0, object_statements: value.sql?.statements ?? 0, object_rows_written: value.sql?.rows_written ?? 0, object_rows_read: value.sql?.rows_read ?? 0, database_bytes: value.database_bytes, persisted: value.persisted, operations: value.checkpoints?.operations, log_operations: value.log?.operations };
+  return { store_calls: runtime.store_calls ?? 0, log_calls: runtime.log_calls ?? 0, statements: value.checkpoints?.statements ?? 0, bridge_request_bytes: runtime.bridge_request_bytes ?? 0, bridge_reply_bytes: runtime.bridge_reply_bytes ?? 0, rows_written: value.checkpoints?.rows_written ?? 0, rows_read: value.checkpoints?.rows_read ?? 0, object_statements: value.sql?.statements ?? 0, object_rows_written: value.sql?.rows_written ?? 0, object_rows_read: value.sql?.rows_read ?? 0, object_alarm_writes: value.sql?.alarm_writes ?? 0, database_bytes: value.database_bytes, persisted: value.persisted, operations: value.checkpoints?.operations, log_operations: value.log?.operations };
 }
 
 async function scenario(name, provider, count, profiler) {

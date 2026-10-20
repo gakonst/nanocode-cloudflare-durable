@@ -25,19 +25,33 @@ function gateway(upstream) {
   };
 }
 const local = env => ({ ...env, AI: { gateway: () => gateway(env.GATEWAY_UPSTREAM) } });
-function counted(sql) {
+function counted(storage) {
+  const sql = storage.sql;
   const exec = sql.exec.bind(sql);
-  const totals = { statements: 0, rows_read: 0, rows_written: 0 };
+  const totals = { statements: 0, rows_read: 0, rows_written: 0, alarm_writes: 0 };
+  for (const name of ["setAlarm", "deleteAlarm"]) {
+    const operation = storage[name].bind(storage);
+    storage[name] = (...args) => { totals.alarm_writes++; return operation(...args); };
+  }
   let cursors = [];
-  sql.exec = (...args) => { const cursor = exec(...args); totals.statements++; cursors.push(cursor); return cursor; };
-  return () => {
+  let paused = false;
+  sql.exec = (...args) => { const cursor = exec(...args); if (paused) return cursor; totals.statements++; cursors.push(cursor); return cursor; };
+  const read = () => {
     for (const cursor of cursors) { totals.rows_read += cursor.rowsRead; totals.rows_written += cursor.rowsWritten; }
     cursors = [];
     return { ...totals };
   };
+  read.uncounted = operation => { paused = true; try { return operation(); } finally { paused = false; } };
+  return read;
 }
 export class AgentSession extends Session {
-  constructor(ctx, env) { const sql = counted(ctx.storage.sql); super(ctx, local(env)); this.sqlTotals = sql; }
+  constructor(ctx, env) {
+    const sql = counted(ctx.storage);
+    super(ctx, local(env));
+    this.sqlTotals = sql;
+    const persisted = this.store.persisted.bind(this.store);
+    this.store.persisted = scope => sql.uncounted(() => persisted(scope));
+  }
   async fetch(request) {
     const response = await super.fetch(request);
     if (new URL(request.url).pathname !== "/internal/metrics" || response.status !== 200) return response;

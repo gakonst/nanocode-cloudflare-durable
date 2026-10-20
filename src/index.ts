@@ -1,7 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
 import { AgentRuntime, EventHub, HostFailure, RECENT_MODEL_LIMIT, RemoteExecutor, Timings, sessionUuid, timingDifference, type HostTool, type LoggedEvent, type LogPage, type ModelProvider, type TimingSnapshot, type TurnView } from "nanocode-wasm";
 import wasm from "nanocode-wasm/nanocode_wasm.wasm";
-import { CheckpointStore } from "./store";
+import { CheckpointStore, Metadata } from "./store";
 import { ExecutorRejection, connectExecutor } from "./remote";
 import { DEFAULT_EXECUTOR, EXECUTOR_ID, headerJson, json, type HostToolCall, type ModelDispatch, type PrivateBinding, type SessionDescriptor } from "./contracts";
 
@@ -70,12 +70,14 @@ function executorFailure(error: unknown): HostFailure {
 export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E>) {
   class AgentSession extends DurableObject<E> {
     private readonly store: CheckpointStore;
+    private readonly metadata: Metadata;
     private readonly instances = new Map<string, Promise<AgentRuntime>>();
     private readonly runtimes = new Map<string, Promise<AgentRuntime>>();
     private readonly residents = new Map<string, AgentRuntime>();
     private readonly blocked = new Set<string>();
     private readonly watchers = new Map<WebSocket, Watcher>();
     private unfinished?: boolean;
+    private admissions = 0;
     private flushing = false;
     private reflush = false;
     private readonly hands = new Map<string, Map<string, { connection: string; executor: Executor; ready: boolean }>>();
@@ -97,6 +99,7 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
     constructor(ctx: DurableObjectState, env: E) {
       super(ctx, env);
       this.store = new CheckpointStore(ctx.storage);
+      this.metadata = new Metadata(ctx.storage);
       ctx.storage.sql.exec(`
         CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
         DROP INDEX IF EXISTS scoped_events;
@@ -144,7 +147,7 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
         let descriptor: SessionDescriptor;
         try { descriptor = JSON.parse(request.headers.get("x-nanocode-descriptor") ?? "null"); } catch { return json({ error: "invalid session authority" }, 400); }
         if (!descriptor || typeof descriptor.account_id !== "string" || !descriptor.account_id || typeof descriptor.session_name !== "string" || !descriptor.session_name) return json({ error: "session authority is required" }, 403);
-        const binding = this.store.row("SELECT value FROM metadata WHERE key = 'authority'")?.value;
+        const binding = this.metadata.get("authority");
         const identity = JSON.stringify({ account_id: descriptor.account_id, session_name: descriptor.session_name });
         if (binding && binding !== identity) return json({ error: "session authority mismatch" }, 403);
         const scope = "owner";
@@ -152,12 +155,12 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
         if (parts[2] === "delete" && request.method === "POST") return await this.destroy();
         if (descriptor.read_only && (request.method !== "GET" || (parts[2] === "hands" && request.headers.get("upgrade")?.toLowerCase() === "websocket"))) return json({ error: "read-only access" }, 403);
         if (!this.recorded && options.recordSession) {
-          if (!this.store.row("SELECT value FROM metadata WHERE key = 'recorded'")) {
+          if (this.metadata.get("recorded") === undefined) {
             if (!await options.recordSession(descriptor.account_id, descriptor.session_name, this.env)) {
               await this.destroy();
               return json({ error: "account not found" }, 403);
             }
-            this.ctx.storage.sql.exec("INSERT INTO metadata VALUES ('recorded', ?) ON CONFLICT(key) DO NOTHING", String(Date.now()));
+            this.metadata.insert("recorded", String(Date.now()));
           }
           this.recorded = true;
         }
@@ -189,8 +192,8 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
           if (!Number.isSafeInteger(after) || after < 0 || !Number.isSafeInteger(limit) || limit < 1 || limit > policy(this.env.EVENT_PAGE_SIZE, "EVENT_PAGE_SIZE")) return json({ error: "invalid event cursor" }, 400);
         }
         const executorKey = `executor:${scope}`;
-        const storedExecutor = this.store.row("SELECT value FROM metadata WHERE key = ?", executorKey)?.value as string | undefined;
-        const initialized = !!this.store.row("SELECT value FROM metadata WHERE key = ?", scope === "owner" ? "session_id" : `session_id:${scope}`);
+        const storedExecutor = this.metadata.get(executorKey);
+        const initialized = this.metadata.get(scope === "owner" ? "session_id" : `session_id:${scope}`) !== undefined;
         const legacyExecutor = this.env.RUNNER_ENABLED === "true" ? DEFAULT_EXECUTOR : "";
         const boundExecutor = storedExecutor ?? (initialized ? legacyExecutor : undefined);
         if (boundExecutor !== undefined && input.executor !== undefined && input.executor !== boundExecutor) return json({ error: "session executor is immutable; create a new session" }, 409);
@@ -198,27 +201,27 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
         descriptor.executor_id = executor || undefined;
         descriptor.hand = input.hand;
         const providerKey = `model_provider:${scope}`;
-        const boundProvider = this.store.row("SELECT value FROM metadata WHERE key = ?", providerKey)?.value
-          ?? (this.store.row("SELECT value FROM metadata WHERE key = ?", scope === "owner" ? "session_id" : `session_id:${scope}`) ? "claude" : undefined);
+        const boundProvider = this.metadata.get(providerKey) ?? (initialized ? "claude" : undefined);
         descriptor.provider = input.provider ?? boundProvider ?? "claude";
         const rejected = await (await this.instance(scope)).admit(input.request_id, boundProvider === undefined ? null : String(boundProvider), descriptor.provider!);
         if (rejected === "reserved_request_id") return json({ error: "request_id prefix is reserved" }, 400);
         if (rejected === "provider_changed") return json({ error: "session provider is immutable; create a new session" }, 409);
         if (descriptor.provider === "codex") descriptor.subscription = descriptor.codex_subscription ?? true;
         policy(this.env.RECOVERY_DELAY_MS, "RECOVERY_DELAY_MS");
-        const current = this.store.row("SELECT value FROM metadata WHERE key = 'authority'")?.value;
+        const current = this.metadata.get("authority");
         if (current && current !== identity) throw new Error("session authority mismatch");
         const submitted = await (await this.instance(scope)).submit(scope, { request_id: input.request_id, prompt: input.prompt, hand: input.hand, metadata: descriptor });
         if (submitted.submitted === "conflict") return json({ error: "request_id already belongs to different input or authority" }, 409);
         const turn = submitted.turn;
         if (submitted.submitted === "accepted") {
-          this.ctx.storage.transactionSync(() => {
-            if (!current) this.ctx.storage.sql.exec("INSERT INTO metadata VALUES ('authority', ?) ON CONFLICT(key) DO NOTHING", identity);
-            this.ctx.storage.sql.exec("INSERT INTO metadata VALUES (?, ?) ON CONFLICT(key) DO NOTHING", providerKey, descriptor.provider!);
-            this.ctx.storage.sql.exec("INSERT INTO metadata VALUES (?, ?) ON CONFLICT(key) DO NOTHING", executorKey, executor);
+          this.metadata.transaction(() => {
+            this.metadata.insert("authority", identity);
+            this.metadata.insert(providerKey, descriptor.provider!);
+            this.metadata.insert(executorKey, executor);
             this.sessionId(scope, descriptor.session_id);
           });
           this.unfinished = true;
+          this.admissions++;
           this.turnTimings.set(input.request_id, { started: admitted, checkpoints: {} });
         }
         const unfinished = UNFINISHED.has(turn.report.status);
@@ -267,23 +270,25 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
       let retryAt: number | undefined;
       try {
         if (!watchdogArmed) await this.ctx.storage.setAlarm(Date.now() + delay);
-        const next = (await (await this.instance(OWNER)).pending(OWNER))[0];
+        const pending = await (await this.instance(OWNER)).pending(OWNER);
+        const admissions = this.admissions;
+        const next = pending[0];
         this.unfinished = !!next;
-        const background = this.store.row("SELECT key, value FROM metadata WHERE key LIKE 'background:%' ORDER BY key LIMIT 1");
+        const background = this.metadata.first("background:");
         if (!next && !background) return;
-        scope = next ? OWNER : String(background!.key).slice("background:".length);
-        const descriptor: SessionDescriptor = next ? this.descriptorOf(next.metadata) : JSON.parse(String(background!.value));
+        scope = next ? OWNER : background![0].slice("background:".length);
+        const descriptor: SessionDescriptor = next ? this.descriptorOf(next.metadata) : JSON.parse(background![1]);
         const serialized = JSON.stringify(descriptor);
-        const marked = background?.key === `background:${scope}`;
+        const marked = background?.[0] === `background:${scope}`;
         const accepted = !next || next.report.status === "running";
         let sessionId!: string;
         let preparationRequired = false;
         const mark = () => {
-          this.ctx.storage.sql.exec("INSERT INTO metadata VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", `background:${scope}`, serialized);
+          this.metadata.set(`background:${scope}`, serialized);
           preparationRequired = true;
         };
-        this.ctx.storage.transactionSync(() => {
-          if ((marked || accepted) && (!watchdogArmed || !marked || background!.value !== serialized)) mark();
+        this.metadata.transaction(() => {
+          if ((marked || accepted) && (!watchdogArmed || !marked || background![1] !== serialized)) mark();
           sessionId = this.sessionId(scope!, descriptor.session_id, () => { preparationRequired = true; });
         });
         if (next) {
@@ -333,12 +338,12 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
         if (driven.retry) throw new Error("runtime recovery required");
         if (driven.finished) {
           this.turnTimings.delete(driven.finished.report.request_id);
-          this.unfinished = undefined;
+          this.unfinished = pending.length === 1 && next!.report.request_id === driven.finished.report.request_id && admissions === this.admissions ? false : undefined;
         }
         waiting = !!driven.waiting;
         const version = this.eventHub.version;
         if (await runtime.settle()) {
-          this.ctx.storage.sql.exec("DELETE FROM metadata WHERE key = ?", `background:${scope}`);
+          this.metadata.delete(`background:${scope}`);
         }
         else if (waiting || this.queueKnownEmpty()) {
           await this.eventHub.wait(delay, version);
@@ -356,7 +361,7 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
       } finally {
         if (this.deleted) { this.pumping = false; return; }
         const unfinished = !this.queueKnownEmpty();
-        const background = this.store.row("SELECT key FROM metadata WHERE key LIKE 'background:%' LIMIT 1");
+        const background = this.metadata.first("background:");
         if (!unfinished && !background) this.releaseIdle();
         this.pumping = false;
         if (unfinished || background) await this.ctx.storage.setAlarm(retryAt ?? Date.now() + delay);
@@ -372,7 +377,7 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
     private async unavailable(scope: string, next: TurnView | undefined, failure: HostFailure, delay: number): Promise<number | undefined> {
       if (!next) {
         if (!failure.permanent) return Date.now() + delay;
-        this.ctx.storage.sql.exec("DELETE FROM metadata WHERE key = ?", `background:${scope}`);
+        this.metadata.delete(`background:${scope}`);
         return undefined;
       }
       const id = next.report.request_id;
@@ -395,17 +400,17 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
     private descriptorOf(value: unknown): SessionDescriptor {
       const descriptor = value as SessionDescriptor | null;
       if (descriptor?.account_id) return descriptor;
-      const identity = this.store.row("SELECT value FROM metadata WHERE key = 'authority'")?.value;
+      const identity = this.metadata.get("authority");
       if (!identity) throw new Error("turn has no session authority");
-      return { ...JSON.parse(String(identity)), session_id: "", subscription: this.env.MODEL_AUTH === "subscription" };
+      return { ...JSON.parse(identity), session_id: "", subscription: this.env.MODEL_AUTH === "subscription" };
     }
 
     private sessionId(scope: string, suggested?: string, created?: () => void): string {
       const key = scope === "owner" ? "session_id" : `session_id:${scope}`;
-      let session = this.store.row("SELECT value FROM metadata WHERE key = ?", key)?.value as string | undefined;
+      let session = this.metadata.get(key);
       if (!session) {
         session = suggested || sessionUuid();
-        this.ctx.storage.sql.exec("INSERT INTO metadata VALUES (?, ?)", key, session);
+        this.metadata.insert(key, session);
         created?.();
       }
       return session;
@@ -788,20 +793,20 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
     }
 
     private turnGrant(scope: string, fallback: SessionDescriptor): unknown {
-      const background = this.store.row("SELECT value FROM metadata WHERE key = ?", `background:${scope}`)?.value;
-      return background === undefined ? fallback.grant : (JSON.parse(String(background)) as SessionDescriptor).grant;
+      const background = this.metadata.get(`background:${scope}`);
+      return background === undefined ? fallback.grant : (JSON.parse(background) as SessionDescriptor).grant;
     }
 
     private async warm(scope: string, base: SessionDescriptor): Promise<boolean> {
-      const sessionId = this.store.row("SELECT value FROM metadata WHERE key = ?", scope === "owner" ? "session_id" : `session_id:${scope}`)?.value;
+      const sessionId = this.metadata.get(scope === "owner" ? "session_id" : `session_id:${scope}`);
       if (!sessionId) return false;
-      const provider = (this.store.row("SELECT value FROM metadata WHERE key = ?", `model_provider:${scope}`)?.value ?? "claude") as ModelProvider;
-      const executor = this.store.row("SELECT value FROM metadata WHERE key = ?", `executor:${scope}`)?.value ?? (this.env.RUNNER_ENABLED === "true" ? DEFAULT_EXECUTOR : "");
-      const descriptor: SessionDescriptor = { ...base, executor_id: String(executor) || undefined, hand: undefined, provider, subscription: provider === "codex" ? base.codex_subscription ?? true : base.subscription };
-      const runtime = await this.runtime(scope, String(sessionId), descriptor);
+      const provider = (this.metadata.get(`model_provider:${scope}`) ?? "claude") as ModelProvider;
+      const executor = this.metadata.get(`executor:${scope}`) ?? (this.env.RUNNER_ENABLED === "true" ? DEFAULT_EXECUTOR : "");
+      const descriptor: SessionDescriptor = { ...base, executor_id: executor || undefined, hand: undefined, provider, subscription: provider === "codex" ? base.codex_subscription ?? true : base.subscription };
+      const runtime = await this.runtime(scope, sessionId, descriptor);
       await runtime.preconnect();
       this.unfinished ??= (await runtime.pending(scope)).length > 0;
-      if (!this.pumping && !this.unfinished && !this.store.row("SELECT key FROM metadata WHERE key LIKE 'background:%' LIMIT 1")) this.releaseIdle();
+      if (!this.pumping && !this.unfinished && !this.metadata.first("background:")) this.releaseIdle();
       return true;
     }
     private executorEnabled(descriptor: SessionDescriptor): boolean {
@@ -876,6 +881,7 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
       await Promise.all(runtimes.map(resident => resident.then(runtime => runtime.dispose()).catch(() => {})));
       await this.ctx.storage.deleteAlarm();
       await this.ctx.storage.deleteAll();
+      this.metadata.reset();
       return json({ deleted: true });
     }
 
