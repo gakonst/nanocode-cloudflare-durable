@@ -52,6 +52,7 @@ function duration(value: string, name: string): number {
 const handName = (value: unknown): value is string => typeof value === "string" && EXECUTOR_ID.test(value);
 const HAND_TAG = "hand";
 const HAND_REPLACED = "another hand attached under this name";
+const INVALID_HAND = "hand names are 1 to 48 lowercase letters, digits, _ or -, starting with a letter or digit; pass --name";
 const WATCH_TAG = "watch";
 type Watch = { watch: string; cursor: number };
 type Watcher = { state: Watch; scope: string; descriptor: SessionDescriptor };
@@ -556,7 +557,7 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
       const hand = requested ?? advertised.name;
       if (!handName(hand)) {
         this.handSockets.delete(executor.socket);
-        return executor.dispose();
+        return executor.refuse(INVALID_HAND);
       }
       const connection = `${hand}#${crypto.randomUUID()}`;
       this.ctx.storage.sql.exec("INSERT INTO hand_sockets (connection, scope, hand, catalog, descriptor) VALUES (?, ?, ?, ?, ?)", connection, scope, hand, executor.catalog!, JSON.stringify(descriptor));

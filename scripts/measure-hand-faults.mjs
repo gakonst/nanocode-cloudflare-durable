@@ -176,7 +176,7 @@ try {
   startHand("alpha", "alpha", base);
   startHand("beta", "beta", base);
   await until(async () => (await attached()).length === 2, () => "Hands did not attach: " + JSON.stringify(logs));
-  const scenarios = (process.env.FAULTS ?? "text,image,copy,missing,yield,cancel,reconnect,duplicate").split(",");
+  const scenarios = (process.env.FAULTS ?? "text,image,copy,catch,missing,yield,cancel,reconnect,badname,duplicate").split(",");
 
   for (const scenario of ["text", "image", "copy"]) {
     if (!scenarios.includes(scenario)) continue;
@@ -246,6 +246,15 @@ try {
     check("reconnect: waiting on the cell after the hand reattached reports it gone instead of hanging", settled.status === "completed" && (observed.reconnect?.[2]?.error ?? false), report.reconnect);
     check("reconnect: the reattached hand runs the next turn", after.status === "completed" && after.results[0]?.text.includes("pong"), report.reconnect);
     for (const line of orphans) { try { process.kill(Number(line.split(" ")[0]), "SIGKILL"); } catch {} }
+  }
+
+  if (scenarios.includes("badname")) {
+    startHand("badname", "Laptop", base);
+    await new Promise(resolve => setTimeout(resolve, 4000));
+    const listedNames = await attached();
+    report.badname = { connects: connects("badname"), listed: listedNames, log: logs.badname.split("\n").slice(-4) };
+    check("badname: a hand whose name the session refuses is told why", !listedNames.includes("Laptop") && /lowercase/.test(logs.badname), report.badname);
+    await stopHand("badname");
   }
 
   if (scenarios.includes("duplicate")) {
