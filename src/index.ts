@@ -105,13 +105,14 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
       this.store = new CheckpointStore(ctx.storage);
       this.metadata = new Metadata(ctx.storage);
       ctx.storage.sql.exec(`
-        CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL) WITHOUT ROWID;
         DROP INDEX IF EXISTS scoped_events;
         DROP INDEX IF EXISTS scoped_request_events;
         DROP TABLE IF EXISTS grant_fences;
         CREATE TABLE IF NOT EXISTS hand_sockets (connection TEXT PRIMARY KEY, scope TEXT NOT NULL, hand TEXT NOT NULL, catalog TEXT NOT NULL, descriptor TEXT) WITHOUT ROWID;
         CREATE TABLE IF NOT EXISTS watch_sockets (id TEXT PRIMARY KEY, scope TEXT NOT NULL, descriptor TEXT NOT NULL) WITHOUT ROWID;
       `);
+      if (!this.store.row("SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'metadata'")?.sql?.toString().includes("WITHOUT ROWID")) ctx.storage.transactionSync(() => ctx.storage.sql.exec("CREATE TABLE metadata_rows (key TEXT PRIMARY KEY, value TEXT NOT NULL) WITHOUT ROWID; INSERT INTO metadata_rows SELECT key, value FROM metadata; DROP TABLE metadata; ALTER TABLE metadata_rows RENAME TO metadata"));
       if (!ctx.storage.sql.exec("PRAGMA table_info(hand_sockets)").toArray().some(column => column.name === "descriptor")) ctx.storage.sql.exec("ALTER TABLE hand_sockets ADD COLUMN descriptor TEXT");
       ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair("ping", "pong"));
       this.restoreHands();
@@ -849,19 +850,21 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
         const pending = await runtime.pending(scope);
         if (this.unfinished === undefined && admissions === this.admissions) this.unfinished = pending.length > 0;
       }
-      if (!this.pumping && !this.unfinished && !this.metadata.first("background:")) this.releaseIdle();
+      if (!this.pumping && !this.unfinished && !this.metadata.first("background:")) this.releaseIdle(true);
       return true;
     }
     private executorEnabled(descriptor: SessionDescriptor): boolean {
       return !!descriptor.executor_id || this.env.RUNNER_ENABLED === "true";
     }
 
-    private releaseIdle(): void {
+    private releaseIdle(warmed = false): void {
       const budget = policy(this.env.RUNTIME_MEMORY_BUDGET_BYTES, "RUNTIME_MEMORY_BUDGET_BYTES");
       for (const [scope, runtime] of this.residents) {
         if (runtime.memoryBytes > budget) this.retire(scope, runtime);
       }
       if (this.linger !== undefined) clearTimeout(this.linger);
+      this.linger = undefined;
+      if (!warmed && ![...this.residents.values()].some(runtime => runtime.remote || runtime.connected)) return;
       this.linger = setTimeout(() => {
         this.linger = undefined;
         if (this.pumping || !this.queueKnownEmpty()) return;

@@ -25,6 +25,16 @@ function gateway(upstream) {
   };
 }
 const local = env => ({ ...env, AI: { gateway: () => gateway(env.GATEWAY_UPSTREAM) } });
+const timers = new Map();
+const schedule = globalThis.setTimeout;
+const unschedule = globalThis.clearTimeout;
+globalThis.setTimeout = (callback, delay = 0, ...args) => {
+  const handle = schedule((...values) => { timers.delete(handle); callback(...values); }, delay, ...args);
+  timers.set(handle, Date.now() + Number(delay || 0));
+  return handle;
+};
+globalThis.clearTimeout = handle => { timers.delete(handle); unschedule(handle); };
+const pendingTimers = () => [...timers.values()].map(due => Math.max(0, due - Date.now())).sort((left, right) => right - left);
 function counted(storage) {
   const sql = storage.sql;
   const exec = sql.exec.bind(sql);
@@ -33,13 +43,22 @@ function counted(storage) {
     const operation = storage[name].bind(storage);
     storage[name] = (...args) => { totals.alarm_writes++; return operation(...args); };
   }
+  const statements = {};
   let cursors = [];
   let paused = false;
-  sql.exec = (...args) => { const cursor = exec(...args); if (paused) return cursor; totals.statements++; cursors.push(cursor); return cursor; };
+  sql.exec = (...args) => { const cursor = exec(...args); if (paused) return cursor; totals.statements++; cursors.push([String(args[0]).replace(/\s+/g, " ").slice(0, 96), cursor, args.slice(1).reduce((total, value) => total + String(value ?? "").length, 0)]); return cursor; };
   const read = () => {
-    for (const cursor of cursors) { totals.rows_read += cursor.rowsRead; totals.rows_written += cursor.rowsWritten; }
+    for (const [query, cursor, bytes] of cursors) {
+      totals.rows_read += cursor.rowsRead;
+      totals.rows_written += cursor.rowsWritten;
+      const entry = statements[query] ??= { statements: 0, rows_read: 0, rows_written: 0, param_bytes: 0 };
+      entry.statements++;
+      entry.rows_read += cursor.rowsRead;
+      entry.rows_written += cursor.rowsWritten;
+      entry.param_bytes += bytes;
+    }
     cursors = [];
-    return { ...totals };
+    return { ...totals, by_statement: structuredClone(statements) };
   };
   read.uncounted = operation => { paused = true; try { return operation(); } finally { paused = false; } };
   return read;
@@ -47,7 +66,11 @@ function counted(storage) {
 export class AgentSession extends Session {
   constructor(ctx, env) {
     const sql = counted(ctx.storage);
+    const waitUntil = ctx.waitUntil.bind(ctx);
+    const waiting = { count: 0 };
+    ctx.waitUntil = promise => { waiting.count++; waitUntil(Promise.resolve(promise).finally(() => { waiting.count--; })); };
     super(ctx, local(env));
+    this.waiting = waiting;
     this.sqlTotals = sql;
     const persisted = this.store.persisted.bind(this.store);
     this.store.persisted = scope => sql.uncounted(() => persisted(scope));
@@ -55,7 +78,7 @@ export class AgentSession extends Session {
   async fetch(request) {
     const response = await super.fetch(request);
     if (new URL(request.url).pathname !== "/internal/metrics" || response.status !== 200) return response;
-    return Response.json({ ...await response.json(), sql: this.sqlTotals() });
+    return Response.json({ ...await response.json(), sql: this.sqlTotals(), idle: { timers_ms: pendingTimers(), wait_until: this.waiting.count } });
   }
 }
 export default { fetch(request, env, ctx) { return worker.fetch(request, local(env), ctx); } };

@@ -952,9 +952,9 @@ async function cellRun(provider) {
 async function retentionRun(provider) {
   const options = localOptions({ provider: async request => globalThis.faultProvider(request), agent: { RECOVERY_DELAY_MS: String(DELAY), RUNTIME_MEMORY_BUDGET_BYTES: "1" } });
   const shim = options.workers[0].modules[0];
-  const original = "return Response.json({ ...await response.json(), sql: this.sqlTotals() });";
+  const original = "return Response.json({ ...await response.json(), sql: this.sqlTotals(), idle: { timers_ms: pendingTimers(), wait_until: this.waiting.count } });";
   if (!shim.contents.includes(original)) throw new Error("the local shim changed; update the retention probe");
-  shim.contents = shim.contents.replace(original, "const retained = await Promise.all([...(this.instances?.values() ?? [])].map(entry => entry.then(runtime => ({ closed: runtime.closed, wasm_memory_bytes: runtime.memoryBytes }), () => null))); return Response.json({ ...await response.json(), sql: this.sqlTotals(), retained });");
+  shim.contents = shim.contents.replace(original, "const retained = await Promise.all([...(this.instances?.values() ?? [])].map(entry => entry.then(runtime => ({ closed: runtime.closed, wasm_memory_bytes: runtime.memoryBytes }), () => null))); return Response.json({ ...await response.json(), sql: this.sqlTotals(), idle: { timers_ms: pendingTimers(), wait_until: this.waiting.count }, retained });");
   const local = new Miniflare(convertV4MiniflareOptions(options));
   try {
     await local.ready;

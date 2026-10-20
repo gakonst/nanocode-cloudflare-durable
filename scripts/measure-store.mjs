@@ -150,7 +150,17 @@ async function turn(session, provider, id) {
 async function sample(session) {
   const value = await (await request("http://worker/sessions/" + session + "/metrics")).json();
   const runtime = value.runtime ?? {};
-  return { store_calls: runtime.store_calls ?? 0, log_calls: runtime.log_calls ?? 0, statements: value.checkpoints?.statements ?? 0, bridge_request_bytes: runtime.bridge_request_bytes ?? 0, bridge_reply_bytes: runtime.bridge_reply_bytes ?? 0, rows_written: value.checkpoints?.rows_written ?? 0, rows_read: value.checkpoints?.rows_read ?? 0, object_statements: value.sql?.statements ?? 0, object_rows_written: value.sql?.rows_written ?? 0, object_rows_read: value.sql?.rows_read ?? 0, object_alarm_writes: value.sql?.alarm_writes ?? 0, database_bytes: value.database_bytes, persisted: value.persisted, operations: value.checkpoints?.operations, log_operations: value.log?.operations };
+  return { store_calls: runtime.store_calls ?? 0, log_calls: runtime.log_calls ?? 0, statements: value.checkpoints?.statements ?? 0, bridge_request_bytes: runtime.bridge_request_bytes ?? 0, bridge_reply_bytes: runtime.bridge_reply_bytes ?? 0, rows_written: value.checkpoints?.rows_written ?? 0, rows_read: value.checkpoints?.rows_read ?? 0, object_statements: value.sql?.statements ?? 0, object_rows_written: value.sql?.rows_written ?? 0, object_rows_read: value.sql?.rows_read ?? 0, object_alarm_writes: value.sql?.alarm_writes ?? 0, by_statement: value.sql?.by_statement ?? {}, database_bytes: value.database_bytes, persisted: value.persisted, operations: value.checkpoints?.operations, log_operations: value.log?.operations };
+}
+
+function difference(after, before) {
+  return Object.fromEntries(Object.entries(after).map(([query, entry]) => [query, Object.fromEntries(Object.entries(entry).map(([key, value]) => [key, value - (before[query]?.[key] ?? 0)]))]).filter(([, entry]) => entry.statements > 0));
+}
+
+function breakdown(turns) {
+  const totals = {};
+  for (const turn of turns) for (const [query, entry] of Object.entries(turn.by_statement)) for (const [key, value] of Object.entries(entry)) (totals[query] ??= {})[key] = (totals[query][key] ?? 0) + value / turns.length;
+  return Object.fromEntries(Object.entries(totals).sort((left, right) => right[1].rows_written - left[1].rows_written));
 }
 
 async function scenario(name, provider, count, profiler) {
@@ -163,7 +173,7 @@ async function scenario(name, provider, count, profiler) {
   for (let index = 0; index < count; index++) {
     const milliseconds = await turn(session, provider, "turn-" + index);
     const after = await sample(session);
-    turns.push({ milliseconds, ...Object.fromEntries(KEYS.map(key => [key, after[key] - before[key]])), database_bytes: after.database_bytes });
+    turns.push({ milliseconds, ...Object.fromEntries(KEYS.map(key => [key, after[key] - before[key]])), by_statement: difference(after.by_statement, before.by_statement), database_bytes: after.database_bytes });
     before = after;
   }
   const profile = await profiler?.stop();
@@ -177,6 +187,7 @@ async function scenario(name, provider, count, profiler) {
     name, provider, turns: count,
     per_turn: Object.fromEntries(["milliseconds", ...KEYS].map(key => [key, mean(key)])),
     workerd_cpu_ms_per_turn: workerdMs / count,
+    by_statement: breakdown(turns),
     ...(profile ? { profile: attribute(profile, sourceOf(JSON.parse(readFileSync("output/deploy/index.js.map", "utf8"))), count) } : {}),
     database_bytes: before.database_bytes,
     persisted: before.persisted,
@@ -195,6 +206,6 @@ try {
   mkdirSync("output", { recursive: true });
   const path = "output/store-" + values.label + "-" + Date.now() + ".json";
   writeFileSync(path, JSON.stringify(report, null, 2));
-  for (const { series, ...entry } of report.scenarios) console.log(JSON.stringify(entry));
+  for (const { series, by_statement, ...entry } of report.scenarios) console.log(JSON.stringify(entry));
   console.log("report", path);
 } finally { await mf.dispose(); }
