@@ -27,6 +27,7 @@ export type NanocodeOptions<E extends NanocodeEnv> = {
   authenticate(request: Request, env: E): Promise<string | null> | string | null;
   egress(env: E): PrivateBinding;
   subscription?(account: string, env: E, provider: ModelProvider): Promise<boolean> | boolean;
+  recordSession?(account: string, name: string, env: E): Promise<boolean> | boolean;
 };
 
 type Job = { request_id: string; prompt: string; status: string; result: string | null; scope: string; descriptor: string; cancel_requested: number; first_seq: number | null; last_seq: number | null };
@@ -62,6 +63,8 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
     private watchersPending = false;
     private running?: Running;
     private pumping = false;
+    private recorded = false;
+    private deleted = false;
     private readonly eventHub = new EventHub();
     private readonly modelDiagnostics: { scope: string; value: unknown }[] = [];
     private readonly timings = new Map<string, Timings>();
@@ -97,6 +100,7 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
 
     async fetch(request: Request): Promise<Response> {
       const admitted = performance.now();
+      if (this.deleted) return json({ error: "session deleted" }, 410);
       try {
         const url = new URL(request.url);
         let descriptor: SessionDescriptor;
@@ -107,6 +111,17 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
         if (binding && binding !== identity) return json({ error: "session authority mismatch" }, 403);
         const scope = "owner";
         const parts = url.pathname.split("/");
+        if (parts[2] === "delete" && request.method === "POST") return await this.destroy();
+        if (!this.recorded && options.recordSession) {
+          if (!this.store.row("SELECT value FROM metadata WHERE key = 'recorded'")) {
+            if (!await options.recordSession(descriptor.account_id, descriptor.session_name, this.env)) {
+              await this.destroy();
+              return json({ error: "account not found" }, 403);
+            }
+            this.ctx.storage.sql.exec("INSERT INTO metadata VALUES ('recorded', ?) ON CONFLICT(key) DO NOTHING", String(Date.now()));
+          }
+          this.recorded = true;
+        }
         if (request.method === "GET" && parts[2] === "metrics") return json({ ...this.counts, object_id: this.ctx.id.toString(), database_bytes: this.ctx.storage.sql.databaseSize, model_diagnostics: this.modelDiagnostics.filter(entry => entry.scope === scope).map(entry => entry.value), timing: this.timings.get(scope)?.snapshot() ?? {}, checkpoints: { ...this.store.metrics, timing: this.residents.get(scope)?.metrics.timing.checkpoints ?? {} }, resident_runtimes: this.runtimes.size, runtime: this.residents.get(scope)?.metrics, persisted: this.store.row("SELECT (SELECT COUNT(*) FROM states) AS states, (SELECT COUNT(*) FROM records) AS records, (SELECT COUNT(*) FROM jobs WHERE scope = ? AND status IN ('queued', 'running')) AS unfinished", scope) });
         if (request.method === "GET" && parts[2] === "events") return this.events(scope, url, request.headers.get("accept")?.includes("text/event-stream"), descriptor);
         if (parts[2] === "socket") return this.watch(scope, url, request, descriptor);
@@ -196,12 +211,14 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
     }
 
     async alarm(): Promise<void> {
+      if (this.deleted) return;
       this.counts.alarms++;
       await this.pump();
     }
 
     private async pump(watchdogArmed = false): Promise<void> {
       const delay = policy(this.env.RECOVERY_DELAY_MS, "RECOVERY_DELAY_MS");
+      if (this.deleted) return;
       if (this.pumping) { await this.ctx.storage.setAlarm(Date.now() + delay); return; }
       this.pumping = true;
       if (this.linger !== undefined) clearTimeout(this.linger);
@@ -294,6 +311,7 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
         if (runtime) await runtime.dispose().catch(() => {});
       } finally {
         this.running = undefined;
+        if (this.deleted) { this.pumping = false; return; }
         const unfinished = this.store.row("SELECT request_id FROM jobs WHERE status IN ('queued', 'running') LIMIT 1");
         const background = this.store.row("SELECT key FROM metadata WHERE key LIKE 'background:%' LIMIT 1");
         if (!unfinished && !background) this.releaseIdle();
@@ -486,6 +504,7 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
     }
 
     async webSocketMessage(socket: WebSocket, message: string | ArrayBuffer): Promise<void> {
+      if (this.deleted) return;
       const executor = this.handSockets.get(socket);
       if (executor) return executor.receive(message);
       if (this.ctx.getTags(socket).includes(WATCH_TAG)) return this.watcherMessage(socket, message);
@@ -493,6 +512,7 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
     }
 
     async webSocketClose(socket: WebSocket): Promise<void> {
+      if (this.deleted) return;
       this.handSockets.get(socket)?.disconnected();
       this.handSockets.delete(socket);
       this.forgetWatcher(socket);
@@ -500,6 +520,7 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
     }
 
     async webSocketError(socket: WebSocket): Promise<void> {
+      if (this.deleted) return;
       this.handSockets.get(socket)?.disconnected("runner connection failed");
       this.handSockets.delete(socket);
       this.forgetWatcher(socket);
@@ -652,6 +673,7 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
     }
 
     private detachHand(scope: string, hand: string, connection: string): void {
+      if (this.deleted) return;
       const executor = this.connections.get(connection);
       if (executor) this.handSockets.delete(executor.socket);
       this.ctx.storage.sql.exec("DELETE FROM hand_sockets WHERE connection = ?", connection);
@@ -659,6 +681,21 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
       const hands = this.hands.get(scope);
       if (hands?.get(hand)?.connection === connection) hands.delete(hand);
       void this.residents.get(scope)?.detach(connection).catch(() => {});
+    }
+
+    private async destroy(): Promise<Response> {
+      this.deleted = true;
+      if (this.linger !== undefined) clearTimeout(this.linger);
+      this.linger = undefined;
+      for (const socket of this.ctx.getWebSockets()) { try { socket.close(1000, "session deleted"); } catch {} }
+      const runtimes = [...this.runtimes.values()];
+      this.runtimes.clear();
+      this.residents.clear();
+      this.eventHub.notify();
+      await Promise.all(runtimes.map(resident => resident.then(runtime => runtime.dispose()).catch(() => {})));
+      await this.ctx.storage.deleteAlarm();
+      await this.ctx.storage.deleteAll();
+      return json({ deleted: true });
     }
 
     private finish(job: Job, result: AgentResult): void {
@@ -821,5 +858,12 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
     return new Response(response.body, { status: response.status, statusText: response.statusText, headers: responseHeaders });
   }
 
-  return { AgentSession, fetch };
+  async function deleteSession(account: string, name: string, env: E): Promise<boolean> {
+    const descriptor: SessionDescriptor = { account_id: account, session_id: "", session_name: name, subscription: false };
+    const response = await env.SESSIONS.get(env.SESSIONS.idFromName(JSON.stringify([account, name])), { locationHint: env.SESSION_LOCATION_HINT }).fetch(new Request("https://session.internal/internal/delete", { method: "POST", headers: { "x-nanocode-descriptor": headerJson(descriptor) } }));
+    await response.body?.cancel();
+    return response.ok || response.status === 410;
+  }
+
+  return { AgentSession, fetch, deleteSession };
 }
