@@ -39,6 +39,7 @@ export type RuntimeMetrics = {
   model_sockets: number;
   socket_sends: number;
   socket_frames: number;
+  tool_calls: number;
   body_reads: number;
   event_batches: number;
   events: number;
@@ -68,7 +69,7 @@ export class AgentRuntime {
   private readonly watchers = new Set<() => void>();
   private readonly counters: Omit<RuntimeMetrics, "timing" | "wasm_memory_bytes"> = {
     initializations: 0, runs: 0, completed: 0, failed: 0, cancelled: 0, retries: 0, waits: 0, resumes: 0, rejected_runs: 0, cancellations: 0,
-    host_calls: 0, store_calls: 0, model_requests: 0, model_sockets: 0, socket_sends: 0, socket_frames: 0, body_reads: 0, event_batches: 0, events: 0,
+    host_calls: 0, store_calls: 0, model_requests: 0, model_sockets: 0, socket_sends: 0, socket_frames: 0, tool_calls: 0, body_reads: 0, event_batches: 0, events: 0,
     host_cancellations: 0, dropped_replies: 0, disposals: 0,
     bridge_request_bytes: 0, bridge_reply_bytes: 0,
   };
@@ -99,7 +100,7 @@ export class AgentRuntime {
     runtime.wasm = instance.exports as unknown as Exports;
     try {
       const initStarted = performance.now();
-      const opened = await runtime.command({ op: "init", config: { session_id: config.session_id, provider: config.provider ?? "claude", subscription: config.subscription, endpoint: config.endpoint, remote: config.remote ?? false, executor: config.executor, hands: runtime.hands, event_coalesce_ms: config.event_coalesce_ms ?? 0 } }) as { pending: string[] };
+      const opened = await runtime.command({ op: "init", config: { session_id: config.session_id, provider: config.provider ?? "claude", subscription: config.subscription, endpoint: config.endpoint, remote: config.remote ?? false, executor: config.executor, hands: runtime.hands, event_coalesce_ms: config.event_coalesce_ms ?? 0, tools: config.tools ?? [] } }) as { pending: string[] };
       runtime.timings.record("sdk.open", performance.now() - initStarted);
       runtime.pendingAtOpen = opened.pending;
     } catch (error) {
@@ -366,6 +367,13 @@ export class AgentRuntime {
           await body.reader.cancel().catch(() => undefined);
         }
         return null;
+      }
+      case "tool_call": {
+        if (!this.options.tools) throw new Error("host tools are not configured");
+        this.counters.tool_calls++;
+        const controller = new AbortController();
+        this.onCancel(id, () => controller.abort());
+        return await this.options.tools.call(request.name, request.input, controller.signal) ?? null;
       }
       case "socket_open": {
         if (!this.options.socket) throw new Error("model sockets are not configured");

@@ -3,10 +3,10 @@ import { AgentRuntime } from "./host";
 import { CheckpointStore } from "./store";
 import { EventHub } from "./events";
 import { RemoteExecutor } from "./remote/host";
-import { DEFAULT_EXECUTOR, EXECUTOR_ID, RECENT_MODEL_LIMIT, headerJson, json, sessionUuid, type AgentResult, type ModelDispatch, type ModelProvider, type PrivateBinding, type SessionDescriptor } from "./contracts";
+import { DEFAULT_EXECUTOR, EXECUTOR_ID, RECENT_MODEL_LIMIT, headerJson, json, sessionUuid, type AgentResult, type HostTool, type HostToolCall, type ModelDispatch, type ModelProvider, type PrivateBinding, type SessionDescriptor } from "./contracts";
 import { Timings, timingDifference, type TimingSnapshot } from "./timing";
 
-export type { ModelDispatch, ModelProvider, PrivateBinding, SessionAuthority, SessionDescriptor, SocketDispatch } from "./contracts";
+export type { HostTool, HostToolCall, ModelDispatch, ModelProvider, PrivateBinding, SessionAuthority, SessionDescriptor, SocketDispatch } from "./contracts";
 
 export interface NanocodeEnv {
   SESSIONS: DurableObjectNamespace;
@@ -28,6 +28,7 @@ export type NanocodeOptions<E extends NanocodeEnv> = {
   egress(env: E): PrivateBinding;
   subscription?(account: string, env: E, provider: ModelProvider): Promise<boolean> | boolean;
   recordSession?(account: string, name: string, env: E): Promise<boolean> | boolean;
+  tools?: { definitions: HostTool[]; call(call: HostToolCall, env: E, signal: AbortSignal): Promise<unknown> };
 };
 
 type Job = { request_id: string; prompt: string; status: string; result: string | null; scope: string; descriptor: string; cancel_requested: number; first_seq: number | null; last_seq: number | null };
@@ -70,7 +71,7 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
     private readonly timings = new Map<string, Timings>();
     private readonly turnTimings = new Map<string, TurnTiming>();
     private readonly eventTurns = new Map<string, string>();
-    private readonly counts = { runtime_initializations: 0, model_dispatches: 0, events_written: 0, event_turn_queries: 0, event_turn_cache_hits: 0, preparation_writes: 0, preparation_writes_skipped: 0, effect_syncs: 0, alarms: 0, direct_starts: 0, recoveries: 0, runtime_retirements: 0 };
+    private readonly counts = { runtime_initializations: 0, model_dispatches: 0, events_written: 0, event_turn_queries: 0, event_turn_cache_hits: 0, preparation_writes: 0, preparation_writes_skipped: 0, effect_syncs: 0, alarms: 0, direct_starts: 0, recoveries: 0, runtime_retirements: 0, host_tool_calls: 0 };
 
     constructor(ctx: DurableObjectState, env: E) {
       super(ctx, env);
@@ -364,7 +365,15 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
             : undefined;
           void connecting?.catch(() => {});
           try {
-            const created = await AgentRuntime.create({ session_id: sessionId, provider: descriptor.provider ?? "claude", subscription: descriptor.subscription, endpoint: descriptor.provider === "codex" ? (descriptor.subscription ? "https://chatgpt.com/backend-api/codex" : "https://api.openai.com/v1") : `https://api.anthropic.com/v1/messages${descriptor.subscription ? "?beta=true" : ""}`, remote: enabled, executor: descriptor.executor_id, hands: this.handsMode(scope, descriptor), event_coalesce_ms: duration(this.env.EVENT_COALESCE_MS, "EVENT_COALESCE_MS") }, this.store, {
+            const created = await AgentRuntime.create({ session_id: sessionId, provider: descriptor.provider ?? "claude", subscription: descriptor.subscription, endpoint: descriptor.provider === "codex" ? (descriptor.subscription ? "https://chatgpt.com/backend-api/codex" : "https://api.openai.com/v1") : `https://api.anthropic.com/v1/messages${descriptor.subscription ? "?beta=true" : ""}`, remote: enabled, executor: descriptor.executor_id, hands: this.handsMode(scope, descriptor), event_coalesce_ms: duration(this.env.EVENT_COALESCE_MS, "EVENT_COALESCE_MS"), tools: options.tools?.definitions }, this.store, {
+          tools: options.tools && {
+            call: async (name, input, signal) => {
+              if (this.dispatchBlocked(scope)) throw new Error("request authority stopped");
+              await this.durable(scope);
+              this.counts.host_tool_calls++;
+              return options.tools!.call({ authority: { account_id: authority.account_id, session_id: authority.session_id }, name, input }, this.env, signal);
+            },
+          },
           remote: {
             failed: () => remoteFailed || remote?.failure !== undefined,
             execute: async (request: any, id: number) => {

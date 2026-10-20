@@ -3,6 +3,7 @@ mod events;
 #[path = "remote/runtime.rs"]
 mod remote;
 mod store;
+mod tools;
 mod transport;
 
 use std::{
@@ -48,6 +49,8 @@ struct Configuration {
     hands: bool,
     #[serde(default)]
     event_coalesce_ms: u64,
+    #[serde(default)]
+    tools: Vec<tools::HostTool>,
 }
 
 impl Configuration {
@@ -189,15 +192,18 @@ async fn open(config: Configuration) -> Result<Session, String> {
         }
     };
     let executors = CodeModeExecutors::new();
+    let selected = config
+        .tools
+        .into_iter()
+        .fold(
+            Tools::builder().without_defaults().tool(executors.tool()),
+            |selected, tool| selected.tool(tool),
+        )
+        .build()
+        .map_err(text)?;
     builder = builder
         .workspace("/")
-        .tools(
-            Tools::builder()
-                .without_defaults()
-                .tool(executors.tool())
-                .build()
-                .map_err(text)?,
-        )
+        .tools(selected)
         .durability(store.clone());
     if config.remote {
         let name: Arc<str> = config.executor.as_deref().unwrap_or("default").into();

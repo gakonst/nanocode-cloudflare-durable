@@ -44,6 +44,10 @@ export interface PrivateBinding {
   fetch(request: Request): Promise<Response>;
 }
 
+export type HostTool = { name: string; description: string; parameters: Record<string, unknown> };
+
+export type HostToolCall = { authority: SessionAuthority; name: string; input: unknown };
+
 export type AgentConfiguration = {
   provider?: ModelProvider;
   session_id: string;
@@ -53,6 +57,7 @@ export type AgentConfiguration = {
   executor?: string;
   hands?: boolean;
   event_coalesce_ms?: number;
+  tools?: HostTool[];
 };
 
 export type AgentInput = { request_id: string; prompt: string; hand?: string };
@@ -93,6 +98,9 @@ export type RuntimeOptions = {
   socket?: {
     open(request: { headers: [string, string][] }, signal: AbortSignal, timing: ModelTiming & { runtime_id: string }): Promise<Response>;
     admit(): Promise<void>;
+  };
+  tools?: {
+    call(name: string, input: unknown, signal: AbortSignal): Promise<unknown>;
   };
   remote?: {
     failed?(): boolean;
