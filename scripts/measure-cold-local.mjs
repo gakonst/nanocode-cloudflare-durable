@@ -1,4 +1,5 @@
 import { Miniflare, convertV4MiniflareOptions } from "miniflare";
+import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { performance } from "node:perf_hooks";
@@ -10,6 +11,17 @@ const replyBytes = Number(values["reply-bytes"]);
 const round = value => typeof value === "number" ? Math.round(value * 10) / 10 : undefined;
 let arrived;
 let calls = 0;
+
+function workerdCpu() {
+  const pids = execFileSync("pgrep", ["-P", String(process.pid), "workerd"], { encoding: "utf8" }).split("\n").filter(Boolean);
+  return pids.reduce((total, pid) => total + execFileSync("ps", ["-o", "time=", "-p", pid], { encoding: "utf8" }).trim().split(":").map(Number).reduce((sum, part) => sum * 60 + part, 0) * 1000, 0);
+}
+
+async function measured(step) {
+  const cpu = workerdCpu();
+  const sample = await step();
+  return { ...(typeof sample === "number" ? { ms: sample } : sample), workerd_cpu_ms: round(workerdCpu() - cpu) };
+}
 
 function sse(events) {
   return new Response(events.map(([event, data]) => (event ? "event: " + event + "\n" : "") + "data: " + JSON.stringify(data) + "\n\n").join(""), { headers: { "content-type": "text/event-stream" } });
@@ -79,17 +91,19 @@ try {
     for (let index = 0; index < Number(values.rounds); index++) {
       await mf.dispose();
       await start();
-      const sample = { restart_ms: await timed("http://worker/sessions/" + name + "/hands") };
-      sample.reader_ms = await timed("http://worker/sessions/" + name + "/turns/none");
-      sample.cold = await turn(name, "cold-" + index, providerName);
-      sample.warm = await turn(name, "warm-" + index, providerName);
+      const sample = { restart: await measured(() => timed("http://worker/sessions/" + name + "/hands")) };
+      sample.reader = await measured(() => timed("http://worker/sessions/" + name + "/turns/none"));
+      sample.cold = await measured(() => turn(name, "cold-" + index, providerName));
+      sample.warm = await measured(() => turn(name, "warm-" + index, providerName));
       rounds.push(sample);
       console.error(providerName, JSON.stringify(sample));
     }
     const summary = {
-      restart_ms: median(rounds.map(sample => sample.restart_ms)),
-      reader_ms: median(rounds.map(sample => sample.reader_ms)),
-      ...Object.fromEntries(["headers_ms", "dispatch_ms", "result_ms", "runtime_open_ms", "sdk_open_ms"].flatMap(key => [["cold_" + key, median(rounds.map(sample => sample.cold[key]))], ["warm_" + key, median(rounds.map(sample => sample.warm[key]))]])),
+      restart_ms: median(rounds.map(sample => sample.restart.ms)),
+      restart_cpu_ms: median(rounds.map(sample => sample.restart.workerd_cpu_ms)),
+      reader_ms: median(rounds.map(sample => sample.reader.ms)),
+      reader_cpu_ms: median(rounds.map(sample => sample.reader.workerd_cpu_ms)),
+      ...Object.fromEntries(["headers_ms", "dispatch_ms", "result_ms", "runtime_open_ms", "sdk_open_ms", "workerd_cpu_ms"].flatMap(key => [["cold_" + key, median(rounds.map(sample => sample.cold[key]))], ["warm_" + key, median(rounds.map(sample => sample.warm[key]))]])),
     };
     report.providers.push({ provider: providerName, session: name, summary, rounds });
   }
