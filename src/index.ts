@@ -23,8 +23,10 @@ export interface NanocodeEnv {
   SESSION_LOCATION_HINT?: DurableObjectLocationHint;
 }
 
+export type Principal = { account: string; read_only?: boolean };
+
 export type NanocodeOptions<E extends NanocodeEnv> = {
-  authenticate(request: Request, env: E): Promise<string | null> | string | null;
+  authenticate(request: Request, env: E): Promise<string | Principal | null> | string | Principal | null;
   egress(env: E): PrivateBinding;
   subscription?(account: string, env: E, provider: ModelProvider): Promise<boolean> | boolean;
   recordSession?(account: string, name: string, env: E): Promise<boolean> | boolean;
@@ -113,6 +115,7 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
         const scope = "owner";
         const parts = url.pathname.split("/");
         if (parts[2] === "delete" && request.method === "POST") return await this.destroy();
+        if (descriptor.read_only && (request.method !== "GET" || (parts[2] === "hands" && request.headers.get("upgrade")?.toLowerCase() === "websocket"))) return json({ error: "read-only access" }, 403);
         if (!this.recorded && options.recordSession) {
           if (!this.store.row("SELECT value FROM metadata WHERE key = 'recorded'")) {
             if (!await options.recordSession(descriptor.account_id, descriptor.session_name, this.env)) {
@@ -616,7 +619,7 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
         const response = await this.fetch(new Request(`https://session.internal/internal/cancel/${encodeURIComponent(input.request_id)}`, { method: "POST", headers }));
         socket.send(JSON.stringify({ type: "cancel", request_id: input.request_id, status: response.status, body: await response.json() }));
       } else if (input?.type === "warm") {
-        const warmed = await this.warm(watcher.scope).catch(() => false);
+        const warmed = !watcher.descriptor.read_only && await this.warm(watcher.scope).catch(() => false);
         socket.send(JSON.stringify({ type: "warm", warmed }));
       } else {
         socket.send(JSON.stringify({ type: "error", error: "unknown message type" }));
@@ -838,8 +841,9 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
 
   async function fetch(request: Request, env: E): Promise<Response> {
     const started = performance.now();
-    const account = await options.authenticate(request, env);
-    if (!account) return json({ error: "unauthorized" }, 401);
+    const principal = await options.authenticate(request, env);
+    if (!principal) return json({ error: "unauthorized" }, 401);
+    const account = typeof principal === "string" ? principal : principal.account;
     const url = new URL(request.url);
     if (url.pathname === "/health") return json({ ok: true, model: "claude-opus-5-5", models: { claude: "claude-opus-5-5", codex: "gpt-6.1-sol" }, auth: env.MODEL_AUTH ?? "api_key" });
     if (url.pathname === "/metrics" && request.method === "GET") return options.egress(env).fetch(new Request(url.searchParams.get("probe") === "codex" ? "https://egress.internal/probe/codex" : "https://egress.internal/metrics"));
@@ -850,7 +854,7 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
     if (!name || name.includes("\0")) return json({ error: "invalid session name" }, 400);
     const mode = (provider: ModelProvider) => options.subscription ? options.subscription(account, env, provider) : env.MODEL_AUTH === "subscription";
     const [subscription, codex_subscription] = await Promise.all([mode("claude"), mode("codex")]);
-    const descriptor: SessionDescriptor = { account_id: account, session_id: "", session_name: name, subscription, codex_subscription };
+    const descriptor: SessionDescriptor = { account_id: account, session_id: "", session_name: name, subscription, codex_subscription, ...(typeof principal === "object" && principal.read_only ? { read_only: true } : {}) };
     let path = `/internal/${match[2] ?? "metrics"}`;
     if (match[4]) path = `/internal/cancel/${match[3]}`;
     else if (match[3]) path += `/${match[3]}`;

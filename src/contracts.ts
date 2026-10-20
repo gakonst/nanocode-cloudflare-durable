@@ -28,6 +28,7 @@ export type SessionDescriptor = SessionAuthority & {
   subscription: boolean;
   codex_subscription?: boolean;
   hand?: string;
+  read_only?: boolean;
 };
 
 export type ModelDispatch = {
