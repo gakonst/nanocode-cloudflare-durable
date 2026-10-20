@@ -1746,6 +1746,7 @@ dependencies = [
  "nanocode-code-mode",
  "serde",
  "serde_json",
+ "tracing",
 ]
 
 [[package]]
