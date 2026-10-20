@@ -19,7 +19,7 @@ use nanocode::{
     Tools, TurnControl,
     backend::Prompt,
     codex::{OpenAiAuth, transport::ResponsesTransport},
-    durability::{SessionRecord, TurnStatus},
+    durability::{SessionRecord, SqlStore, TurnStatus},
     subagents::SubagentActivity,
 };
 use nanocode_code_mode::remote::PLACEMENT_INSTRUCTIONS;
@@ -143,7 +143,7 @@ fn current() -> Option<Rc<Session>> {
 
 async fn open(config: Configuration) -> Result<Session, String> {
     let coalesce = std::time::Duration::from_millis(config.event_coalesce_ms);
-    let store = nanocode::session_store(store::WorkerStore).map_err(text)?;
+    let store = nanocode::session_store(SqlStore::new(store::WorkerStore)).map_err(text)?;
     if store
         .summary(&config.session_id)
         .await

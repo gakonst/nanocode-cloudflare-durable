@@ -1,6 +1,6 @@
 import module from "../dist/nanocode_worker.wasm";
 import { RECENT_MODEL_LIMIT, type AgentConfiguration, type AgentInput, type AgentResult, type ModelTiming, type RuntimeOptions } from "./contracts";
-import { CheckpointStore, StoreFailure } from "./store";
+import { CheckpointStore } from "./store";
 import { Timings, type TimingSnapshot } from "./timing";
 
 type Exports = {
@@ -49,8 +49,6 @@ export type RuntimeMetrics = {
   bridge_request_bytes: number;
   bridge_reply_bytes: number;
 };
-
-const STORE_OPERATIONS = new Set(["peek", "read_record", "read_records", "list_states", "acquire", "replace"]);
 
 export class AgentRuntime {
   private readonly runtimeId = crypto.randomUUID();
@@ -467,11 +465,11 @@ export class AgentRuntime {
         this.notify();
         return null;
       }
-      default: {
-        if (!STORE_OPERATIONS.has(request.op)) throw new Error("unsupported host operation");
+      case "store": {
         this.counters.store_calls++;
-        return this.store.execute(request, this.checkpointTimings);
+        return this.store.transaction(request.operation, request.statements, this.checkpointTimings);
       }
+      default: throw new Error("unsupported host operation");
     }
   }
 
@@ -603,9 +601,7 @@ export class AgentRuntime {
   }
 
   private static encodeError(error: unknown) {
-    return error instanceof StoreFailure
-      ? { kind: error.kind, detail: error.message, expected: error.expected, actual: error.actual }
-      : { kind: "backend", detail: error instanceof Error ? error.message : String(error) };
+    return { detail: error instanceof Error ? error.message : String(error) };
   }
 
   private elapsed(): number { return performance.now() - this.started; }
