@@ -1,5 +1,5 @@
 import module from "../dist/nanocode_worker.wasm";
-import { RECENT_MODEL_LIMIT, type AgentConfiguration, type Driven, type HostOptions, type LogPage, type ModelTiming, type RuntimeOptions, type TurnView } from "./contracts";
+import { HostFailure, RECENT_MODEL_LIMIT, type AgentConfiguration, type Driven, type HostOptions, type LogPage, type ModelTiming, type RuntimeOptions, type TurnView } from "./contracts";
 import { CheckpointStore } from "./store";
 import { Timings, type TimingSnapshot } from "./timing";
 
@@ -104,7 +104,8 @@ export class AgentRuntime {
     this.subscription = config.subscription;
     try {
       const initStarted = performance.now();
-      await this.command({ op: "init", config: { scope: config.scope, session_id: config.session_id, runtime_id: this.runtimeId, started_ms: this.started, provider: config.provider ?? "claude", subscription: config.subscription, endpoint: config.endpoint, remote: config.remote ?? false, executor: config.executor, hands: this.hands, event_coalesce_ms: config.event_coalesce_ms ?? 0, tools: config.tools ?? [] } });
+      const opened = await this.command({ op: "init", config: { scope: config.scope, session_id: config.session_id, runtime_id: this.runtimeId, started_ms: this.started, provider: config.provider ?? "claude", subscription: config.subscription, endpoint: config.endpoint, remote: config.remote ?? false, executor: config.executor, hands: this.hands, event_coalesce_ms: config.event_coalesce_ms ?? 0, tools: config.tools ?? [] } }) as { rejected?: { error: string; kind: string } };
+      if (opened.rejected) throw new HostFailure(opened.rejected.error, opened.rejected.kind, true);
       this.timings.record("sdk.open", performance.now() - initStarted);
     } catch (error) {
       this.terminate(error);
@@ -155,6 +156,14 @@ export class AgentRuntime {
 
   async interrupted(scope: string, request_id: string, note: string): Promise<void> {
     await this.command({ op: "interrupted", scope, request_id, note });
+  }
+
+  async retry(scope: string, request_id: string, error: string, kind: string, retry_at: number): Promise<TurnView | null> {
+    return (await this.command({ op: "retry", scope, request_id, error, kind, retry_at }) as { turn: TurnView | null }).turn;
+  }
+
+  async finish(scope: string, request_id: string, status: "failed" | "cancelled", fields: Record<string, unknown>): Promise<void> {
+    await this.command({ op: "finish", scope, request_id, status, fields });
   }
 
   async import(scope: string, turns: unknown[]): Promise<number> {

@@ -4,6 +4,10 @@ export type RemotePolicy = { max_frame_bytes: number; timeout_ms: number };
 
 const encoder = new TextEncoder();
 
+export class ExecutorRejection extends Error {
+  constructor(readonly status: number, message: string) { super(message); }
+}
+
 function validate(policy: RemotePolicy) {
   for (const key of ["max_frame_bytes", "timeout_ms"] as const) {
     if (!Number.isSafeInteger(policy[key]) || policy[key] <= 0) throw new Error(`remote ${key} must be a positive integer`);
@@ -69,7 +73,7 @@ export class RemoteExecutor {
       const socket = response.webSocket;
       if (response.status !== 101 || !socket) {
         const detail = await response.json<{ error?: string }>().then(body => body.error, () => undefined);
-        throw new Error(`remote executor connection rejected with status ${response.status}${detail ? `: ${detail}` : ""}`);
+        throw new ExecutorRejection(response.status, `remote executor connection rejected with status ${response.status}${detail ? `: ${detail}` : ""}`);
       }
       executor = new RemoteExecutor(socket, policy, true);
       socket.accept();

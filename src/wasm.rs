@@ -119,6 +119,20 @@ enum Command {
         request_id: String,
         note: String,
     },
+    Retry {
+        scope: String,
+        request_id: String,
+        error: String,
+        kind: String,
+        retry_at: u64,
+    },
+    Finish {
+        scope: String,
+        request_id: String,
+        status: String,
+        #[serde(default)]
+        fields: Map<String, Value>,
+    },
     Page {
         scope: String,
         after: u64,
@@ -181,6 +195,21 @@ fn text(error: impl std::fmt::Display) -> String {
     error.to_string()
 }
 
+enum Opening {
+    Configuration(String),
+    Failed(String),
+}
+
+impl From<String> for Opening {
+    fn from(error: String) -> Self {
+        Self::Failed(error)
+    }
+}
+
+fn configuration(error: impl std::fmt::Display) -> Opening {
+    Opening::Configuration(error.to_string())
+}
+
 fn log(scope: &str) -> Arc<Log> {
     LOGS.with_borrow_mut(|logs| {
         Arc::clone(logs.entry(scope.to_owned()).or_insert_with(|| {
@@ -210,7 +239,7 @@ fn described(record: &TurnRecord) -> Result<Value, String> {
     }))
 }
 
-async fn open(config: Configuration) -> Result<Session, String> {
+async fn open(config: Configuration) -> Result<Session, Opening> {
     let coalesce = Duration::from_millis(config.event_coalesce_ms);
     let store =
         nanocode::session_store(SqlStore::new(store::WorkerStore::durability())).map_err(text)?;
@@ -243,7 +272,7 @@ async fn open(config: Configuration) -> Result<Session, String> {
                     .api_base_url(config.endpoint)
                     .host_transport(transport::WorkerTransport)
                     .build()
-                    .map_err(text)?,
+                    .map_err(configuration)?,
             )
         }
     };
@@ -256,7 +285,7 @@ async fn open(config: Configuration) -> Result<Session, String> {
             |selected, tool| selected.tool(tool),
         )
         .build()
-        .map_err(text)?;
+        .map_err(configuration)?;
     builder = builder
         .workspace("/")
         .tools(selected)
@@ -270,11 +299,11 @@ async fn open(config: Configuration) -> Result<Session, String> {
         builder = builder
             .instructions(PLACEMENT_INSTRUCTIONS)
             .code_mode_host(executors.clone())
-            .map_err(text)?;
+            .map_err(configuration)?;
     }
     let runtime = builder
         .build()
-        .map_err(|error| format!("build runtime: {error}"))?;
+        .map_err(|error| configuration(format!("build runtime: {error}")))?;
     let host = Arc::new(events::WorkerInbox::new(
         config.runtime_id,
         config.started_ms,
@@ -301,7 +330,7 @@ async fn open(config: Configuration) -> Result<Session, String> {
         }
         Err(error) => {
             let _ = runtime.shutdown().await;
-            Err(error.to_string())
+            Err(Opening::Failed(error.to_string()))
         }
     }
 }
@@ -327,7 +356,11 @@ async fn init(config: Configuration) -> Result<Value, String> {
             bridge::spawn(async move { session.inbox.deliver_completions().await });
             Ok(summary)
         }
-        Err(error) => {
+        Err(Opening::Configuration(error)) => {
+            PHASE.set(Phase::Closed);
+            Ok(json!({"rejected": {"error": error, "kind": "configuration"}}))
+        }
+        Err(Opening::Failed(error)) => {
             PHASE.set(Phase::Closed);
             Err(error)
         }
@@ -413,6 +446,43 @@ async fn cancel(
     })
 }
 
+async fn retry(
+    scope: &str,
+    request_id: &str,
+    error: &str,
+    kind: &str,
+    retry_at: u64,
+) -> Result<Value, String> {
+    let retried = log(scope)
+        .retry(request_id, error, kind, retry_at)
+        .await
+        .map_err(text)?;
+    let Some((record, event)) = retried else {
+        return Ok(json!({"turn": null}));
+    };
+    if let Some(event) = event {
+        events::publish(vec![event]).await?;
+    }
+    Ok(json!({"turn": described(&record)?}))
+}
+
+async fn finish(
+    scope: &str,
+    request_id: &str,
+    status: &str,
+    fields: &Map<String, Value>,
+) -> Result<Value, String> {
+    let state = TurnState::parse(status).map_err(text)?;
+    if let Some((_, event)) = log(scope)
+        .finish(request_id, state, fields)
+        .await
+        .map_err(text)?
+    {
+        events::publish(vec![event]).await?;
+    }
+    Ok(Value::Null)
+}
+
 async fn import(scope: &str, turns: Vec<Legacy>) -> Result<Value, String> {
     let turns = turns
         .into_iter()
@@ -494,6 +564,19 @@ async fn execute(command: Command) -> Result<Box<RawValue>, String> {
                 .map_err(text)?;
             raw(&Value::Null)
         }
+        Command::Retry {
+            scope,
+            request_id,
+            error,
+            kind,
+            retry_at,
+        } => raw(&retry(&scope, &request_id, &error, &kind, retry_at).await?),
+        Command::Finish {
+            scope,
+            request_id,
+            status,
+            fields,
+        } => raw(&finish(&scope, &request_id, &status, &fields).await?),
         Command::Page {
             scope,
             after,

@@ -66,6 +66,10 @@ export type AgentConfiguration = {
 
 export type TurnReport = Record<string, unknown> & { request_id: string; status: string };
 
+export class HostFailure extends Error {
+  constructor(message: string, readonly kind: string, readonly permanent: boolean) { super(message); }
+}
+
 export type TurnView = { report: TurnReport; first_seq: number; last_seq: number | null; cancel_requested: boolean; metadata: unknown };
 
 export type LoggedEvent = { seq: number; request_id: string | null; created_at: number; event: unknown };

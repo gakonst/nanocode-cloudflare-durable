@@ -2,8 +2,8 @@ import { DurableObject } from "cloudflare:workers";
 import { AgentRuntime } from "./host";
 import { CheckpointStore } from "./store";
 import { EventHub } from "./events";
-import { RemoteExecutor } from "./remote/host";
-import { DEFAULT_EXECUTOR, EXECUTOR_ID, RECENT_MODEL_LIMIT, headerJson, json, sessionUuid, type HostTool, type HostToolCall, type LoggedEvent, type LogPage, type ModelDispatch, type ModelProvider, type PrivateBinding, type SessionDescriptor, type TurnView } from "./contracts";
+import { ExecutorRejection, RemoteExecutor } from "./remote/host";
+import { DEFAULT_EXECUTOR, EXECUTOR_ID, HostFailure, RECENT_MODEL_LIMIT, headerJson, json, sessionUuid, type HostTool, type HostToolCall, type LoggedEvent, type LogPage, type ModelDispatch, type ModelProvider, type PrivateBinding, type SessionDescriptor, type TurnView } from "./contracts";
 import { Timings, timingDifference, type TimingSnapshot } from "./timing";
 
 export type { HostTool, HostToolCall, ModelDispatch, ModelProvider, PrivateBinding, SessionAuthority, SessionDescriptor, SocketDispatch } from "./contracts";
@@ -57,6 +57,14 @@ type Watcher = { state: Watch; scope: string; descriptor: SessionDescriptor };
 const OWNER = "owner";
 const UNFINISHED = new Set(["queued", "running"]);
 const INTERRUPTED = "Agent execution interrupted; recovery scheduled";
+
+function executorFailure(error: unknown): HostFailure {
+  const message = error instanceof Error ? error.message : String(error);
+  if (!(error instanceof ExecutorRejection)) return new HostFailure(message, "unreachable", false);
+  if (error.status === 401 || error.status === 403) return new HostFailure(message, "unauthorized", true);
+  if (error.status === 501 || (error.status >= 400 && error.status < 500 && error.status !== 408 && error.status !== 429)) return new HostFailure(message, "rejected", true);
+  return new HostFailure(message, "unavailable", false);
+}
 
 export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E>) {
   class AgentSession extends DurableObject<E> {
@@ -152,7 +160,7 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
           }
           this.recorded = true;
         }
-        if (request.method === "GET" && parts[2] === "metrics") return json({ ...this.counts, object_id: this.ctx.id.toString(), database_bytes: this.ctx.storage.sql.databaseSize, model_diagnostics: this.modelDiagnostics.filter(entry => entry.scope === scope).map(entry => entry.value), timing: this.timings.get(scope)?.snapshot() ?? {}, checkpoints: { ...this.store.metrics, timing: this.residents.get(scope)?.metrics.timing.checkpoints ?? {} }, log: this.store.log, resident_runtimes: this.runtimes.size, runtime: this.residents.get(scope)?.metrics, persisted: this.store.persisted(scope) });
+        if (request.method === "GET" && parts[2] === "metrics") return json({ ...this.counts, object_id: this.ctx.id.toString(), alarm_at: await this.ctx.storage.getAlarm(), database_bytes: this.ctx.storage.sql.databaseSize, model_diagnostics: this.modelDiagnostics.filter(entry => entry.scope === scope).map(entry => entry.value), timing: this.timings.get(scope)?.snapshot() ?? {}, checkpoints: { ...this.store.metrics, timing: this.residents.get(scope)?.metrics.timing.checkpoints ?? {} }, log: this.store.log, resident_runtimes: this.runtimes.size, runtime: this.residents.get(scope)?.metrics, persisted: this.store.persisted(scope) });
         if (request.method === "GET" && parts[2] === "events") return await this.events(scope, url, request.headers.get("accept")?.includes("text/event-stream"), undefined, descriptor);
         if (parts[2] === "socket") return this.watch(scope, url, request, descriptor);
         if (parts[2] === "hands") {
@@ -208,7 +216,6 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
             this.ctx.storage.sql.exec("INSERT INTO metadata VALUES (?, ?) ON CONFLICT(key) DO NOTHING", providerKey, descriptor.provider!);
             this.ctx.storage.sql.exec("INSERT INTO metadata VALUES (?, ?) ON CONFLICT(key) DO NOTHING", executorKey, executor);
             this.sessionId(scope, descriptor.session_id);
-            this.ctx.storage.sql.exec("INSERT INTO metadata VALUES (?, ?) ON CONFLICT(key) DO NOTHING", `background:${scope}`, JSON.stringify(descriptor));
           });
           this.unfinished = true;
           this.turnTimings.set(input.request_id, { started: admitted, checkpoints: {} });
@@ -256,6 +263,7 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
       let immediate = false;
       let waiting = false;
       let active: string | undefined;
+      let retryAt: number | undefined;
       try {
         if (!watchdogArmed) await this.ctx.storage.setAlarm(Date.now() + delay);
         const next = (await (await this.instance(OWNER)).pending(OWNER))[0];
@@ -264,14 +272,17 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
         if (!next && !background) return;
         scope = next ? OWNER : String(background!.key).slice("background:".length);
         const descriptor: SessionDescriptor = next ? this.descriptorOf(next.metadata) : JSON.parse(String(background!.value));
+        const serialized = JSON.stringify(descriptor);
+        const marked = background?.key === `background:${scope}`;
+        const accepted = !next || next.report.status === "running";
         let sessionId!: string;
-        let preparationRequired = !watchdogArmed;
+        let preparationRequired = false;
+        const mark = () => {
+          this.ctx.storage.sql.exec("INSERT INTO metadata VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", `background:${scope}`, serialized);
+          preparationRequired = true;
+        };
         this.ctx.storage.transactionSync(() => {
-          const serialized = JSON.stringify(descriptor);
-          if (preparationRequired || background?.key !== `background:${scope}` || background.value !== serialized) {
-            this.ctx.storage.sql.exec("INSERT INTO metadata VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", `background:${scope}`, serialized);
-            preparationRequired = true;
-          }
+          if ((marked || accepted) && (!watchdogArmed || !marked || background!.value !== serialized)) mark();
           sessionId = this.sessionId(scope!, descriptor.session_id, () => { preparationRequired = true; });
         });
         if (next) {
@@ -279,8 +290,6 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
           if (next.report.status === "running") this.counts.recoveries++;
         }
         const prepared = performance.now();
-        if (preparationRequired) this.counts.preparation_writes++;
-        else this.counts.preparation_writes_skipped++;
         let timing: TurnTiming | undefined;
         if (active) {
           timing = this.turnTimings.get(active);
@@ -291,9 +300,25 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
           timing.pump_wait_ms = prepared - (timing.admitted_at ?? prepared);
           timing.runtime_reused = this.runtimes.has(scope);
         }
+        const hand = next && !next.cancel_requested ? descriptor.hand : undefined;
+        if (hand !== undefined && !this.hands.get(scope)?.get(hand)?.ready) {
+          retryAt = await this.unavailable(scope, next, new HostFailure(`hand \`${hand}\` is not attached`, "detached", false), delay);
+          immediate = retryAt === undefined || !!this.hands.get(scope)?.get(hand)?.ready;
+          return;
+        }
         const runtimeStarted = performance.now();
         const initializations = this.counts.runtime_initializations;
-        runtime = await this.runtime(scope, sessionId, descriptor);
+        try {
+          runtime = await this.runtime(scope, sessionId, descriptor);
+        } catch (error) {
+          this.blocked.delete(scope);
+          retryAt = await this.unavailable(scope, next, error instanceof HostFailure ? error : new HostFailure(error instanceof Error ? error.message : String(error), "runtime", false), delay);
+          immediate = retryAt === undefined;
+          return;
+        }
+        if (!marked && !accepted) mark();
+        if (preparationRequired) this.counts.preparation_writes++;
+        else this.counts.preparation_writes_skipped++;
         if (timing) {
           timing.runtime_reused = initializations === this.counts.runtime_initializations;
           timing.runtime_open_ms = performance.now() - runtimeStarted;
@@ -333,7 +358,7 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
         const background = this.store.row("SELECT key FROM metadata WHERE key LIKE 'background:%' LIMIT 1");
         if (!unfinished && !background) this.releaseIdle();
         this.pumping = false;
-        if (unfinished || background) await this.ctx.storage.setAlarm(Date.now() + delay);
+        if (unfinished || background) await this.ctx.storage.setAlarm(retryAt ?? Date.now() + delay);
         else await this.ctx.storage.deleteAlarm();
         if (immediate && unfinished) this.ctx.waitUntil(this.pump(true));
       }
@@ -341,6 +366,29 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
 
     private queueKnownEmpty(): boolean {
       return this.unfinished === false;
+    }
+
+    private async unavailable(scope: string, next: TurnView | undefined, failure: HostFailure, delay: number): Promise<number | undefined> {
+      if (!next) {
+        if (!failure.permanent) return Date.now() + delay;
+        this.ctx.storage.sql.exec("DELETE FROM metadata WHERE key = ?", `background:${scope}`);
+        return undefined;
+      }
+      const id = next.report.request_id;
+      const reader = await this.instance(scope);
+      let turn: TurnView | null = next;
+      if (!next.cancel_requested && !failure.permanent) {
+        const retryAt = Date.now() + delay;
+        turn = await reader.retry(scope, id, failure.message, failure.kind, retryAt);
+        if (turn && UNFINISHED.has(turn.report.status) && !turn.cancel_requested) return retryAt;
+      }
+      if (turn && UNFINISHED.has(turn.report.status)) {
+        const fields = turn.cancel_requested ? { cancelled: true, error: "request cancelled" } : { error: failure.message, kind: failure.kind };
+        await reader.finish(scope, id, turn.cancel_requested ? "cancelled" : "failed", { ...fields, ...this.observed(id) });
+      }
+      this.turnTimings.delete(id);
+      this.unfinished = undefined;
+      return undefined;
     }
 
     private descriptorOf(value: unknown): SessionDescriptor {
@@ -378,10 +426,11 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
           const enabled = this.executorEnabled(descriptor);
           let remote: RemoteExecutor | undefined;
           let remoteFailed = false;
+          let remoteError: unknown;
           const owner = {};
           const connectStarted = performance.now();
           const connecting = enabled
-            ? RemoteExecutor.create(options.egress(this.env), authority, { max_frame_bytes: policy(this.env.REMOTE_MAX_FRAME_BYTES, "REMOTE_MAX_FRAME_BYTES"), timeout_ms: policy(this.env.REMOTE_TIMEOUT_MS, "REMOTE_TIMEOUT_MS") }).then(value => remote = value, error => { remoteFailed = true; throw error; }).finally(() => this.scopeTimings(scope).record("remote.connect", performance.now() - connectStarted))
+            ? RemoteExecutor.create(options.egress(this.env), authority, { max_frame_bytes: policy(this.env.REMOTE_MAX_FRAME_BYTES, "REMOTE_MAX_FRAME_BYTES"), timeout_ms: policy(this.env.REMOTE_TIMEOUT_MS, "REMOTE_TIMEOUT_MS") }).then(value => remote = value, error => { remoteFailed = true; remoteError = error; throw error; }).finally(() => this.scopeTimings(scope).record("remote.connect", performance.now() - connectStarted))
             : undefined;
           void connecting?.catch(() => {});
           try {
@@ -455,7 +504,11 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
         });
             for (const [hand, entry] of this.hands.get(scope) ?? []) await created.attach(hand, entry.connection).catch(() => {});
             return created;
-          } catch (error) { await connecting?.then(value => value.dispose(), () => {}); throw error; }
+          } catch (error) {
+            const failed = remoteFailed;
+            await connecting?.then(value => value.dispose(), () => {});
+            throw failed ? executorFailure(remoteError) : error;
+          }
         })().then(runtime => {
           if (this.runtimes.get(scope) === resident) this.residents.set(scope, runtime);
           return runtime;
@@ -508,6 +561,9 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
       const entry = hands.get(hand);
       if (entry?.connection !== connection) return;
       entry.ready = true;
+      if (this.pumping || this.unfinished === false) return;
+      const next = (await (await this.instance(scope)).pending(scope))[0];
+      if ((next?.metadata as SessionDescriptor | null | undefined)?.hand === hand && !this.pumping) this.ctx.waitUntil(this.pump());
     }
 
     private indexHand(scope: string, hand: string, connection: string, executor: RemoteExecutor, ready: boolean): void {
@@ -827,10 +883,13 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
       return { timing: { ...phases, observed_ms: performance.now() - started, runtime_id: runtime.runtime_id, checkpoint_spans: timingDifference(runtime.checkpoints, checkpoints), runtime_spans: timingDifference(runtime.spans, before ?? {}) } };
     }
 
+    private observed(id: string): { timing: Record<string, unknown> } {
+      const { started, admitted_at, checkpoints, runtime: before, run_started, ...phases } = this.turnTimings.get(id) ?? { started: performance.now(), checkpoints: {} };
+      return { timing: { ...phases, observed_ms: performance.now() - started, checkpoint_spans: {} } };
+    }
+
     private async cancel(id: string, scope: string): Promise<Response> {
-      const timing = this.turnTimings.get(id);
-      const { started, admitted_at, checkpoints, runtime: before, run_started, ...phases } = timing ?? { started: performance.now(), checkpoints: {} };
-      const fields = { cancelled: true, error: "request cancelled", timing: { ...phases, observed_ms: performance.now() - started, checkpoint_spans: {} } };
+      const fields = { cancelled: true, error: "request cancelled", ...this.observed(id) };
       const { turn, dequeued } = await (await this.instance(scope)).cancel(scope, id, fields);
       if (!turn) return json({ error: "request not found" }, 404);
       const running = turn.report.status === "running";

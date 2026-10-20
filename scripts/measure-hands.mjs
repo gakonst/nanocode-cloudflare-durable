@@ -9,6 +9,7 @@ const sdk = resolve(process.env.NANOCODE_SDK_PATH ?? "../nanocodex");
 const binary = resolve(process.env.CARGO_TARGET_DIR ?? resolve(sdk, "target"), "debug/nanocode");
 const policy = { max_frame_bytes: 1048576, timeout_ms: 30000 };
 const keepaliveMs = Number(process.env.HANDS_KEEPALIVE_MS ?? "45000");
+const recoveryMs = Number(process.env.HANDS_RECOVERY_DELAY_MS ?? "30000");
 const latencyTurns = 10;
 const token = "local-measurement";
 const persistence = resolve(mkdtempSync("output/hands-state-"));
@@ -117,12 +118,13 @@ const outbound = async request => {
 };
 
 const buildMs = process.env.HANDS_SKIP_BUILD ? 0 : buildHand();
-const options = localOptions({ persistence, agent: { REMOTE_MAX_FRAME_BYTES: String(policy.max_frame_bytes), REMOTE_TIMEOUT_MS: String(policy.timeout_ms) } });
+const options = localOptions({ persistence, agent: { RECOVERY_DELAY_MS: String(recoveryMs), REMOTE_MAX_FRAME_BYTES: String(policy.max_frame_bytes), REMOTE_TIMEOUT_MS: String(policy.timeout_ms) } });
 options.workers[1].outboundService = outbound;
 const mf = new Miniflare(convertV4MiniflareOptions(options));
 const name = `hands-${Date.now()}`;
 const headers = { authorization: `Bearer ${token}`, "content-type": "application/json" };
-const request = (path, init = {}) => mf.dispatchFetch(`http://worker/sessions/${name}${path}`, { ...init, headers });
+const sessionRequest = (session, path, init = {}) => mf.dispatchFetch(`http://worker/sessions/${session}${path}`, { ...init, headers });
+const request = (path, init = {}) => sessionRequest(name, path, init);
 const workspaces = {};
 const logs = {};
 const hands = {};
@@ -159,15 +161,28 @@ async function stopHand(hand) {
   await hands[hand].exited;
 }
 
-async function turn(id, scenario, hand) {
-  const begin = performance.now();
-  const response = await request("/turns", { method: "POST", body: JSON.stringify({ request_id: id, prompt: `Run ${scenario} [${id}]`, ...(hand === undefined ? {} : { hand }) }) });
+async function submit(id, scenario, fields = {}, session = name) {
+  const response = await sessionRequest(session, "/turns", { method: "POST", body: JSON.stringify({ request_id: id, prompt: `Run ${scenario} [${id}]`, ...fields }) });
   if (![200, 202].includes(response.status)) throw new Error(`Submit rejected: ${await response.text()}`);
+}
+
+async function status(id, condition, session = name) {
   let result;
   await until(async () => {
-    result = await (await request(`/turns/${encodeURIComponent(id)}`)).json();
-    return ["failed", "completed", "cancelled"].includes(result.status);
+    result = await (await sessionRequest(session, `/turns/${encodeURIComponent(id)}`)).json();
+    return condition(result);
   }, () => `Turn ${id} stalled: ${JSON.stringify(result)}`);
+  return result;
+}
+
+const finished = (id, session) => status(id, result => ["failed", "completed", "cancelled"].includes(result.status), session);
+const metrics = async session => (await sessionRequest(session, "/metrics")).json();
+const turnEvents = async (id, session = name) => (await (await sessionRequest(session, "/events?after=0&limit=128")).json()).events.filter(entry => entry.request_id === id).map(entry => entry.event);
+
+async function turn(id, scenario, hand) {
+  const begin = performance.now();
+  await submit(id, scenario, hand === undefined ? {} : { hand });
+  const result = await finished(id);
   const milliseconds = performance.now() - begin;
   measurements.push({ id, hand, status: result.status, milliseconds });
   if (result.status !== "completed") throw new Error(`Turn ${id} did not complete: ${JSON.stringify(result)}`);
@@ -185,6 +200,23 @@ try {
   const base = String(await mf.ready);
   const direct = await turn("direct", "hands-where");
   expect(/not available in the admitted catalog/.test(direct.results[0]?.text ?? ""), `turn without hands or executor kept Code Mode: ${JSON.stringify(direct.results)}`);
+  const executorSession = `${name}-executor`;
+  const executorStart = performance.now();
+  await submit("executor", "hands-where", { executor: "paradigm-a" }, executorSession);
+  const rejected = await finished("executor", executorSession);
+  const executorMs = performance.now() - executorStart;
+  expect(rejected.status === "failed" && rejected.kind === "rejected" && /status 501/.test(rejected.error), `executor turn without a remote egress: ${JSON.stringify(rejected)}`);
+  expect((await turnEvents("executor", executorSession)).some(event => event.type === "result" && event.kind === "rejected"), "executor failure missing from the event stream");
+  await until(async () => (await metrics(executorSession)).alarm_at === null, "failed executor turn left its session retrying");
+  await submit("absent", "hands-where", { hand: "absent" });
+  const absent = await status("absent", result => result.kind === "detached");
+  expect(absent.status === "queued" && absent.error === "hand `absent` is not attached" && absent.attempts === 1 && absent.retry_at > Date.now(), `turn naming an absent hand: ${JSON.stringify(absent)}`);
+  await until(async () => (await metrics(name)).alarm_at === absent.retry_at, "waiting turn's retry is not scheduled at its retry_at");
+  const absentEvents = (await turnEvents("absent")).filter(event => event.type === "retrying");
+  expect(absentEvents.length === 1 && absentEvents[0].error === absent.error && absentEvents[0].kind === "detached", `waiting turn events: ${JSON.stringify(absentEvents)}`);
+  const cancelledAbsent = await (await request("/turns/absent/cancel", { method: "POST" })).json();
+  expect(cancelledAbsent.status === "cancelled", `cancel of a waiting turn: ${JSON.stringify(cancelledAbsent)}`);
+  await until(async () => (await metrics(name)).alarm_at === null, "cancelled waiting turn kept its session retrying");
   const attachStart = performance.now();
   startHand("laptop", base, false);
   startHand("desk", base);
@@ -238,14 +270,20 @@ try {
 
   await stopHand("laptop");
   const detachMs = await until(async () => !(await attached()).includes(laptopName), "Killed hand stayed attached");
-  const departed = await turn("where-departed", "hands-where", laptopName);
-  expect(/not connected; nothing was dispatched/.test(departed.results[0]?.text ?? ""), `departed hand: ${JSON.stringify(departed.results)}`);
+  await submit("where-departed", "hands-where", { hand: laptopName });
+  const departedWait = await status("where-departed", result => result.kind === "detached");
+  expect(departedWait.status === "queued" && departedWait.error === `hand \`${laptopName}\` is not attached`, `turn naming a departed hand: ${JSON.stringify(departedWait)}`);
 
   const reconnectStart = performance.now();
   logs.laptop = "";
   startHand("laptop", base, false);
   await until(async () => (await attached()).includes(laptopName), () => `Hand did not reattach: ${logs.laptop}`);
   const reconnectMs = performance.now() - reconnectStart;
+  const attachedAt = performance.now();
+  const departed = await finished("where-departed");
+  const departedResumeMs = performance.now() - attachedAt;
+  expect(departed.status === "completed" && observed["where-departed"]?.[0]?.text.includes(workspaces.laptop), `waiting turn after its hand returned: ${JSON.stringify({ departed, results: observed["where-departed"] })}`);
+  expect(departedResumeMs < recoveryMs, `waiting turn waited for its retry instead of its hand: ${departedResumeMs} ms`);
   const returned = await turn("where-returned", "hands-where", laptopName);
   expect(returned.results[0]?.text.includes(workspaces.laptop), `returned hand: ${JSON.stringify(returned.results)}`);
 
@@ -286,7 +324,12 @@ try {
     after_departure: outcomes,
     reattached_ms: deskReturnMs,
     turn_ms: { direct: direct.milliseconds, list: listed.milliseconds, desk: switched.milliseconds, sole_hand: sole.milliseconds, callback: callback.milliseconds },
-    departed_home_result: departed.results[0]?.text,
+    unavailable: {
+      recovery_delay_ms: recoveryMs,
+      executor_without_remote_egress: { status: rejected.status, kind: rejected.kind, error: rejected.error, ms: executorMs },
+      absent_hand: { status: absent.status, kind: absent.kind, error: absent.error, attempts: absent.attempts, retrying_events: absentEvents.length, cancelled: cancelledAbsent.status },
+      departed_hand: { waiting: { status: departedWait.status, kind: departedWait.kind, error: departedWait.error }, completed_after_attach_ms: departedResumeMs },
+    },
     home_left_registry_ms: detachMs,
     reconnect_to_attached_ms: reconnectMs,
     idle_ms: keepaliveMs,
