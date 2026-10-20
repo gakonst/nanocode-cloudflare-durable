@@ -14,7 +14,6 @@ export class RemoteExecutor {
   #socket: WebSocket;
   #policy: RemotePolicy;
   #catalog: string | undefined;
-  #name: string | undefined;
   #catalogWaiter: { resolve(): void; reject(error: Error): void } | undefined;
   #frames: string[] = [];
   #waiter: { id: number; resolve(value: unknown): void } | undefined;
@@ -37,10 +36,9 @@ export class RemoteExecutor {
     return new RemoteExecutor(socket, policy, false);
   }
 
-  static restore(socket: WebSocket, policy: RemotePolicy, catalog: string, name: string): RemoteExecutor {
+  static restore(socket: WebSocket, policy: RemotePolicy, catalog: string): RemoteExecutor {
     const executor = RemoteExecutor.hibernatable(socket, policy);
     executor.#catalog = catalog;
-    executor.#name = name;
     return executor;
   }
 
@@ -89,10 +87,6 @@ export class RemoteExecutor {
     return this.#failure;
   }
 
-  get name(): string | undefined {
-    return this.#name;
-  }
-
   get catalog(): string | undefined {
     return this.#catalog;
   }
@@ -103,6 +97,10 @@ export class RemoteExecutor {
 
   disconnected(reason = "runner disconnected"): void {
     this.#fail(reason, reason === "runner disconnected" ? 1000 : 1011);
+  }
+
+  reject(reason: string): void {
+    this.#fail(reason, 1002);
   }
 
   async execute(request: any, id: number): Promise<unknown> {
@@ -163,11 +161,7 @@ export class RemoteExecutor {
     if (typeof data !== "string") return this.#fail("remote code mode requires JSON text frames", 1003);
     if (encoder.encode(data).byteLength > this.#policy.max_frame_bytes) return this.#fail("remote code mode frame exceeds caller max_frame_bytes policy", 1009);
     if (this.#catalog === undefined) {
-      let catalog: any;
-      try { catalog = JSON.parse(data); } catch {}
-      if (catalog?.type !== "catalog") return this.#fail("runner did not publish a code mode catalog", 1002);
       this.#catalog = data;
-      if (typeof catalog.name === "string") this.#name = catalog.name;
       this.#catalogWaiter?.resolve();
       this.#catalogWaiter = undefined;
       return;

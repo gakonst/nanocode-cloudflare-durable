@@ -10,7 +10,7 @@ use std::{cell::RefCell, collections::HashMap, rc::Rc, sync::Arc, time::Duration
 
 use nanocode::{
     ClaudeClient, ClaudeModel, CodeModeExecutors, CodeModeHost, Model, ModelSelection, Nanocode,
-    OpenAi, Tools,
+    OpenAi, PromptRejection, Tools,
     backend::Prompt,
     codex::{OpenAiAuth, transport::ResponsesTransport},
     durability::{SessionRecord, SqlStore},
@@ -28,6 +28,15 @@ enum Provider {
     #[default]
     Claude,
     Codex,
+}
+
+impl Provider {
+    fn model(self) -> ModelSelection {
+        match self {
+            Self::Claude => ModelSelection::Claude(ClaudeModel::Opus55),
+            Self::Codex => ModelSelection::Codex(Model::Sol),
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -54,10 +63,7 @@ struct Configuration {
 
 impl Configuration {
     fn model(&self) -> ModelSelection {
-        match self.provider {
-            Provider::Claude => ModelSelection::Claude(ClaudeModel::Opus55),
-            Provider::Codex => ModelSelection::Codex(Model::Sol),
-        }
+        self.provider.model()
     }
 }
 
@@ -138,6 +144,15 @@ enum Command {
     Settle,
     Preconnect,
     Dispose,
+    Catalog {
+        frame: String,
+        max_frame_bytes: usize,
+    },
+    Admit {
+        request_id: String,
+        recorded: Option<Provider>,
+        requested: Provider,
+    },
 }
 
 type Log = SessionLog<store::WorkerStore>;
@@ -505,6 +520,27 @@ async fn execute(command: Command) -> Result<Box<RawValue>, String> {
             raw(&Value::Null)
         }
         Command::Dispose => raw(&dispose().await?),
+        Command::Catalog {
+            frame,
+            max_frame_bytes,
+        } => raw(&remote::catalog(&frame, max_frame_bytes)?),
+        Command::Admit {
+            request_id,
+            recorded,
+            requested,
+        } => raw(&match nanocode::admit_prompt(
+            recorded.map(|provider| provider.model().family()).as_ref(),
+            &requested.model().family(),
+            &request_id,
+        ) {
+            Ok(()) => Value::Null,
+            Err(PromptRejection::ReservedRequestId(_)) => {
+                json!({"rejected": "reserved_request_id"})
+            }
+            Err(PromptRejection::HarnessChanged { .. }) => {
+                json!({"rejected": "provider_changed"})
+            }
+        }),
     }
 }
 

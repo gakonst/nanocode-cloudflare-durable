@@ -5,7 +5,7 @@ use std::{
 
 use nanocode_code_mode::{
     embedded::{CodeModeHostError, HostFuture},
-    remote::{RemoteActivity, RemoteClient, RemoteCodeModeHost, RemoteDelivery, RemoteFrame as Frame, RemoteLink},
+    remote::{RemoteActivity, RemoteCatalog, RemoteClient, RemoteCodeModeHost, RemoteDelivery, RemoteFrame as Frame, RemoteLink},
 };
 use serde_json::{Value, json};
 
@@ -42,11 +42,12 @@ impl RemoteLink for WorkerLink {
         delivery: RemoteDelivery,
     ) -> HostFuture<'_, Result<(), CodeModeHostError>> {
         Box::pin(async move {
+            let dispatches = frames.iter().any(Frame::dispatches);
             let frames = frames
                 .iter()
                 .map(|frame| frame.encode(self.max_frame_bytes))
                 .collect::<Result<Vec<_>, _>>()?;
-            call(json!({"op": "remote_send", "connection": self.connection, "frames": frames, "durable": delivery == RemoteDelivery::Durable}))
+            call(json!({"op": "remote_send", "connection": self.connection, "frames": frames, "durable": delivery == RemoteDelivery::Durable, "dispatches": dispatches}))
                 .await
                 .map(drop)
                 .map_err(host_error)
@@ -85,6 +86,11 @@ impl RemoteLink for WorkerLink {
     }
 }
 
+pub fn catalog(frame: &str, max_frame_bytes: usize) -> Result<Value, String> {
+    let catalog = RemoteCatalog::decode(frame, max_frame_bytes).map_err(|e| e.to_string())?;
+    Ok(json!({"name": catalog.name}))
+}
+
 pub async fn host(connection: Option<String>) -> Result<RemoteCodeModeHost, String> {
     let catalog = call(json!({"op": "remote_catalog", "connection": connection}))
         .await
@@ -99,11 +105,9 @@ pub async fn host(connection: Option<String>) -> Result<RemoteCodeModeHost, Stri
     let text = catalog["frame"]
         .as_str()
         .ok_or("remote catalog frame must be text")?;
-    let Frame::Catalog { definitions, .. } =
-        Frame::decode(text, max_frame_bytes).map_err(|e| e.to_string())?
-    else {
-        return Err("runner did not publish a code mode catalog".into());
-    };
+    let definitions = RemoteCatalog::decode(text, max_frame_bytes)
+        .map_err(|e| e.to_string())?
+        .definitions;
     let (client, driver) = RemoteClient::new(
         WorkerLink {
             connection,

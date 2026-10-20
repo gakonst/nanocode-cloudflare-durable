@@ -165,7 +165,6 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
         let input: any;
         try { input = await request.json(); } catch { return json({ error: "invalid JSON" }, 400); }
         if (typeof input?.request_id !== "string" || !input.request_id.trim() || typeof input.prompt !== "string" || !input.prompt.trim()) return json({ error: "request_id and prompt must be nonempty strings" }, 400);
-        if (input.request_id.startsWith("subagent-completion:")) return json({ error: "request_id prefix is reserved" }, 400);
         if (input.provider !== undefined && input.provider !== "claude" && input.provider !== "codex") return json({ error: "provider must be claude or codex" }, 400);
         if (input.executor !== undefined && (typeof input.executor !== "string" || !EXECUTOR_ID.test(input.executor))) return json({ error: "invalid executor" }, 400);
         if (input.hand !== undefined && !handName(input.hand)) return json({ error: "hand must be the name of an attached hand" }, 400);
@@ -187,9 +186,10 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
         const providerKey = `model_provider:${scope}`;
         const boundProvider = this.store.row("SELECT value FROM metadata WHERE key = ?", providerKey)?.value
           ?? (this.store.row("SELECT value FROM metadata WHERE key = ?", scope === "owner" ? "session_id" : `session_id:${scope}`) ? "claude" : undefined);
-        if (boundProvider && input.provider !== undefined && input.provider !== boundProvider) return json({ error: "session provider is immutable; create a new session" }, 409);
         descriptor.provider = input.provider ?? boundProvider ?? "claude";
-        if (descriptor.provider === "codex" && descriptor.session_id && descriptor.session_id[14] !== "7") return json({ error: "Codex requires a new thread with a UUIDv7 session" }, 409);
+        const rejected = await (await this.instance(scope)).admit(input.request_id, boundProvider === undefined ? null : String(boundProvider), descriptor.provider!);
+        if (rejected === "reserved_request_id") return json({ error: "request_id prefix is reserved" }, 400);
+        if (rejected === "provider_changed") return json({ error: "session provider is immutable; create a new session" }, 409);
         if (descriptor.provider === "codex") descriptor.subscription = descriptor.codex_subscription ?? true;
         policy(this.env.RECOVERY_DELAY_MS, "RECOVERY_DELAY_MS");
         const current = this.store.row("SELECT value FROM metadata WHERE key = 'authority'")?.value;
@@ -401,15 +401,9 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
                 return request.op === "remote_poll" ? { closed: "connection moved to a newer runtime" } : null;
               }
               if (request.op === "remote_send" && request.durable !== false) await this.durable(scope);
-              if (request.op === "remote_send" && this.dispatchBlocked(scope)) {
-                const forbidden = request.frames.some((text: string) => {
-                  const frame = JSON.parse(text);
-                  return frame.type === "request" && ["Execute", "Wait", "Call"].includes(Object.keys(frame.operation)[0]);
-                });
-                if (forbidden) {
-                  await executor.dispose();
-                  throw new Error("request authority stopped");
-                }
+              if (request.op === "remote_send" && request.dispatches && this.dispatchBlocked(scope)) {
+                await executor.dispose();
+                throw new Error("request authority stopped");
               }
               return executor.execute(request, id);
             },
@@ -480,7 +474,13 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
 
     private async registerHand(scope: string, requested: string | undefined, executor: RemoteExecutor, descriptor: SessionDescriptor): Promise<void> {
       try { await executor.ready(); } catch { this.handSockets.delete(executor.socket); return; }
-      const hand = requested ?? executor.name;
+      let advertised: string | null;
+      try { advertised = await (await this.instance(scope)).catalog(executor.catalog!, this.handLimits().max_frame_bytes); }
+      catch (error) {
+        this.handSockets.delete(executor.socket);
+        return executor.reject(error instanceof Error ? error.message : String(error));
+      }
+      const hand = requested ?? advertised;
       if (!handName(hand)) {
         this.handSockets.delete(executor.socket);
         return executor.dispose();
@@ -519,7 +519,7 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
           continue;
         }
         live.push(connection);
-        const executor = RemoteExecutor.restore(socket, this.handLimits(), String(row.catalog), String(row.hand));
+        const executor = RemoteExecutor.restore(socket, this.handLimits(), String(row.catalog));
         this.handSockets.set(socket, executor);
         this.indexHand(String(row.scope), String(row.hand), connection, executor, true);
       }

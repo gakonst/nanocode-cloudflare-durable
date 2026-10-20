@@ -133,6 +133,14 @@ export class AgentRuntime {
     return await this.command({ op: "submit", scope, ...input }) as { submitted: "accepted" | "existing" | "conflict"; turn: TurnView };
   }
 
+  async admit(request_id: string, recorded: string | null, requested: string): Promise<"reserved_request_id" | "provider_changed" | undefined> {
+    return (await this.command({ op: "admit", request_id, recorded, requested }) as { rejected?: "reserved_request_id" | "provider_changed" } | null)?.rejected;
+  }
+
+  async catalog(frame: string, max_frame_bytes: number): Promise<string | null> {
+    return (await this.command({ op: "catalog", frame, max_frame_bytes }) as { name: string | null }).name;
+  }
+
   async turn(scope: string, request_id: string): Promise<TurnView | null> {
     return (await this.command({ op: "turn", scope, request_id }) as { turn: TurnView | null }).turn;
   }
