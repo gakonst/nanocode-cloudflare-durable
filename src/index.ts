@@ -1,12 +1,12 @@
 import { DurableObject } from "cloudflare:workers";
-import { AgentRuntime } from "./host";
+import { AgentRuntime, EventHub, HostFailure, RECENT_MODEL_LIMIT, RemoteExecutor, Timings, sessionUuid, timingDifference, type HostTool, type LoggedEvent, type LogPage, type ModelProvider, type TimingSnapshot, type TurnView } from "nanocode-wasm";
+import wasm from "nanocode-wasm/nanocode_wasm.wasm";
 import { CheckpointStore } from "./store";
-import { EventHub } from "./events";
-import { ExecutorRejection, RemoteExecutor } from "./remote/host";
-import { DEFAULT_EXECUTOR, EXECUTOR_ID, HostFailure, RECENT_MODEL_LIMIT, headerJson, json, sessionUuid, type HostTool, type HostToolCall, type LoggedEvent, type LogPage, type ModelDispatch, type ModelProvider, type PrivateBinding, type SessionDescriptor, type TurnView } from "./contracts";
-import { Timings, timingDifference, type TimingSnapshot } from "./timing";
+import { ExecutorRejection, connectExecutor } from "./remote";
+import { DEFAULT_EXECUTOR, EXECUTOR_ID, headerJson, json, type HostToolCall, type ModelDispatch, type PrivateBinding, type SessionDescriptor } from "./contracts";
 
-export type { HostTool, HostToolCall, ModelDispatch, ModelProvider, PrivateBinding, SessionAuthority, SessionDescriptor, SocketDispatch } from "./contracts";
+export type { HostTool, ModelProvider } from "nanocode-wasm";
+export type { HostToolCall, ModelDispatch, PrivateBinding, SessionAuthority, SessionDescriptor, SocketDispatch } from "./contracts";
 
 export interface NanocodeEnv {
   SESSIONS: DurableObjectNamespace;
@@ -54,6 +54,7 @@ const HAND_TAG = "hand";
 const WATCH_TAG = "watch";
 type Watch = { watch: string; cursor: number };
 type Watcher = { state: Watch; scope: string; descriptor: SessionDescriptor };
+type Executor = RemoteExecutor<WebSocket>;
 const OWNER = "owner";
 const UNFINISHED = new Set(["queued", "running"]);
 const INTERRUPTED = "Agent execution interrupted; recovery scheduled";
@@ -77,9 +78,9 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
     private unfinished?: boolean;
     private flushing = false;
     private reflush = false;
-    private readonly hands = new Map<string, Map<string, { connection: string; executor: RemoteExecutor; ready: boolean }>>();
-    private readonly connections = new Map<string, RemoteExecutor>();
-    private readonly handSockets = new Map<WebSocket, RemoteExecutor>();
+    private readonly hands = new Map<string, Map<string, { connection: string; executor: Executor; ready: boolean }>>();
+    private readonly connections = new Map<string, Executor>();
+    private readonly handSockets = new Map<WebSocket, Executor>();
     private readonly handAuthority = new Map<string, SessionDescriptor>();
     private readonly rechecks = new Set<WebSocket>();
     private readonly handFrames = new Map<WebSocket, Promise<void>>();
@@ -424,13 +425,13 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
         resident = (async () => {
           const authority = { account_id: descriptor.account_id, session_id: sessionId, executor_id: descriptor.executor_id };
           const enabled = this.executorEnabled(descriptor);
-          let remote: RemoteExecutor | undefined;
+          let remote: Executor | undefined;
           let remoteFailed = false;
           let remoteError: unknown;
           const owner = {};
           const connectStarted = performance.now();
           const connecting = enabled
-            ? RemoteExecutor.create(options.egress(this.env), authority, { max_frame_bytes: policy(this.env.REMOTE_MAX_FRAME_BYTES, "REMOTE_MAX_FRAME_BYTES"), timeout_ms: policy(this.env.REMOTE_TIMEOUT_MS, "REMOTE_TIMEOUT_MS") }).then(value => remote = value, error => { remoteFailed = true; remoteError = error; throw error; }).finally(() => this.scopeTimings(scope).record("remote.connect", performance.now() - connectStarted))
+            ? connectExecutor(options.egress(this.env), authority, { max_frame_bytes: policy(this.env.REMOTE_MAX_FRAME_BYTES, "REMOTE_MAX_FRAME_BYTES"), timeout_ms: policy(this.env.REMOTE_TIMEOUT_MS, "REMOTE_TIMEOUT_MS") }).then(value => remote = value, error => { remoteFailed = true; remoteError = error; throw error; }).finally(() => this.scopeTimings(scope).record("remote.connect", performance.now() - connectStarted))
             : undefined;
           void connecting?.catch(() => {});
           try {
@@ -497,7 +498,9 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
               if (this.dispatchBlocked(scope)) throw new Error("request authority stopped");
               const response = await options.egress(this.env).fetch(new Request("https://egress.internal/socket", { signal, headers: { upgrade: "websocket", "x-nanocode-socket": headerJson({ authority, provider: descriptor.provider ?? "claude", headers: request.headers }) } }));
               this.socketDiagnostic(scope, response.headers.get("x-nanocode-model-diagnostic"), timing);
-              return response;
+              const socket = response.status === 101 ? response.webSocket ?? undefined : undefined;
+              socket?.accept();
+              return { status: response.status, headers: response.headers, socket, idle_ms: Number(response.headers.get("x-nanocode-stream-idle-ms")), text: () => response.text() };
             },
             admit: () => this.socketEffect(scope, descriptor),
           },
@@ -524,7 +527,7 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
       if (request.headers.get("upgrade")?.toLowerCase() !== "websocket") return json({ error: "hands attach over WebSocket" }, 426);
       const [client, server] = Object.values(new WebSocketPair());
       this.ctx.acceptWebSocket(server, [HAND_TAG]);
-      const executor = RemoteExecutor.hibernatable(server, this.handLimits());
+      const executor = RemoteExecutor.accept(server, this.handLimits());
       this.handSockets.set(server, executor);
       this.ctx.waitUntil(this.registerHand(scope, requested, executor, descriptor));
       return new Response(null, { status: 101, webSocket: client });
@@ -534,7 +537,7 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
       return { max_frame_bytes: policy(this.env.REMOTE_MAX_FRAME_BYTES, "REMOTE_MAX_FRAME_BYTES"), timeout_ms: policy(this.env.REMOTE_TIMEOUT_MS, "REMOTE_TIMEOUT_MS") };
     }
 
-    private async registerHand(scope: string, requested: string | undefined, executor: RemoteExecutor, descriptor: SessionDescriptor): Promise<void> {
+    private async registerHand(scope: string, requested: string | undefined, executor: Executor, descriptor: SessionDescriptor): Promise<void> {
       try { await executor.ready(); } catch { this.handSockets.delete(executor.socket); return; }
       let advertised: string | null;
       try { advertised = await (await this.instance(scope)).catalog(executor.catalog!, this.handLimits().max_frame_bytes); }
@@ -566,7 +569,7 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
       if ((next?.metadata as SessionDescriptor | null | undefined)?.hand === hand && !this.pumping) this.ctx.waitUntil(this.pump());
     }
 
-    private indexHand(scope: string, hand: string, connection: string, executor: RemoteExecutor, ready: boolean): void {
+    private indexHand(scope: string, hand: string, connection: string, executor: Executor, ready: boolean): void {
       let hands = this.hands.get(scope);
       if (!hands) this.hands.set(scope, hands = new Map());
       hands.set(hand, { connection, executor, ready });
@@ -756,7 +759,7 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
       return !descriptor || await this.allowed(descriptor);
     }
 
-    private handFrame(socket: WebSocket, executor: RemoteExecutor, message: string | ArrayBuffer): Promise<void> {
+    private handFrame(socket: WebSocket, executor: Executor, message: string | ArrayBuffer): Promise<void> {
       const connection = (socket.deserializeAttachment() as { connection?: string } | null)?.connection;
       const deliver = async () => {
         if (connection !== undefined && !await this.handAllowed(connection)) return executor.dispose();
@@ -924,7 +927,7 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
     private instance(scope: string, unopened = false): Promise<AgentRuntime> {
       let current = this.instances.get(scope);
       if (!current) {
-        current = AgentRuntime.instantiate(this.store, { published: events => this.published(scope, events), wake: () => this.eventHub.notify() });
+        current = AgentRuntime.instantiate(wasm, this.store, { published: events => this.published(scope, events), wake: () => this.eventHub.notify() });
         const created = current;
         this.instances.set(scope, created);
         void created.catch(() => { if (this.instances.get(scope) === created) this.instances.delete(scope); });

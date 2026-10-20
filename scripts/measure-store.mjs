@@ -11,7 +11,7 @@ const DELTAS = Number(values.deltas);
 const CODEX_TURNS = Number(values["codex-turns"]);
 const ROUNDS = 3;
 const KEYS = ["store_calls", "log_calls", "statements", "bridge_request_bytes", "bridge_reply_bytes", "rows_written", "rows_read", "object_statements", "object_rows_written", "object_rows_read"];
-const STORE_PATHS = ["nanocode_worker::wasm::store", "nanocode_durability_core::sql", "nanocode_durability_core::store"];
+const STORE_PATHS = ["nanocode_wasm::wasm::store", "nanocode_durability_core::sql", "nanocode_durability_core::store"];
 const IDLE = new Set(["(idle)", "(program)", "(garbage collector)"]);
 let calls = 0;
 

@@ -1,14 +1,12 @@
-import { Timings } from "./timing";
+import { Timings, type SqlHost, type SqlKind, type Statement } from "nanocode-wasm";
 
 type Row = Record<string, SqlStorageValue>;
-
-export type Statement = [string, ...SqlStorageValue[]];
 
 type Metrics = { operations: Record<string, number>; statements: number; point_queries: number; rows_read: number; rows_written: number };
 
 const metrics = (): Metrics => ({ operations: {}, statements: 0, point_queries: 0, rows_read: 0, rows_written: 0 });
 
-export class CheckpointStore {
+export class CheckpointStore implements SqlHost {
   readonly timings = new Timings();
   readonly metrics = metrics();
   readonly log = metrics();
@@ -26,8 +24,9 @@ export class CheckpointStore {
     return this.row(`SELECT ${stored}, (SELECT COUNT(*) FROM turns WHERE scope = ? AND status IN ('queued', 'running')) AS unfinished`, scope);
   }
 
-  transaction(operation: string, statements: Statement[], observer?: Timings, into: Metrics = this.metrics): SqlStorageValue[][][] {
+  transaction(kind: SqlKind, operation: string, statements: Statement[]): SqlStorageValue[][][] {
     const started = performance.now();
+    const into = kind === "log" ? this.log : this.metrics;
     into.operations[operation] = (into.operations[operation] ?? 0) + 1;
     into.statements += statements.length;
     try {
@@ -39,9 +38,7 @@ export class CheckpointStore {
         return rows;
       }));
     } finally {
-      const elapsed = performance.now() - started;
-      this.timings.record(operation, elapsed);
-      observer?.record(operation, elapsed);
+      this.timings.record(operation, performance.now() - started);
     }
   }
 }
