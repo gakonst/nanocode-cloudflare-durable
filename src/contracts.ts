@@ -29,6 +29,8 @@ export type SessionDescriptor = SessionAuthority & {
   codex_subscription?: boolean;
   hand?: string;
   read_only?: boolean;
+  grant?: unknown;
+  expires_at?: number;
 };
 
 export type ModelDispatch = {
@@ -47,7 +49,7 @@ export interface PrivateBinding {
 
 export type HostTool = { name: string; description: string; parameters: Record<string, unknown> };
 
-export type HostToolCall = { authority: SessionAuthority; name: string; input: unknown };
+export type HostToolCall = { authority: SessionAuthority; name: string; input: unknown; grant?: unknown };
 
 export type AgentConfiguration = {
   scope: string;

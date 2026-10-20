@@ -23,13 +23,14 @@ export interface NanocodeEnv {
   SESSION_LOCATION_HINT?: DurableObjectLocationHint;
 }
 
-export type Principal = { account: string; read_only?: boolean };
+export type Principal = { account: string; read_only?: boolean; grant?: unknown; expires_at?: number | null };
 
 export type NanocodeOptions<E extends NanocodeEnv> = {
   authenticate(request: Request, env: E): Promise<string | Principal | null> | string | Principal | null;
   egress(env: E): PrivateBinding;
   subscription?(account: string, env: E, provider: ModelProvider): Promise<boolean> | boolean;
   recordSession?(account: string, name: string, env: E): Promise<boolean> | boolean;
+  active?(account: string, grant: unknown, env: E): Promise<boolean> | boolean;
   tools?: { definitions: HostTool[]; call(call: HostToolCall, env: E, signal: AbortSignal): Promise<unknown> };
 };
 
@@ -71,6 +72,9 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
     private readonly hands = new Map<string, Map<string, { connection: string; executor: RemoteExecutor; ready: boolean }>>();
     private readonly connections = new Map<string, RemoteExecutor>();
     private readonly handSockets = new Map<WebSocket, RemoteExecutor>();
+    private readonly handAuthority = new Map<string, SessionDescriptor>();
+    private readonly rechecks = new Set<WebSocket>();
+    private readonly handFrames = new Map<WebSocket, Promise<void>>();
     private linger?: ReturnType<typeof setTimeout>;
     private pumping = false;
     private recorded = false;
@@ -89,9 +93,10 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
         DROP INDEX IF EXISTS scoped_events;
         DROP INDEX IF EXISTS scoped_request_events;
         DROP TABLE IF EXISTS grant_fences;
-        CREATE TABLE IF NOT EXISTS hand_sockets (connection TEXT PRIMARY KEY, scope TEXT NOT NULL, hand TEXT NOT NULL, catalog TEXT NOT NULL) WITHOUT ROWID;
+        CREATE TABLE IF NOT EXISTS hand_sockets (connection TEXT PRIMARY KEY, scope TEXT NOT NULL, hand TEXT NOT NULL, catalog TEXT NOT NULL, descriptor TEXT) WITHOUT ROWID;
         CREATE TABLE IF NOT EXISTS watch_sockets (id TEXT PRIMARY KEY, scope TEXT NOT NULL, descriptor TEXT NOT NULL) WITHOUT ROWID;
       `);
+      if (!ctx.storage.sql.exec("PRAGMA table_info(hand_sockets)").toArray().some(column => column.name === "descriptor")) ctx.storage.sql.exec("ALTER TABLE hand_sockets ADD COLUMN descriptor TEXT");
       ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair("ping", "pong"));
       this.restoreHands();
       this.restoreWatchers();
@@ -148,7 +153,7 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
           this.recorded = true;
         }
         if (request.method === "GET" && parts[2] === "metrics") return json({ ...this.counts, object_id: this.ctx.id.toString(), database_bytes: this.ctx.storage.sql.databaseSize, model_diagnostics: this.modelDiagnostics.filter(entry => entry.scope === scope).map(entry => entry.value), timing: this.timings.get(scope)?.snapshot() ?? {}, checkpoints: { ...this.store.metrics, timing: this.residents.get(scope)?.metrics.timing.checkpoints ?? {} }, log: this.store.log, resident_runtimes: this.runtimes.size, runtime: this.residents.get(scope)?.metrics, persisted: this.store.persisted(scope) });
-        if (request.method === "GET" && parts[2] === "events") return await this.events(scope, url, request.headers.get("accept")?.includes("text/event-stream"));
+        if (request.method === "GET" && parts[2] === "events") return await this.events(scope, url, request.headers.get("accept")?.includes("text/event-stream"), undefined, descriptor);
         if (parts[2] === "socket") return this.watch(scope, url, request, descriptor);
         if (parts[2] === "hands") {
           if (request.method !== "GET") return json({ error: "method not allowed" }, 405);
@@ -224,7 +229,7 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
         if (streaming) {
           const cursor = Number(url.searchParams.get("after") ?? "0");
           if (!unfinished && (turn.last_seq === null || cursor >= turn.last_seq)) return new Response(null, { headers: { "content-type": "text/event-stream", "cache-control": "no-store" } });
-          return await this.events(scope, url, true, input.request_id);
+          return await this.events(scope, url, true, input.request_id, descriptor);
         }
         return json(turn.report, unfinished ? 202 : 200);
       } catch (error) {
@@ -387,7 +392,7 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
               if (this.dispatchBlocked(scope)) throw new Error("request authority stopped");
               await this.durable(scope);
               this.counts.host_tool_calls++;
-              return options.tools!.call({ authority: { account_id: authority.account_id, session_id: authority.session_id }, name, input }, this.env, signal);
+              return options.tools!.call({ authority: { account_id: authority.account_id, session_id: authority.session_id }, name, input, grant: this.turnGrant(scope, descriptor) }, this.env, signal);
             },
           },
           remote: {
@@ -404,6 +409,10 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
               if (request.op === "remote_send" && request.dispatches && this.dispatchBlocked(scope)) {
                 await executor.dispose();
                 throw new Error("request authority stopped");
+              }
+              if (request.op === "remote_send" && request.connection != null && !await this.handAllowed(request.connection)) {
+                await executor.dispose();
+                throw new Error("the hand's access token expired or was revoked");
               }
               return executor.execute(request, id);
             },
@@ -486,7 +495,8 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
         return executor.dispose();
       }
       const connection = `${hand}#${crypto.randomUUID()}`;
-      this.ctx.storage.sql.exec("INSERT INTO hand_sockets VALUES (?, ?, ?, ?)", connection, scope, hand, executor.catalog!);
+      this.ctx.storage.sql.exec("INSERT INTO hand_sockets (connection, scope, hand, catalog, descriptor) VALUES (?, ?, ?, ?, ?)", connection, scope, hand, executor.catalog!, JSON.stringify(descriptor));
+      this.handAuthority.set(connection, descriptor);
       executor.socket.serializeAttachment({ connection });
       const previous = this.hands.get(scope)?.get(hand);
       this.indexHand(scope, hand, connection, executor, false);
@@ -513,12 +523,13 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
       const live: string[] = [];
       for (const socket of sockets) {
         const connection = (socket.deserializeAttachment() as { connection?: string } | null)?.connection;
-        const row = connection ? this.store.row("SELECT scope, hand, catalog FROM hand_sockets WHERE connection = ?", connection) : undefined;
+        const row = connection ? this.store.row("SELECT scope, hand, catalog, descriptor FROM hand_sockets WHERE connection = ?", connection) : undefined;
         if (!connection || !row) {
           try { socket.close(1011, "hand registration was lost"); } catch {}
           continue;
         }
         live.push(connection);
+        if (row.descriptor) this.handAuthority.set(connection, JSON.parse(String(row.descriptor)));
         const executor = RemoteExecutor.restore(socket, this.handLimits(), String(row.catalog));
         this.handSockets.set(socket, executor);
         this.indexHand(String(row.scope), String(row.hand), connection, executor, true);
@@ -529,7 +540,7 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
     async webSocketMessage(socket: WebSocket, message: string | ArrayBuffer): Promise<void> {
       if (this.deleted) return;
       const executor = this.handSockets.get(socket);
-      if (executor) return executor.receive(message);
+      if (executor) return this.handFrame(socket, executor, message);
       if (this.ctx.getTags(socket).includes(WATCH_TAG)) return this.watcherMessage(socket, message);
       try { socket.close(1011, "unknown connection"); } catch {}
     }
@@ -591,6 +602,7 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
       for (const socket of this.ctx.getWebSockets(WATCH_TAG)) {
         const watcher = this.watcher(socket);
         if (!watcher) { try { socket.close(1011, "watch registration was lost"); } catch {} continue; }
+        if (!this.current(watcher.descriptor)) { this.refuse(socket); continue; }
         list.push({ socket, watcher });
       }
       return list;
@@ -608,6 +620,7 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
       let behind = false;
       for (const { socket, watcher } of this.watching()) {
         if (watcher.scope !== scope) continue;
+        this.recheck(socket, watcher.descriptor);
         if (watcher.state.cursor < events[0].seq - 1) { behind = true; continue; }
         const cursor = watcher.state.cursor;
         for (const event of events) this.deliver(socket, watcher.state, event);
@@ -653,6 +666,7 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
     private async watcherMessage(socket: WebSocket, message: string | ArrayBuffer): Promise<void> {
       const watcher = this.watcher(socket);
       if (!watcher) { try { socket.close(1011, "watch registration was lost"); } catch {} return; }
+      if (!await this.allowed(watcher.descriptor)) return this.refuse(socket);
       let input: any;
       try { input = JSON.parse(typeof message === "string" ? message : new TextDecoder().decode(message)); } catch { socket.send(JSON.stringify({ type: "error", error: "messages must be JSON" })); return; }
       const headers = { "content-type": "application/json", "x-nanocode-descriptor": headerJson(watcher.descriptor) };
@@ -669,6 +683,53 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
       } else {
         socket.send(JSON.stringify({ type: "error", error: "unknown message type" }));
       }
+    }
+
+    private current(descriptor: SessionDescriptor): boolean {
+      return descriptor.expires_at === undefined || descriptor.expires_at > Date.now();
+    }
+
+    private async allowed(descriptor: SessionDescriptor): Promise<boolean> {
+      if (!this.current(descriptor)) return false;
+      if (!options.active) return true;
+      try { return await options.active(descriptor.account_id, descriptor.grant, this.env); } catch { return false; }
+    }
+
+    private async handAllowed(connection: string): Promise<boolean> {
+      const descriptor = this.handAuthority.get(connection);
+      return !descriptor || await this.allowed(descriptor);
+    }
+
+    private handFrame(socket: WebSocket, executor: RemoteExecutor, message: string | ArrayBuffer): Promise<void> {
+      const connection = (socket.deserializeAttachment() as { connection?: string } | null)?.connection;
+      const deliver = async () => {
+        if (connection !== undefined && !await this.handAllowed(connection)) return executor.dispose();
+        executor.receive(message);
+      };
+      const next = (this.handFrames.get(socket) ?? Promise.resolve()).then(deliver, deliver);
+      const settled = () => { if (this.handFrames.get(socket) === next) this.handFrames.delete(socket); };
+      this.handFrames.set(socket, next);
+      void next.then(settled, settled);
+      return next;
+    }
+
+    private recheck(socket: WebSocket, descriptor: SessionDescriptor): void {
+      if (!options.active || this.rechecks.has(socket)) return;
+      this.rechecks.add(socket);
+      this.ctx.waitUntil(this.allowed(descriptor).then(allowed => {
+        this.rechecks.delete(socket);
+        if (!allowed) this.refuse(socket);
+      }));
+    }
+
+    private refuse(socket: WebSocket): void {
+      this.forgetWatcher(socket);
+      try { socket.close(1008, "access token expired or revoked"); } catch {}
+    }
+
+    private turnGrant(scope: string, fallback: SessionDescriptor): unknown {
+      const background = this.store.row("SELECT value FROM metadata WHERE key = ?", `background:${scope}`)?.value;
+      return background === undefined ? fallback.grant : (JSON.parse(String(background)) as SessionDescriptor).grant;
     }
 
     private async warm(scope: string, base: SessionDescriptor): Promise<boolean> {
@@ -736,6 +797,7 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
       if (executor) this.handSockets.delete(executor.socket);
       this.ctx.storage.sql.exec("DELETE FROM hand_sockets WHERE connection = ?", connection);
       this.connections.delete(connection);
+      this.handAuthority.delete(connection);
       const hands = this.hands.get(scope);
       if (hands?.get(hand)?.connection === connection) hands.delete(hand);
       void this.residents.get(scope)?.detach(connection).catch(() => {});
@@ -816,12 +878,15 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
       });
     }
 
-    private async events(scope: string, url: URL, streaming = false, requestId?: string): Promise<Response> {
+    private async events(scope: string, url: URL, streaming = false, requestId?: string, descriptor?: SessionDescriptor): Promise<Response> {
       const after = Number(url.searchParams.get("after") ?? "0");
       const limit = Number(url.searchParams.get("limit") ?? this.env.EVENT_PAGE_SIZE);
       const maximum = policy(this.env.EVENT_PAGE_SIZE, "EVENT_PAGE_SIZE");
       if (!Number.isSafeInteger(after) || after < 0 || !Number.isSafeInteger(limit) || limit < 1 || limit > maximum) return json({ error: `after must be a nonnegative integer and limit must be between 1 and ${maximum}` }, 400);
-      const read = async (cursor: number): Promise<LogPage> => this.eventHub.recent(cursor, requestId) ?? await (await this.instance(scope)).page(scope, cursor, limit, requestId);
+      const read = async (cursor: number): Promise<LogPage> => {
+        if (descriptor && !await this.allowed(descriptor)) throw new Error("access token expired or revoked");
+        return this.eventHub.recent(cursor, requestId) ?? await (await this.instance(scope)).page(scope, cursor, limit, requestId);
+      };
       if (streaming) return this.eventHub.stream(after, policy(this.env.EVENT_STREAM_KEEPALIVE_MS, "EVENT_STREAM_KEEPALIVE_MS"), read, requestId === undefined ? undefined : event => (event.event as { type?: unknown } | undefined)?.type === "result");
       return json(await (await this.instance(scope)).page(scope, after, limit));
     }
@@ -848,7 +913,8 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
     if (!name || name.includes("\0")) return json({ error: "invalid session name" }, 400);
     const mode = (provider: ModelProvider) => options.subscription ? options.subscription(account, env, provider) : env.MODEL_AUTH === "subscription";
     const [subscription, codex_subscription] = await Promise.all([mode("claude"), mode("codex")]);
-    const descriptor: SessionDescriptor = { account_id: account, session_id: "", session_name: name, subscription, codex_subscription, ...(typeof principal === "object" && principal.read_only ? { read_only: true } : {}) };
+    const caller = typeof principal === "object" ? principal : undefined;
+    const descriptor: SessionDescriptor = { account_id: account, session_id: "", session_name: name, subscription, codex_subscription, ...(caller?.read_only ? { read_only: true } : {}), ...(caller?.grant !== undefined ? { grant: caller.grant } : {}), ...(typeof caller?.expires_at === "number" ? { expires_at: caller.expires_at } : {}) };
     let path = `/internal/${match[2] ?? "metrics"}`;
     if (match[4]) path = `/internal/cancel/${match[3]}`;
     else if (match[3]) path += `/${match[3]}`;
