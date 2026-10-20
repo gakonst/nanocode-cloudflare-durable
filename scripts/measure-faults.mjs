@@ -566,6 +566,10 @@ const scenarios = {
     return retentionRun(provider);
   },
 
+  async destroy(provider) {
+    return destroyRun(provider);
+  },
+
   async cell(provider) {
     return cellRun(provider);
   },
@@ -707,6 +711,23 @@ async function retentionRun(provider) {
     const closed = idle.retained.filter(entry => entry?.closed);
     check("retention", closed.length === 0, `${provider}: a runtime retired over the memory budget is no longer referenced`, { runtime_retirements: idle.runtime_retirements, resident_runtimes: idle.resident_runtimes, retained: idle.retained });
   } finally { await local.dispose(); }
+}
+
+async function destroyRun(provider) {
+  const session = await newSession(provider, "destroy");
+  const id = `ds-${provider}`;
+  await submit(session, id, "[hold]");
+  await until(() => holds.has(`${id}:0`), "held model call");
+  const before = (await sql(session.name, "SELECT name FROM sqlite_schema WHERE type = 'table' ORDER BY name")).map(row => row.name);
+  const namespace = await mf.getDurableObjectNamespace("SESSIONS", "nanocode");
+  const stub = namespace.get(namespace.idFromName(objectName(session.name)));
+  const response = await stub.fetch("https://session.internal/internal/delete", { method: "POST", headers: { "x-nanocode-descriptor": JSON.stringify({ account_id: "owner", session_id: "", session_name: session.name, subscription: false }) } });
+  const deleted = await response.json();
+  await sleep(10 * DELAY);
+  const after = (await sql(session.name, "SELECT name FROM sqlite_schema WHERE type = 'table' ORDER BY name")).map(row => row.name);
+  const gone = await status(session, id);
+  check("destroy", deleted.deleted === true && gone.status === "http 410", `${provider}: deleting a session with a running turn answers 410 afterwards`, { deleted, status: gone.status });
+  check("destroy", !after.some(table => ["turns", "events", "states", "records"].includes(table)), `${provider}: deleting a session with a running turn leaves no session tables behind`, { before, after });
 }
 
 async function chaosRun(provider) {

@@ -936,6 +936,7 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
     }
 
     private instance(scope: string, unopened = false): Promise<AgentRuntime> {
+      if (this.deleted) return Promise.reject(new Error("session deleted"));
       let current = this.instances.get(scope);
       if (!current) {
         current = AgentRuntime.instantiate(wasm, this.store, { published: events => this.published(scope, events), wake: () => this.eventHub.notify() });
