@@ -803,7 +803,10 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
       const provider = (this.metadata.get(`model_provider:${scope}`) ?? "claude") as ModelProvider;
       const executor = this.metadata.get(`executor:${scope}`) ?? (this.env.RUNNER_ENABLED === "true" ? DEFAULT_EXECUTOR : "");
       const descriptor: SessionDescriptor = { ...base, executor_id: executor || undefined, hand: undefined, provider, subscription: provider === "codex" ? base.codex_subscription ?? true : base.subscription };
-      const runtime = await this.runtime(scope, sessionId, descriptor);
+      const resident = this.runtimes.get(scope);
+      const busy = this.pumping || !this.queueKnownEmpty() || !!this.metadata.first("background:");
+      const current = resident && busy ? await resident.catch(() => undefined) : undefined;
+      const runtime = current?.reusable ? current : await this.runtime(scope, sessionId, descriptor);
       await runtime.preconnect();
       this.unfinished ??= (await runtime.pending(scope)).length > 0;
       if (!this.pumping && !this.unfinished && !this.metadata.first("background:")) this.releaseIdle();
@@ -838,6 +841,8 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
       this.runtimes.delete(scope);
       this.residents.delete(scope);
       this.releaseHands(scope);
+      const instance = this.instances.get(scope);
+      void instance?.then(current => { if (current === runtime && this.instances.get(scope) === instance) this.instances.delete(scope); }, () => {});
       void runtime.dispose().catch(() => {});
     }
 
