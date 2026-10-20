@@ -6,6 +6,7 @@ import { GATEWAY_KEY, LOCAL_TOKEN, localOptions } from "./local-runtime.mjs";
 
 const STRING_LIMIT = 8 * 1024 * 1024;
 const UNFINISHED = new Set(["queued", "running"]);
+const TRANSPORT_ATTEMPTS = 8;
 const replyBytes = Number(process.env.LIMITS_REPLY_BYTES ?? STRING_LIMIT + 1_000_000);
 const held = [];
 
@@ -75,6 +76,18 @@ async function until(condition, timeout = 10000) {
     await sleep(20);
   }
   return true;
+}
+
+async function delivered(send) {
+  const transport_errors = [];
+  for (let attempt = 0; attempt < TRANSPORT_ATTEMPTS; attempt++) {
+    const started = performance.now();
+    try {
+      const response = await send();
+      return { status: response.status, body: await response.json(), ms: performance.now() - started, transport_errors };
+    } catch (error) { transport_errors.push(error.cause?.code ?? error.message); }
+  }
+  return { status: null, transport_errors };
 }
 
 async function firstChunk(response) {
@@ -147,18 +160,14 @@ try {
   {
     const name = `limits-body-${Date.now()}`;
     const body = JSON.stringify({ request_id: "body", prompt: "c".repeat(10_000_000) });
-    const sizedStarted = performance.now();
-    const sized = await route(`${name}/turns`, { method: "POST", headers: { "content-type": "application/json" }, body });
-    const sizedReply = { status: sized.status, body: await sized.json(), ms: performance.now() - sizedStarted };
     const encoded = new TextEncoder().encode(body);
-    const stream = new ReadableStream({ start(controller) { for (let offset = 0; offset < encoded.length; offset += 65536) controller.enqueue(encoded.subarray(offset, offset + 65536)); controller.close(); } });
-    const chunkedStarted = performance.now();
-    const chunked = await route(`${name}/turns`, { method: "POST", headers: { "content-type": "application/json" }, body: stream, duplex: "half" });
-    const chunkedReply = { status: chunked.status, body: await chunked.json(), ms: performance.now() - chunkedStarted };
+    const stream = () => new ReadableStream({ start(controller) { for (let offset = 0; offset < encoded.length; offset += 65536) controller.enqueue(encoded.subarray(offset, offset + 65536)); controller.close(); } });
+    const sizedReply = await delivered(() => route(`${name}/turns`, { method: "POST", headers: { "content-type": "application/json" }, body }));
+    const chunkedReply = await delivered(() => route(`${name}/turns`, { method: "POST", headers: { "content-type": "application/json" }, body: stream(), duplex: "half" }));
     const m = await metrics(name);
     report.body_limit = { body_bytes: encoded.length, content_length: sizedReply, chunked: chunkedReply, submits: m.log?.operations?.submit ?? 0 };
-    check(sized.status === 413 && /request bodies are limited to 8388608 bytes/.test(sizedReply.body.error), "A body whose Content-Length exceeds the SQLite value limit gets 413 before it is read");
-    check(chunked.status === 413 && /request bodies are limited to 8388608 bytes/.test(chunkedReply.body.error) && !m.log?.operations?.submit, "A chunked body is cut off at the limit with 413 and never reaches the session log");
+    check(sizedReply.status === 413 && /request bodies are limited to 8388608 bytes/.test(sizedReply.body?.error), "A body whose Content-Length exceeds the SQLite value limit gets 413 before it is read");
+    check(chunkedReply.status === 413 && /request bodies are limited to 8388608 bytes/.test(chunkedReply.body?.error) && !m.log?.operations?.submit, "A chunked body is cut off at the limit with 413 and never reaches the session log");
   }
 
   {
