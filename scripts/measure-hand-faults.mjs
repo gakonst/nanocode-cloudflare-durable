@@ -244,6 +244,7 @@ try {
     report.reconnect = { status: settled.status, results: brief(observed.reconnect ?? []), after: after.status, orphans };
     check("reconnect: a wait in flight when its hand dies reports an unknown outcome", /unknown outcome/.test(observed.reconnect?.[1]?.text ?? ""), report.reconnect);
     check("reconnect: waiting on the cell after the hand reattached reports it gone instead of hanging", settled.status === "completed" && (observed.reconnect?.[2]?.error ?? false), report.reconnect);
+    check("reconnect: the wait says the hand restarted and the cell's outcome is unknown", /restarted or reconnected/.test(observed.reconnect?.[2]?.text ?? "") && /outcome is unknown/.test(observed.reconnect?.[2]?.text ?? ""), report.reconnect);
     check("reconnect: the reattached hand runs the next turn", after.status === "completed" && after.results[0]?.text.includes("pong"), report.reconnect);
     for (const line of orphans) { try { process.kill(Number(line.split(" ")[0]), "SIGKILL"); } catch {} }
   }
