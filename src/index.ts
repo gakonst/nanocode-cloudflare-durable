@@ -780,6 +780,7 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
 
     private refuse(socket: WebSocket): void {
       this.forgetWatcher(socket);
+      try { socket.send(JSON.stringify({ type: "error", error: "access token expired or revoked" })); } catch {}
       try { socket.close(1008, "access token expired or revoked"); } catch {}
     }
 
