@@ -6,9 +6,10 @@ import { performance } from "node:perf_hooks";
 import { parseArgs } from "node:util";
 import { GATEWAY_KEY, LOCAL_TOKEN, localOptions } from "./local-runtime.mjs";
 
-const { values, positionals } = parseArgs({ allowPositionals: true, options: { providers: { type: "string", default: "claude,codex" }, delay: { type: "string", default: "200" }, rounds: { type: "string", default: "6" }, seed: { type: "string", default: String(Date.now() % 100000) } } });
+const { values, positionals } = parseArgs({ allowPositionals: true, options: { providers: { type: "string", default: "claude,codex" }, delay: { type: "string", default: "200" }, rounds: { type: "string", default: "6" }, slow: { type: "string", default: "20000" }, seed: { type: "string", default: String(Date.now() % 100000) } } });
 const PROVIDERS = values.providers.split(",");
 const DELAY = Number(values.delay);
+const SLOW = Number(values.slow);
 const ROUNDS = Number(values.rounds);
 let seed = Number(values.seed);
 const random = () => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 2147483648; };
@@ -370,6 +371,49 @@ async function newSession(provider, label) {
 }
 
 const scenarios = {
+  async slowEvict(provider) {
+    const session = await newSession(provider, "slow-evict");
+    const first = `se0-${provider}`;
+    await submit(session, first, "warm up");
+    await settled(session, first);
+    await restart();
+    const id = `se-${provider}`;
+    const response = await request(`${sessionUrl(session.name)}/turns`, { method: "POST", headers: { accept: "text/event-stream" }, body: JSON.stringify({ request_id: id, prompt: `turn=${id} [slow:3000]`, provider }) });
+    let text = "", ended;
+    const reading = (async () => { const reader = response.body.getReader(); const decoder = new TextDecoder(); try { for (;;) { const next = await reader.read(); if (next.done) break; text += decoder.decode(next.value, { stream: true }); } ended = "done"; } catch (error) { ended = `error: ${error?.message ?? error}`; } })();
+    await until(() => modelCalls(id) > 0, "slow call started");
+    await sleep(500);
+    const started = modelCalls(id);
+    await restart();
+    await Promise.race([reading, sleep(15000)]);
+    check("slowEvict", ended !== undefined, `${provider}: the turn's stream ended at the restart`, ended);
+    check("slowEvict", text.includes("model.call.started") && !text.includes('"type":"result"'), `${provider}: the stream carried model.call.started and no result`, text.slice(-400));
+    const done = await settled(session, id);
+    check("slowEvict", done.status === "completed", `${provider}: the turn interrupted before its model call answered recovered`, done);
+    check("slowEvict", started === 1 && modelCalls(id) === 2, `${provider}: the unanswered model call repeated once`, modelCalls(id));
+    const page = await (await request(`${sessionUrl(session.name)}/events?after=0&limit=128`)).json();
+    const result = (page.events ?? []).filter(entry => entry.request_id === id && entry.event?.type === "result").at(-1);
+    check("slowEvict", result?.event?.recovered === true || JSON.stringify(result ?? {}).includes('"recovered":true'), `${provider}: the recovered turn's result says recovered`, result);
+    await invariants("slowEvict", session);
+    return { ended };
+  },
+
+  async slowCold(provider) {
+    const session = await newSession(provider, "slow-cold");
+    const first = `sc0-${provider}`;
+    await submit(session, first, "warm up");
+    await settled(session, first);
+    await restart();
+    const id = `sc-${provider}`;
+    const started = performance.now();
+    const response = await request(`${sessionUrl(session.name)}/turns`, { method: "POST", headers: { accept: "text/event-stream" }, body: JSON.stringify({ request_id: id, prompt: `turn=${id} [slow:${SLOW}]`, provider }) });
+    const text = await response.text();
+    check("slowCold", text.includes('"type":"result"') && text.includes('"status":"completed"'), `${provider}: a cold turn whose model answers after ${SLOW} ms streams its result`, text.slice(-400));
+    check("slowCold", modelCalls(id) === 1, `${provider}: the slow model call ran once`, modelCalls(id));
+    await invariants("slowCold", session);
+    return { milliseconds: Math.round(performance.now() - started) };
+  },
+
   async basic(provider) {
     const session = await newSession(provider, "basic");
     const watcher = await watch(session);
