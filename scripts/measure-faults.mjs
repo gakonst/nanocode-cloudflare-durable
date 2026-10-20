@@ -296,15 +296,27 @@ async function operations(name) {
   const [state] = await sql(name, "SELECT payload FROM states WHERE id = ?", root.value);
   if (!state) return {};
   const found = {};
+  const pages = [];
+  const collect = operations => {
+    for (const [id, operation] of Object.entries(operations)) found[id] = { status: operationStatus(operation.status), order: operation.accepted_order, steps: Object.entries(operation.steps ?? {}).map(([key, step]) => ({ key, kind: step.kind, status: operationStatus(step.status), attempts: step.attempts })) };
+  };
   const visit = value => {
     if (!value || typeof value !== "object") return;
     if (value.operations && typeof value.operations === "object" && !Array.isArray(value.operations)) {
-      for (const [id, operation] of Object.entries(value.operations)) found[id] = { status: operationStatus(operation.status), order: operation.accepted_order, steps: Object.entries(operation.steps ?? {}).map(([key, step]) => ({ key, kind: step.kind, status: operationStatus(step.status), attempts: step.attempts })) };
+      collect(value.operations);
+      pages.push(...(value.sealed?.levels ?? []).flat());
       return;
     }
     for (const child of Object.values(value)) visit(child);
   };
   try { visit(JSON.parse(state.payload)); } catch { return { unreadable: true }; }
+  while (pages.length) {
+    const [record] = await sql(name, "SELECT value FROM records WHERE state_id = ? AND key = ?", root.value, pages.shift());
+    if (!record?.value?.startsWith("=")) return { unreadable: true };
+    const page = JSON.parse(record.value.slice(1));
+    collect(page.operations ?? {});
+    pages.push(...(page.pages ?? []));
+  }
   return found;
 }
 
