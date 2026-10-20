@@ -266,7 +266,7 @@ try {
     const flaps = { alpha: connects("alpha") - before, impostor: connects("impostor") };
     report.duplicate = { flaps, status: result.status, results: brief(result.results), alpha_log: logs.alpha.split("\n").slice(-4), impostor_log: logs.impostor.split("\n").slice(-4), alpha_stopped: hands.alpha.done };
     check("duplicate: two hands claiming one name do not displace each other in a loop", flaps.alpha === 0 && flaps.impostor === 1, report.duplicate);
-    check("duplicate: the displaced hand is told why and stops", /another hand attached under the name alpha; stopping/.test(logs.alpha) && hands.alpha.done, report.duplicate);
+    check("duplicate: the displaced hand is told why and stops", /another hand attached under this name; stopping/.test(logs.alpha) && hands.alpha.done, report.duplicate);
     check("duplicate: the name runs on the newest hand", result.status === "completed" && result.results[0]?.text.includes(workspaces.impostor), report.duplicate);
     await stopHand("impostor");
   }
