@@ -307,9 +307,9 @@ try {
   const before = await metrics();
   await new Promise(resolve => setTimeout(resolve, 3 * Number(options.workers[0].bindings.RECOVERY_DELAY_MS)));
   const later = await metrics();
-  check(await marker() === 1, "background marker remains after jobs completed");
-  check((await sql("SELECT COUNT(*) AS count FROM jobs WHERE status IN ('queued', 'running')"))[0].count === 0, "no unfinished jobs while child is pending");
-  check(later.alarms > before.alarms, "alarm keeps firing with no unfinished jobs", { before: before.alarms, later: later.alarms });
+  check(await marker() === 1, "background marker remains after turns completed");
+  check((await sql("SELECT COUNT(*) AS count FROM turns WHERE status IN ('queued', 'running')"))[0].count === 0, "no unfinished turns while child is pending");
+  check(later.alarms > before.alarms, "alarm keeps firing with no unfinished turns", { before: before.alarms, later: later.alarms });
   const heldTree = await tree();
   const childStates = Object.keys(heldTree.operations).filter(id => id !== "root");
   steps.push({ phase, held_tree: heldTree });
@@ -376,7 +376,7 @@ try {
   await restart();
   const cancelResponse = await request(`${base}/turns/bg-cancel/cancel`, { method: "POST" });
   check(cancelResponse.status === 202, "cancel of interrupted running job accepted before recovery", cancelResponse.status);
-  check((await sql("SELECT cancel_requested FROM jobs WHERE request_id = 'bg-cancel'"))[0].cancel_requested === 1, "cancel request is durable");
+  check((await sql("SELECT cancel_requested FROM turns WHERE request_id = 'bg-cancel'"))[0].cancel_requested === 1, "cancel request is durable");
   const held = await metrics();
   check(held.runtime_initializations === 0, "status and cancel requests did not initialize WASM during the recovery hold", { runtime_initializations: held.runtime_initializations, alarms: held.alarms });
   check(hangCalls() === 1, "no recovered model dispatch before cancel");
@@ -391,7 +391,7 @@ try {
   const final = await settled("bg-final");
   check(final.state.status === "completed" && final.state.ok?.session_id === root, "later root job completed in the same SDK session", final.state);
   await until(async () => await marker() === 0, "Background marker was not cleared after cancellation scenario");
-  const persisted = await sql("SELECT payload FROM states UNION ALL SELECT value AS payload FROM records UNION ALL SELECT body AS payload FROM events UNION ALL SELECT result AS payload FROM jobs");
+  const persisted = await sql("SELECT payload FROM states UNION ALL SELECT value AS payload FROM records UNION ALL SELECT body AS payload FROM events UNION ALL SELECT metadata AS payload FROM turns UNION ALL SELECT prompt AS payload FROM turns");
   check(!JSON.stringify(persisted).includes("local-provider"), "provider credential absent from agent persistence");
   check(anomalies.length === 0, "provider saw only expected requests", anomalies);
   check(!calls.some(call => call.duplicate), "no model request repeated a prompt inside one turn", calls.filter(call => call.duplicate).map(({ phase, actor, kind }) => ({ phase, actor, kind })), false);

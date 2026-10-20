@@ -60,10 +60,14 @@ pub enum Reply {
 }
 
 pub async fn request(request: Value) -> Reply {
-    send(request, None).await
+    send(encode(&request), None).await
 }
 
-async fn send(request: Value, body: Option<&[u8]>) -> Reply {
+fn encode(request: &impl serde::Serialize) -> Vec<u8> {
+    serde_json::to_vec(request).expect("encode host request")
+}
+
+async fn send(bytes: Vec<u8>, body: Option<&[u8]>) -> Reply {
     let id = NEXT.with_borrow_mut(|next| {
         *next = next
             .checked_add(1)
@@ -73,7 +77,6 @@ async fn send(request: Value, body: Option<&[u8]>) -> Reply {
     let (sender, receiver) = oneshot::channel();
     PENDING.with_borrow_mut(|pending| pending.insert(id, sender));
     let guard = Pending(id);
-    let bytes = serde_json::to_vec(&request).expect("encode host request");
     match body {
         Some(body) => unsafe {
             dispatch_body(id, bytes.as_ptr(), bytes.len(), body.as_ptr(), body.len())
@@ -89,8 +92,16 @@ pub async fn call(request: Value) -> Result<Value, Value> {
     settle(self::request(request).await)
 }
 
+pub async fn call_with(request: &impl serde::Serialize) -> Result<Value, Value> {
+    settle(send(encode(request), None).await)
+}
+
 pub async fn call_with_body(request: Value, body: &[u8]) -> Result<Value, Value> {
-    settle(send(request, Some(body)).await)
+    settle(send(encode(&request), Some(body)).await)
+}
+
+pub fn monotonic_ms() -> f64 {
+    unsafe { clock(1) }
 }
 
 fn settle(reply: Reply) -> Result<Value, Value> {
@@ -115,7 +126,7 @@ pub async fn bytes(request: Value) -> Result<Option<Vec<u8>>, Value> {
     }
 }
 
-pub fn respond(id: u32, value: &Value) {
+pub fn respond(id: u32, value: &impl serde::Serialize) {
     let bytes = serde_json::to_vec(value).expect("encode command reply");
     unsafe { reply(id, bytes.as_ptr(), bytes.len()) };
 }

@@ -25,7 +25,25 @@ function gateway(upstream) {
   };
 }
 const local = env => ({ ...env, AI: { gateway: () => gateway(env.GATEWAY_UPSTREAM) } });
-export class AgentSession extends Session { constructor(ctx, env) { super(ctx, local(env)); } }
+function counted(sql) {
+  const exec = sql.exec.bind(sql);
+  const totals = { statements: 0, rows_read: 0, rows_written: 0 };
+  let cursors = [];
+  sql.exec = (...args) => { const cursor = exec(...args); totals.statements++; cursors.push(cursor); return cursor; };
+  return () => {
+    for (const cursor of cursors) { totals.rows_read += cursor.rowsRead; totals.rows_written += cursor.rowsWritten; }
+    cursors = [];
+    return { ...totals };
+  };
+}
+export class AgentSession extends Session {
+  constructor(ctx, env) { const sql = counted(ctx.storage.sql); super(ctx, local(env)); this.sqlTotals = sql; }
+  async fetch(request) {
+    const response = await super.fetch(request);
+    if (new URL(request.url).pathname !== "/internal/metrics" || response.status !== 200) return response;
+    return Response.json({ ...await response.json(), sql: this.sqlTotals() });
+  }
+}
 export default { fetch(request, env, ctx) { return worker.fetch(request, local(env), ctx); } };
 `;
 }
@@ -40,7 +58,7 @@ function modules(directory) {
   return [{ type: "ESModule", path: `${directory}/local-shim.mjs`, contents: shim(scripts[0]) }, { type: "ESModule", path, contents }, ...[...new Set(imports)].map(file => ({ type: "CompiledWasm", path: `${directory}/${file}`, contents: readFileSync(process.env.NANOCODE_WASM_PATH ?? `${directory}/${file}`) }))];
 }
 
-export function localOptions({ provider, agent = {}, workers = [], persistence } = {}) {
+export function localOptions({ provider, agent = {}, workers = [], persistence, bundle = process.env.NANOCODE_BUNDLE_PATH ?? "output/deploy" } = {}) {
   mkdirSync("output", { recursive: true });
   return {
     unsafeInspectDurableObjects: true,
@@ -48,7 +66,7 @@ export function localOptions({ provider, agent = {}, workers = [], persistence }
     workers: [
       {
         name: "nanocode",
-        modules: modules("output/deploy"),
+        modules: modules(bundle),
         compatibilityDate: "2026-10-16",
         durableObjects: { SESSIONS: { className: "AgentSession", useSQLite: true } },
         serviceBindings: { GATEWAY_UPSTREAM: "gateway-upstream" },

@@ -4,9 +4,14 @@ type Row = Record<string, SqlStorageValue>;
 
 export type Statement = [string, ...SqlStorageValue[]];
 
+type Metrics = { operations: Record<string, number>; statements: number; point_queries: number; rows_read: number; rows_written: number };
+
+const metrics = (): Metrics => ({ operations: {}, statements: 0, point_queries: 0, rows_read: 0, rows_written: 0 });
+
 export class CheckpointStore {
   readonly timings = new Timings();
-  readonly metrics = { operations: {} as Record<string, number>, statements: 0, point_queries: 0, rows_read: 0, rows_written: 0 };
+  readonly metrics = metrics();
+  readonly log = metrics();
   constructor(readonly storage: DurableObjectStorage) {}
 
   row(query: string, ...values: SqlStorageValue[]): Row | undefined {
@@ -15,20 +20,22 @@ export class CheckpointStore {
   }
 
   persisted(scope: string): Row | undefined {
-    const stored = this.row("SELECT 1 FROM sqlite_schema WHERE name = 'records'") ? "(SELECT COUNT(*) FROM states) AS states, (SELECT COUNT(*) FROM records) AS records" : "0 AS states, 0 AS records";
-    return this.row(`SELECT ${stored}, (SELECT COUNT(*) FROM jobs WHERE scope = ? AND status IN ('queued', 'running')) AS unfinished`, scope);
+    const tables = new Set(this.storage.sql.exec("SELECT name FROM sqlite_schema WHERE type = 'table' AND name IN ('records', 'turns')").toArray().map(row => row.name));
+    const stored = tables.has("records") ? "(SELECT COUNT(*) FROM states) AS states, (SELECT COUNT(*) FROM records) AS records" : "0 AS states, 0 AS records";
+    if (!tables.has("turns")) return this.row(`SELECT ${stored}, 0 AS unfinished`);
+    return this.row(`SELECT ${stored}, (SELECT COUNT(*) FROM turns WHERE scope = ? AND status IN ('queued', 'running')) AS unfinished`, scope);
   }
 
-  transaction(operation: string, statements: Statement[], observer?: Timings): SqlStorageValue[][][] {
+  transaction(operation: string, statements: Statement[], observer?: Timings, into: Metrics = this.metrics): SqlStorageValue[][][] {
     const started = performance.now();
-    this.metrics.operations[operation] = (this.metrics.operations[operation] ?? 0) + 1;
-    this.metrics.statements += statements.length;
+    into.operations[operation] = (into.operations[operation] ?? 0) + 1;
+    into.statements += statements.length;
     try {
       return this.storage.transactionSync(() => statements.map(([query, ...values]) => {
         const cursor = this.storage.sql.exec(query, ...values);
         const rows = [...cursor.raw()];
-        this.metrics.rows_read += cursor.rowsRead;
-        this.metrics.rows_written += cursor.rowsWritten;
+        into.rows_read += cursor.rowsRead;
+        into.rows_written += cursor.rowsWritten;
         return rows;
       }));
     } finally {

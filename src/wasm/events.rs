@@ -1,68 +1,80 @@
-use std::{future::Future, pin::Pin};
+use nanocode::{
+    CodeModeExecutors,
+    session_host::{InboxHost, LoggedEvent},
+};
+use nanocode_code_mode::embedded::HostFuture;
+use serde::Serialize;
+use serde_json::{Map, Value, json};
 
-use nanocode::{AgentUpdate, EventSink, ScopedAgentUpdate, SessionEvent};
-use serde_json::{Value, json};
+use super::{
+    bridge::{call_with, monotonic_ms},
+    remote,
+};
 
-use super::bridge::call;
-
-pub struct WorkerSink;
-
-fn subagent(update: ScopedAgentUpdate) -> Result<Value, serde_json::Error> {
-    let body = match update.update {
-        AgentUpdate::Added(agent) => {
-            json!({"type": "added", "agent": serde_json::to_value(agent)?})
-        }
-        AgentUpdate::Event { id, event } => {
-            json!({"type": "event", "id": id, "event": serde_json::to_value(event)?})
-        }
-        AgentUpdate::Status { id, status } => {
-            json!({"type": "status", "id": id, "status": serde_json::to_value(status)?})
-        }
-        AgentUpdate::Completion {
-            id,
-            status,
-            revision,
-        } => {
-            json!({"type": "completion", "id": id, "status": serde_json::to_value(status)?, "revision": revision})
-        }
-        AgentUpdate::Message(message) => {
-            json!({"type": "message", "message": serde_json::to_value(message)?})
-        }
-    };
-    Ok(json!({
-        "source": "subagent",
-        "root_session_id": update.root_session_id,
-        "detach": update.detach,
-        "update": body,
-    }))
+pub struct WorkerInbox {
+    runtime_id: String,
+    started_ms: f64,
+    executors: CodeModeExecutors,
 }
 
-fn encode(event: SessionEvent) -> Result<Value, serde_json::Error> {
-    match event {
-        SessionEvent::Agent {
-            event,
-            timing,
-            received_ns,
-        } => Ok(json!({"source": "agent", "event": serde_json::to_value(event)?, "sdk_timing": {"emitted_ns": timing.emitted_ns, "received_ns": received_ns, "queue_ns": received_ns.saturating_sub(timing.emitted_ns), "source_received_ns": timing.source_received_ns}})),
-        SessionEvent::Subagent(update) => subagent(update),
+impl WorkerInbox {
+    pub const fn new(runtime_id: String, started_ms: f64, executors: CodeModeExecutors) -> Self {
+        Self {
+            runtime_id,
+            started_ms,
+            executors,
+        }
     }
 }
 
-impl EventSink for WorkerSink {
-    fn deliver(
-        &self,
-        events: Vec<SessionEvent>,
-    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + '_>> {
+#[derive(Serialize)]
+struct Published<'a> {
+    op: &'static str,
+    events: &'a [LoggedEvent],
+}
+
+pub async fn publish(events: Vec<LoggedEvent>) -> Result<(), String> {
+    if events.is_empty() {
+        return Ok(());
+    }
+    call_with(&Published {
+        op: "events",
+        events: &events,
+    })
+    .await
+    .map(drop)
+    .map_err(|error| error.to_string())
+}
+
+impl InboxHost for WorkerInbox {
+    fn publish(&self, events: Vec<LoggedEvent>) -> HostFuture<'_, Result<(), String>> {
+        Box::pin(publish(events))
+    }
+
+    fn annotate(&self) -> Map<String, Value> {
+        let mut annotation = Map::new();
+        annotation.insert(
+            "host_timing".into(),
+            json!({"runtime_id": self.runtime_id, "received_ms": monotonic_ms() - self.started_ms}),
+        );
+        annotation
+    }
+
+    fn finishing(&self, request_id: &str) -> HostFuture<'_, Map<String, Value>> {
+        let request = json!({"op": "turn_finished", "request_id": request_id});
         Box::pin(async move {
-            let events = events
-                .into_iter()
-                .map(encode)
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|error| format!("encode agent event: {error}"))?;
-            call(json!({"op": "events", "events": events}))
-                .await
-                .map(drop)
-                .map_err(|error| error.to_string())
+            match call_with(&request).await {
+                Ok(Value::Object(fields)) => fields,
+                _ => Map::new(),
+            }
         })
+    }
+
+    fn place(&self, session_id: &str, hand: Option<&str>) {
+        self.executors.select_prompt_hand(session_id, hand);
+    }
+
+    fn idle(&self) -> bool {
+        !remote::busy()
     }
 }

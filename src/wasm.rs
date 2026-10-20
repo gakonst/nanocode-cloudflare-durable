@@ -6,25 +6,21 @@ mod store;
 mod tools;
 mod transport;
 
-use std::{
-    cell::{Cell, RefCell},
-    collections::{HashMap, HashSet},
-    rc::Rc,
-    sync::Arc,
-};
+use std::{cell::RefCell, collections::HashMap, rc::Rc, sync::Arc, time::Duration};
 
 use nanocode::{
-    Agent, ClaudeClient, ClaudeModel, CodeModeExecutors, CodeModeHost, DurableOutcome, SessionEvents,
-    Model, ModelSelection, Nanocode, NanocodeError, OpenAi, PromptRequest,
-    Tools, TurnControl,
+    ClaudeClient, ClaudeModel, CodeModeExecutors, CodeModeHost, Model, ModelSelection, Nanocode,
+    OpenAi, Tools,
     backend::Prompt,
     codex::{OpenAiAuth, transport::ResponsesTransport},
-    durability::{SessionRecord, SqlStore, TurnStatus},
-    subagents::SubagentActivity,
+    durability::{SessionRecord, SqlStore},
+    session_host::{
+        Driven, ImportedTurn, SessionLog, Submission, Submitted, TurnInbox, TurnRecord, TurnState,
+    },
 };
 use nanocode_code_mode::remote::PLACEMENT_INSTRUCTIONS;
-use serde::Deserialize;
-use serde_json::{Value, json};
+use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value, json, value::RawValue};
 
 #[derive(Clone, Copy, Default, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -36,7 +32,10 @@ enum Provider {
 
 #[derive(Deserialize)]
 struct Configuration {
+    scope: String,
     session_id: String,
+    runtime_id: String,
+    started_ms: f64,
     #[serde(default)]
     provider: Provider,
     subscription: bool,
@@ -63,11 +62,23 @@ impl Configuration {
 }
 
 #[derive(Deserialize)]
-struct Input {
+struct Legacy {
     request_id: String,
+    status: String,
     prompt: String,
     #[serde(default)]
     hand: Option<String>,
+    metadata: Value,
+    #[serde(default)]
+    cancel_requested: bool,
+    #[serde(default)]
+    note: Option<String>,
+    #[serde(default)]
+    first_seq: Option<u64>,
+    #[serde(default)]
+    last_seq: Option<u64>,
+    #[serde(default)]
+    result: Option<Map<String, Value>>,
 }
 
 #[derive(Deserialize)]
@@ -76,14 +87,46 @@ enum Command {
     Init {
         config: Configuration,
     },
-    Pending,
-    Run {
-        input: Input,
-    },
-    Resume {
+    Submit {
+        scope: String,
         request_id: String,
+        prompt: String,
         #[serde(default)]
         hand: Option<String>,
+        metadata: Value,
+    },
+    Turn {
+        scope: String,
+        request_id: String,
+    },
+    Pending {
+        scope: String,
+    },
+    Cancel {
+        scope: String,
+        request_id: String,
+        #[serde(default)]
+        fields: Map<String, Value>,
+    },
+    Interrupted {
+        scope: String,
+        request_id: String,
+        note: String,
+    },
+    Page {
+        scope: String,
+        after: u64,
+        limit: usize,
+        #[serde(default)]
+        request_id: Option<String>,
+    },
+    Import {
+        scope: String,
+        turns: Vec<Legacy>,
+    },
+    Drive {
+        #[serde(default)]
+        next: Option<String>,
     },
     Attach {
         hand: String,
@@ -92,26 +135,18 @@ enum Command {
     Detach {
         connection: String,
     },
-    Cancel {
-        #[serde(default)]
-        request_id: Option<String>,
-    },
     Settle,
     Preconnect,
     Dispose,
 }
 
+type Log = SessionLog<store::WorkerStore>;
+
 struct Session {
-    runtime: Nanocode,
     executors: CodeModeExecutors,
     hands: RefCell<HashMap<String, (String, Arc<dyn CodeModeHost>)>>,
-    agent: Agent,
-    events: SessionEvents,
-    model: String,
-    opened: Vec<String>,
-    busy: Cell<bool>,
-    live: RefCell<HashMap<String, Option<TurnControl>>>,
-    cancelled: RefCell<HashSet<String>>,
+    inbox: TurnInbox<store::WorkerStore>,
+    scope: String,
 }
 
 enum Phase {
@@ -124,14 +159,19 @@ enum Phase {
 
 thread_local! {
     static PHASE: RefCell<Phase> = const { RefCell::new(Phase::Empty) };
+    static LOGS: RefCell<HashMap<String, Arc<Log>>> = RefCell::new(HashMap::new());
 }
 
 fn text(error: impl std::fmt::Display) -> String {
     error.to_string()
 }
 
-fn waiting() -> Value {
-    json!({"waiting": true})
+fn log(scope: &str) -> Arc<Log> {
+    LOGS.with_borrow_mut(|logs| {
+        Arc::clone(logs.entry(scope.to_owned()).or_insert_with(|| {
+            Arc::new(SessionLog::new(Arc::new(store::WorkerStore::log()), scope))
+        }))
+    })
 }
 
 fn current() -> Option<Rc<Session>> {
@@ -141,24 +181,25 @@ fn current() -> Option<Rc<Session>> {
     })
 }
 
+fn ready() -> Result<Rc<Session>, String> {
+    current().ok_or_else(|| "agent runtime is not ready".into())
+}
+
+fn described(record: &TurnRecord) -> Result<Value, String> {
+    Ok(json!({
+        "report": record.report().map_err(text)?,
+        "first_seq": record.first_seq,
+        "last_seq": record.last_seq,
+        "cancel_requested": record.cancel_requested,
+        "metadata": record.metadata,
+    }))
+}
+
 async fn open(config: Configuration) -> Result<Session, String> {
-    let coalesce = std::time::Duration::from_millis(config.event_coalesce_ms);
-    let store = nanocode::session_store(SqlStore::new(store::WorkerStore)).map_err(text)?;
-    if store
-        .summary(&config.session_id)
-        .await
-        .map_err(text)?
-        .is_none()
-    {
-        store
-            .session(SessionRecord::root(
-                &config.session_id,
-                config.model(),
-                None,
-            ))
-            .await
-            .map_err(text)?;
-    }
+    let coalesce = Duration::from_millis(config.event_coalesce_ms);
+    let store =
+        nanocode::session_store(SqlStore::new(store::WorkerStore::durability())).map_err(text)?;
+    let model = config.model();
     let mut builder = Nanocode::builder();
     builder = match config.provider {
         Provider::Claude => {
@@ -219,42 +260,33 @@ async fn open(config: Configuration) -> Result<Session, String> {
     let runtime = builder
         .build()
         .map_err(|error| format!("build runtime: {error}"))?;
-    let subagents = runtime.take_subagent_updates();
-    let opened = async {
-        let stored = store.load(&config.session_id).await.map_err(text)?;
-        let (agent, stream) = runtime.open_loaded(&store, &stored).await.map_err(text)?;
-        let (events, pump) = SessionEvents::start(stream, subagents, coalesce, events::WorkerSink);
-        bridge::spawn(pump);
-        let pending = stored
-            .turns
-            .iter()
-            .filter(|turn| turn.status == TurnStatus::Pending)
-            .map(|turn| turn.id.clone())
-            .collect();
-        Ok::<_, String>((
-            agent,
-            events,
-            stored.summary.record.model.as_str().to_owned(),
-            pending,
-        ))
-    }
-    .await;
-    match opened {
-        Ok((agent, events, model, opened)) => Ok(Session {
-            runtime,
-            executors,
-            hands: RefCell::default(),
-            agent,
-            events,
-            model,
-            opened,
-            busy: Cell::new(false),
-            live: RefCell::default(),
-            cancelled: RefCell::default(),
-        }),
+    let host = Arc::new(events::WorkerInbox::new(
+        config.runtime_id,
+        config.started_ms,
+        executors.clone(),
+    ));
+    match TurnInbox::open(
+        (*runtime).clone(),
+        &store,
+        SessionRecord::root(&config.session_id, model, None),
+        log(&config.scope),
+        host,
+        coalesce,
+    )
+    .await
+    {
+        Ok((inbox, pump)) => {
+            bridge::spawn(pump);
+            Ok(Session {
+                executors,
+                hands: RefCell::default(),
+                inbox,
+                scope: config.scope,
+            })
+        }
         Err(error) => {
             let _ = runtime.shutdown().await;
-            Err(error)
+            Err(error.to_string())
         }
     }
 }
@@ -272,19 +304,12 @@ async fn init(config: Configuration) -> Result<Value, String> {
     match open(config).await {
         Ok(session) => {
             let summary = json!({
-                "session_id": session.agent.session_id(),
-                "model": session.model,
-                "pending": session.opened,
+                "session_id": session.inbox.session_id(),
+                "model": session.inbox.model(),
             });
             let session = Rc::new(session);
             PHASE.set(Phase::Ready(Rc::clone(&session)));
-            bridge::spawn(async move {
-                if let Some(control) = session.runtime.subagents() {
-                    control
-                        .deliver_completions(&session.agent, session.agent.session_id())
-                        .await;
-                }
-            });
+            bridge::spawn(async move { session.inbox.deliver_completions().await });
             Ok(summary)
         }
         Err(error) => {
@@ -294,98 +319,7 @@ async fn init(config: Configuration) -> Result<Value, String> {
     }
 }
 
-struct Busy<'a>(&'a Session);
-
-impl Drop for Busy<'_> {
-    fn drop(&mut self) {
-        self.0.busy.set(false);
-    }
-}
-
-struct Live<'a>(&'a Session, &'a str);
-
-impl Drop for Live<'_> {
-    fn drop(&mut self) {
-        self.0.live.borrow_mut().remove(self.1);
-    }
-}
-
 impl Session {
-    fn root(&self) -> &str {
-        self.agent.session_id()
-    }
-
-    async fn prompt(
-        &self,
-        request_id: &str,
-        prompt: Prompt,
-        cancel: bool,
-    ) -> Result<String, NanocodeError> {
-        let mut request = PromptRequest::new(prompt).request_id(request_id);
-        if cancel || self.cancelled.borrow().contains(request_id) {
-            request = request.cancel_on_admission();
-        }
-        let turn = self.agent.prompt(request).await?;
-        self.live
-            .borrow_mut()
-            .insert(request_id.to_owned(), Some(turn.control()));
-        if self.cancelled.borrow().contains(request_id) {
-            ignore_inactive(turn.cancel().await)?;
-        }
-        let message = turn.result().await?.into_final_message();
-        self.agent.flush().await?;
-        Ok(message)
-    }
-
-    async fn execute(
-        &self,
-        request_id: &str,
-        prompt: Prompt,
-        cancel: bool,
-    ) -> Result<Value, String> {
-        if self.live.borrow().contains_key(request_id) {
-            return Ok(waiting());
-        }
-        self.live.borrow_mut().insert(request_id.to_owned(), None);
-        let _live = Live(self, request_id);
-        let outcome = self.prompt(request_id, prompt, cancel).await;
-        if self.events.drained().await.is_err() {
-            return Ok(json!({"retry": true}));
-        }
-        Ok(
-            match self
-                .runtime
-                .durable_outcome(self.root(), request_id, outcome)
-                .await
-            {
-                DurableOutcome::Completed(message) => json!({"ok": {
-                    "session_id": self.root(),
-                    "model": self.model,
-                    "message": message,
-                }}),
-                DurableOutcome::Failed(error) => json!({"error": error}),
-                DurableOutcome::Cancelled => json!({"cancelled": true}),
-                DurableOutcome::Waiting => waiting(),
-                DurableOutcome::Interrupted => json!({"retry": true}),
-            },
-        )
-    }
-
-    async fn run(
-        &self,
-        request_id: &str,
-        prompt: Prompt,
-        hand: Option<String>,
-    ) -> Result<Value, String> {
-        if self.busy.replace(true) {
-            return Ok(waiting());
-        }
-        let _busy = Busy(self);
-        self.executors
-            .select_prompt_hand(self.root(), hand.as_deref());
-        self.execute(request_id, prompt, false).await
-    }
-
     async fn attach(&self, hand: String, connection: String) -> Result<Value, String> {
         let host: Arc<dyn CodeModeHost> = Arc::new(remote::host(Some(connection.clone())).await?);
         self.executors.insert(hand.as_str(), Arc::clone(&host));
@@ -400,90 +334,93 @@ impl Session {
         Value::Null
     }
 
-    async fn stored(&self, request_id: &str) -> Result<Option<Prompt>, String> {
-        self.runtime
-            .durable_prompt(&self.agent, request_id)
-            .await
-            .map_err(text)
-    }
-
-    async fn resume(&self, request_id: &str, hand: Option<String>) -> Result<Value, String> {
-        if self.busy.get() || self.live.borrow().contains_key(request_id) {
-            return Ok(waiting());
-        }
-        match self.stored(request_id).await? {
-            Some(prompt) => self.run(request_id, prompt, hand).await,
-            None => Ok(json!({"error": "request is not a durable root operation"})),
-        }
-    }
-
-    async fn cancel(&self, request_id: Option<String>) -> Result<Value, String> {
-        let Some(request_id) = request_id else {
-            let live = self.live.borrow().clone();
-            self.cancelled.borrow_mut().extend(live.keys().cloned());
-            for control in live.values().flatten() {
-                ignore_inactive(control.cancel().await).map_err(text)?;
-            }
-            return Ok(json!({"waiting": !live.is_empty()}));
-        };
-        self.cancelled.borrow_mut().insert(request_id.clone());
-        let live = self.live.borrow().get(&request_id).cloned();
-        if let Some(control) = live {
-            if let Some(control) = control {
-                ignore_inactive(control.cancel().await).map_err(text)?;
-            }
-            return Ok(waiting());
-        }
-        match self.stored(&request_id).await? {
-            Some(prompt) => self.execute(&request_id, prompt, true).await,
-            None => Ok(json!({"cancelled": true})),
-        }
-    }
-
-    async fn activity(&self) -> SubagentActivity {
-        match self.runtime.subagents() {
-            Some(control) => control.activity(self.root()).await,
-            None => SubagentActivity::default(),
-        }
-    }
-
-    async fn pending_ids(&self) -> Result<Vec<String>, String> {
-        self.runtime.pending_turns(self.root()).await.map_err(text)
-    }
-
-    async fn pending(&self) -> Result<Value, String> {
-        let pending = self.pending_ids().await?;
-        let activity = self.activity().await;
-        let quiescent = pending.is_empty()
-            && activity.is_quiescent()
-            && self.live.borrow().is_empty()
-            && !remote::busy();
-        Ok(json!({
-            "pending": pending,
-            "quiescent": quiescent,
-            "remote_busy": remote::busy(),
-            "activity": serde_json::to_value(&activity).map_err(text)?,
-        }))
-    }
-
-    fn host_idle(&self) -> bool {
-        self.live.borrow().is_empty() && !remote::busy()
-    }
-
-    async fn settle(&self) -> Result<bool, String> {
-        self.events.drained().await?;
-        if !self.host_idle() {
-            return Ok(false);
-        }
-        Ok(self.runtime.settle(self.root()).await.map_err(text)? && self.host_idle())
+    async fn drive(&self, next: Option<&str>) -> Result<Value, String> {
+        Ok(match self.inbox.drive(next).await.map_err(text)? {
+            Driven::Idle => json!({"idle": true}),
+            Driven::Busy => json!({"waiting": true, "busy": true}),
+            Driven::Finished(record) => json!({"finished": described(&record)?}),
+            Driven::Resumed(request_id) => json!({"resumed": request_id}),
+            Driven::Waiting(request_id) => json!({"waiting": true, "request_id": request_id}),
+            Driven::Interrupted(request_id) => json!({"retry": true, "request_id": request_id}),
+        })
     }
 }
 
-fn ignore_inactive(result: Result<(), NanocodeError>) -> Result<(), NanocodeError> {
-    match result {
-        Err(NanocodeError::TurnNotCancellable) => Ok(()),
-        other => other,
-    }
+async fn submit(
+    scope: &str,
+    request_id: String,
+    prompt: String,
+    hand: Option<String>,
+    metadata: &Value,
+) -> Result<Value, String> {
+    let submission = Submission {
+        request_id,
+        prompt: Prompt::from(prompt),
+        hand,
+        metadata: serde_json::value::to_raw_value(metadata).map_err(text)?,
+    };
+    let (status, record) = match log(scope).submit(&submission).await.map_err(text)? {
+        Submitted::Accepted { record, event } => {
+            events::publish(vec![event]).await?;
+            ("accepted", record)
+        }
+        Submitted::Existing(record) => ("existing", record),
+        Submitted::Conflict(record) => ("conflict", record),
+    };
+    Ok(json!({"submitted": status, "turn": described(&record)?}))
+}
+
+async fn cancel(
+    scope: &str,
+    request_id: &str,
+    fields: &Map<String, Value>,
+) -> Result<Value, String> {
+    let cancelled = match current() {
+        Some(session) if session.scope == scope => session
+            .inbox
+            .cancel(request_id, fields)
+            .await
+            .map_err(text)?,
+        _ => match log(scope).cancel(request_id, fields).await.map_err(text)? {
+            Some((record, event)) => {
+                let dequeued = event.is_some();
+                if let Some(event) = event {
+                    events::publish(vec![event]).await?;
+                }
+                Some((record, dequeued))
+            }
+            None => None,
+        },
+    };
+    Ok(match cancelled {
+        Some((record, dequeued)) => json!({"turn": described(&record)?, "dequeued": dequeued}),
+        None => json!({"turn": null}),
+    })
+}
+
+async fn import(scope: &str, turns: Vec<Legacy>) -> Result<Value, String> {
+    let turns = turns
+        .into_iter()
+        .map(|turn| {
+            Ok(ImportedTurn {
+                request_id: turn.request_id,
+                state: TurnState::parse(&turn.status).map_err(text)?,
+                prompt: Prompt::from(turn.prompt),
+                hand: turn.hand,
+                metadata: serde_json::value::to_raw_value(&turn.metadata).map_err(text)?,
+                cancel_requested: turn.cancel_requested,
+                note: turn.note,
+                first_seq: turn.first_seq,
+                last_seq: turn.last_seq,
+                result: turn.result,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    log(scope)
+        .import(&turns)
+        .await
+        .map(Value::from)
+        .map_err(text)
 }
 
 async fn dispose() -> Result<Value, String> {
@@ -498,47 +435,84 @@ async fn dispose() -> Result<Value, String> {
         PHASE.set(Phase::Closed);
         return Ok(Value::Null);
     };
-    let shutdown = session.runtime.shutdown().await.map_err(text);
-    let delivered = session.events.drained().await;
+    let shutdown = session.inbox.shutdown().await.map_err(text);
     drop(session);
     PHASE.set(Phase::Closed);
-    shutdown?;
-    delivered?;
-    Ok(Value::Null)
+    shutdown.map(|()| Value::Null)
 }
 
-fn ready() -> Result<Rc<Session>, String> {
-    current().ok_or_else(|| "agent runtime is not ready".into())
+fn raw(value: &impl Serialize) -> Result<Box<RawValue>, String> {
+    serde_json::value::to_raw_value(value).map_err(text)
 }
 
-async fn execute(command: Command) -> Result<Value, String> {
+async fn execute(command: Command) -> Result<Box<RawValue>, String> {
     match command {
-        Command::Init { config } => init(config).await,
-        Command::Pending => ready()?.pending().await,
-        Command::Run { input } => {
-            ready()?
-                .run(&input.request_id, Prompt::from(input.prompt), input.hand)
-                .await
+        Command::Init { config } => raw(&init(config).await?),
+        Command::Submit {
+            scope,
+            request_id,
+            prompt,
+            hand,
+            metadata,
+        } => raw(&submit(&scope, request_id, prompt, hand, &metadata).await?),
+        Command::Turn { scope, request_id } => {
+            let record = log(&scope).turn(&request_id).await.map_err(text)?;
+            raw(&json!({"turn": record.as_ref().map(described).transpose()?}))
         }
-        Command::Resume { request_id, hand } => ready()?.resume(&request_id, hand).await,
-        Command::Attach { hand, connection } => ready()?.attach(hand, connection).await,
-        Command::Detach { connection } => Ok(match current() {
+        Command::Pending { scope } => {
+            let records = log(&scope).pending().await.map_err(text)?;
+            raw(&json!({"turns": records.iter().map(described).collect::<Result<Vec<_>, _>>()?}))
+        }
+        Command::Cancel {
+            scope,
+            request_id,
+            fields,
+        } => raw(&cancel(&scope, &request_id, &fields).await?),
+        Command::Interrupted {
+            scope,
+            request_id,
+            note,
+        } => {
+            log(&scope)
+                .interrupted(&request_id, &note)
+                .await
+                .map_err(text)?;
+            raw(&Value::Null)
+        }
+        Command::Page {
+            scope,
+            after,
+            limit,
+            request_id,
+        } => {
+            let log = log(&scope);
+            let page = match request_id {
+                Some(request_id) => log.turn_page(&request_id, after, limit).await,
+                None => log.page(after, limit).await,
+            };
+            raw(&page.map_err(text)?)
+        }
+        Command::Import { scope, turns } => raw(&import(&scope, turns).await?),
+        Command::Drive { next } => raw(&ready()?.drive(next.as_deref()).await?),
+        Command::Attach { hand, connection } => raw(&ready()?.attach(hand, connection).await?),
+        Command::Detach { connection } => raw(&match current() {
             Some(session) => session.detach(&connection),
             None => Value::Null,
         }),
-        Command::Cancel { request_id } => match current() {
-            Some(session) => session.cancel(request_id).await,
-            None => Ok(Value::Null),
-        },
-        Command::Settle => ready()?.settle().await.map(Value::Bool),
-        Command::Preconnect => ready()?
-            .agent
-            .preconnect()
-            .await
-            .map(|()| Value::Null)
-            .map_err(text),
-        Command::Dispose => dispose().await,
+        Command::Settle => raw(&ready()?.inbox.settle().await.map_err(text)?),
+        Command::Preconnect => {
+            ready()?.inbox.agent().preconnect().await.map_err(text)?;
+            raw(&Value::Null)
+        }
+        Command::Dispose => raw(&dispose().await?),
     }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+enum Reply {
+    Ok(Box<RawValue>),
+    Error(String),
 }
 
 #[unsafe(no_mangle)]
@@ -553,8 +527,8 @@ pub unsafe extern "C" fn command(id: u32, pointer: *mut u8, length: usize) {
         bridge::respond(
             id,
             &match result {
-                Ok(value) => json!({"ok": value}),
-                Err(error) => json!({"error": error}),
+                Ok(value) => Reply::Ok(value),
+                Err(error) => Reply::Error(error),
             },
         );
     });

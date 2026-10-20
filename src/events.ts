@@ -1,16 +1,35 @@
-import { json } from "./contracts";
+import type { LoggedEvent, LogPage } from "./contracts";
 
-type Page = { events: { seq: number; [key: string]: unknown }[]; next_cursor: number; has_more: boolean };
+type Event = LoggedEvent & { [key: string]: unknown };
 
 export class EventHub {
   private readonly listeners = new Set<() => void>();
   private revision = 0;
+  private highest = -1;
+  private tail: LoggedEvent[] = [];
+
+  constructor(private readonly retained: () => number) {}
 
   get version(): number { return this.revision; }
 
   notify(): void {
     this.revision++;
     for (const resolve of [...this.listeners]) resolve();
+  }
+
+  publish(events: LoggedEvent[]): void {
+    if (!events.length) return;
+    const first = events[0].seq;
+    const last = events[events.length - 1].seq;
+    this.tail = this.highest < 0 || first === this.highest + 1 ? [...this.tail, ...events].slice(-this.retained()) : [];
+    this.highest = Math.max(this.highest, last);
+    this.notify();
+  }
+
+  recent(after: number, requestId?: string): LogPage | undefined {
+    if (!this.tail.length || after < this.tail[0].seq - 1) return undefined;
+    const events = this.tail.filter(event => event.seq > after && (requestId === undefined || event.request_id === requestId));
+    return { events, next_cursor: Math.max(after, this.tail[this.tail.length - 1].seq), has_more: false };
   }
 
   async wait(milliseconds: number, version = this.revision): Promise<void> {
@@ -22,7 +41,7 @@ export class EventHub {
     try { await ready; } finally { clearTimeout(timer); this.listeners.delete(finish); }
   }
 
-  stream(after: number, interval: number, read: (after: number) => Page, finished?: (event: Page["events"][number]) => boolean): Response {
+  stream(after: number, interval: number, read: (after: number) => Promise<LogPage>, finished?: (event: Event) => boolean): Response {
     let cursor = after;
     let closed = false;
     let complete = false;
@@ -39,16 +58,18 @@ export class EventHub {
             const timer = setTimeout(() => { timedOut = true; finish(); }, interval);
             release = () => { clearTimeout(timer); this.listeners.delete(finish); finish(); };
             this.listeners.add(finish);
-            const page = read(cursor);
+            const page = await read(cursor);
+            if (closed) { release(); release = undefined; return; }
             if (page.events.length) {
               release();
               release = undefined;
               cursor = page.next_cursor;
-              complete = !!finished && page.events.some(finished);
+              complete = !!finished && page.events.some(event => finished(event as Event));
               const streamedAt = Date.now();
               controller.enqueue(encoder.encode(page.events.map(event => `id: ${event.seq}\ndata: ${JSON.stringify({ ...event, streamed_at: streamedAt })}\n\n`).join("")));
               return;
             }
+            cursor = page.next_cursor;
             await ready;
             release();
             release = undefined;
@@ -67,5 +88,3 @@ export class EventHub {
     return new Response(body, { headers: { "content-type": "text/event-stream", "cache-control": "no-store" } });
   }
 }
-
-export function eventResponse(value: Page): Response { return json(value); }

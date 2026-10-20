@@ -180,7 +180,7 @@ try {
     await complete("queued-b", restart);
     if (modelCalls !== calls + 4) throw new Error("Recovery duplicated queued requests");
     const restored = await storage();
-    await restored.exec("UPDATE jobs SET status = 'running', result = NULL WHERE request_id = 'queued-b'");
+    await restored.exec("UPDATE turns SET status = 'running', last_seq = NULL WHERE request_id = 'queued-b'");
     const receiptCalls = modelCalls;
     await turn("queued-b");
     if (modelCalls !== receiptCalls) throw new Error("Saved SDK receipt called the model");
@@ -194,7 +194,7 @@ try {
     await complete("cancel-active", performance.now(), "cancelled");
     await complete("cancel-queued", performance.now(), "cancelled");
     await turn("after-cancellation");
-    const savedState = await restored.exec("SELECT payload FROM states UNION ALL SELECT value AS payload FROM records UNION ALL SELECT body AS payload FROM events UNION ALL SELECT result AS payload FROM jobs");
+    const savedState = await restored.exec("SELECT payload FROM states UNION ALL SELECT value AS payload FROM records UNION ALL SELECT body AS payload FROM events UNION ALL SELECT metadata AS payload FROM turns UNION ALL SELECT prompt AS payload FROM turns");
     if (JSON.stringify(savedState).includes(GATEWAY_KEY)) throw new Error("Provider credential appeared in agent persistence");
   }
   const codexName = `codex-${Date.now()}`;
@@ -231,7 +231,7 @@ try {
   if (!codexRequests.every(entry => entry.model === "gpt-6.1-sol" && entry.store === false && entry.previous === null && entry.stream && entry.credential_free)) throw new Error(`Codex gateway requests were not stateless: ${JSON.stringify(codexRequests)}`);
   if (!codexCompleted.every(replays) || codexSecond.answered[0].input_items <= codexFirst.answered.at(-1).input_items) throw new Error(`Codex model calls did not replay the full history: ${JSON.stringify(codexRequests)}`);
   const durable = await storage();
-  const persisted = await durable.exec("SELECT (SELECT COUNT(*) FROM states) AS states, (SELECT COUNT(*) FROM records) AS records, (SELECT COUNT(*) FROM events) AS events, (SELECT COUNT(*) FROM jobs WHERE status = 'completed') AS completed, (SELECT COUNT(*) FROM jobs WHERE status IN ('queued', 'running')) AS unfinished");
+  const persisted = await durable.exec("SELECT (SELECT COUNT(*) FROM states) AS states, (SELECT COUNT(*) FROM records) AS records, (SELECT COUNT(*) FROM events) AS events, (SELECT COUNT(*) FROM turns WHERE status = 'completed') AS completed, (SELECT COUNT(*) FROM turns WHERE status IN ('queued', 'running')) AS unfinished");
   if (persisted[0].unfinished !== 0) throw new Error("Durable queue did not drain");
   const report = { runtime: "local workerd with a mock AI Gateway binding", model: "mock Opus 5.5 and Sol SSE", warm, measurements, modelCalls, codexRequests, persisted };
   writeFileSync("output/local-measurement.json", JSON.stringify(report, null, 2));

@@ -50,6 +50,7 @@ export type HostTool = { name: string; description: string; parameters: Record<s
 export type HostToolCall = { authority: SessionAuthority; name: string; input: unknown };
 
 export type AgentConfiguration = {
+  scope: string;
   provider?: ModelProvider;
   session_id: string;
   subscription: boolean;
@@ -61,15 +62,15 @@ export type AgentConfiguration = {
   tools?: HostTool[];
 };
 
-export type AgentInput = { request_id: string; prompt: string; hand?: string };
+export type TurnReport = Record<string, unknown> & { request_id: string; status: string };
 
-export type AgentResult = {
-  ok?: { session_id: string; model: string; message: unknown };
-  error?: string;
-  cancelled?: boolean;
-  retry?: boolean;
-  waiting?: boolean;
-};
+export type TurnView = { report: TurnReport; first_seq: number; last_seq: number | null; cancel_requested: boolean; metadata: unknown };
+
+export type LoggedEvent = { seq: number; request_id: string | null; created_at: number; event: unknown };
+
+export type LogPage = { events: LoggedEvent[]; next_cursor: number; has_more: boolean };
+
+export type Driven = { idle?: boolean; busy?: boolean; waiting?: boolean; retry?: boolean; request_id?: string; resumed?: string; finished?: TurnView };
 
 export const RECENT_MODEL_LIMIT = 64;
 
@@ -91,11 +92,14 @@ export type ModelTiming = {
   diagnostic?: unknown;
 };
 
+export type HostOptions = {
+  published(events: LoggedEvent[]): void;
+  wake?(): void;
+};
+
 export type RuntimeOptions = {
   dispatch(request: { endpoint: string; headers: [string, string][]; body: Uint8Array }, signal?: AbortSignal, timing?: ModelTiming & { runtime_id: string }): Promise<Response>;
-  wake?(): void;
-  event(value: unknown): Promise<void>;
-  events?(values: unknown[]): Promise<void>;
+  finishing?(request_id: string): Record<string, unknown>;
   socket?: {
     open(request: { headers: [string, string][] }, signal: AbortSignal, timing: ModelTiming & { runtime_id: string }): Promise<Response>;
     admit(): Promise<void>;

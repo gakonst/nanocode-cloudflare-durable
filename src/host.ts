@@ -1,5 +1,5 @@
 import module from "../dist/nanocode_worker.wasm";
-import { RECENT_MODEL_LIMIT, type AgentConfiguration, type AgentInput, type AgentResult, type ModelTiming, type RuntimeOptions } from "./contracts";
+import { RECENT_MODEL_LIMIT, type AgentConfiguration, type Driven, type HostOptions, type LogPage, type ModelTiming, type RuntimeOptions, type TurnView } from "./contracts";
 import { CheckpointStore } from "./store";
 import { Timings, type TimingSnapshot } from "./timing";
 
@@ -16,10 +16,6 @@ type Pending = { resolve(value: unknown): void; reject(reason: unknown): void };
 
 type Socket = { socket: WebSocket; idle: number; frames: (string | null)[]; closed?: string; waiter?: { id: number; resolve(value: unknown): void }; watchers: (() => void)[]; timing: ModelTiming };
 
-export type TurnOutcome = AgentResult & { waiting?: boolean };
-
-export type RuntimeActivity = { pending: string[]; quiescent: boolean; activity: unknown };
-
 export type RuntimeMetrics = {
   wasm_memory_bytes: number;
   timing: { runtime_id: string; started_at: number; elapsed_ms: number; spans: TimingSnapshot; checkpoints: TimingSnapshot; models: ModelTiming[] };
@@ -35,6 +31,7 @@ export type RuntimeMetrics = {
   cancellations: number;
   host_calls: number;
   store_calls: number;
+  log_calls: number;
   model_requests: number;
   model_sockets: number;
   socket_sends: number;
@@ -67,7 +64,7 @@ export class AgentRuntime {
   private readonly watchers = new Set<() => void>();
   private readonly counters: Omit<RuntimeMetrics, "timing" | "wasm_memory_bytes"> = {
     initializations: 0, runs: 0, completed: 0, failed: 0, cancelled: 0, retries: 0, waits: 0, resumes: 0, rejected_runs: 0, cancellations: 0,
-    host_calls: 0, store_calls: 0, model_requests: 0, model_sockets: 0, socket_sends: 0, socket_frames: 0, tool_calls: 0, body_reads: 0, event_batches: 0, events: 0,
+    host_calls: 0, store_calls: 0, log_calls: 0, model_requests: 0, model_sockets: 0, socket_sends: 0, socket_frames: 0, tool_calls: 0, body_reads: 0, event_batches: 0, events: 0,
     host_cancellations: 0, dropped_replies: 0, disposals: 0,
     bridge_request_bytes: 0, bridge_reply_bytes: 0,
   };
@@ -76,37 +73,44 @@ export class AgentRuntime {
   private nextCommand = 0;
   private depth = 0;
   private stopped = false;
-  private running = false;
   private failure?: Error;
   private disposal?: Promise<void>;
-  private pendingAtOpen: string[] = [];
   private readonly attached = new Set<string>();
+  private options: Partial<RuntimeOptions> & HostOptions;
   hands = false;
   remote = false;
   subscription = false;
+  opened = false;
 
-  private constructor(private readonly store: CheckpointStore, private readonly options: RuntimeOptions) {}
+  private constructor(private readonly store: CheckpointStore, options: HostOptions) {
+    this.options = options;
+  }
 
-  static async create(config: AgentConfiguration, store: CheckpointStore, options: RuntimeOptions): Promise<AgentRuntime> {
+  static async instantiate(store: CheckpointStore, options: HostOptions): Promise<AgentRuntime> {
     const runtime = new AgentRuntime(store, options);
-    runtime.hands = config.hands ?? false;
-    runtime.remote = config.remote ?? false;
-    runtime.subscription = config.subscription;
     const instantiateStarted = performance.now();
     const instance = await WebAssembly.instantiate(module, { host: runtime.imports() });
     runtime.timings.record("wasm.instantiate", performance.now() - instantiateStarted);
     runtime.wasm = instance.exports as unknown as Exports;
+    return runtime;
+  }
+
+  async open(config: AgentConfiguration, options: RuntimeOptions): Promise<void> {
+    if (this.opened || this.closed) throw new Error("agent runtime cannot be opened again");
+    this.opened = true;
+    this.options = { ...options, published: this.options.published, wake: this.options.wake };
+    this.hands = config.hands ?? false;
+    this.remote = config.remote ?? false;
+    this.subscription = config.subscription;
     try {
       const initStarted = performance.now();
-      const opened = await runtime.command({ op: "init", config: { session_id: config.session_id, provider: config.provider ?? "claude", subscription: config.subscription, endpoint: config.endpoint, remote: config.remote ?? false, executor: config.executor, hands: runtime.hands, event_coalesce_ms: config.event_coalesce_ms ?? 0, tools: config.tools ?? [] } }) as { pending: string[] };
-      runtime.timings.record("sdk.open", performance.now() - initStarted);
-      runtime.pendingAtOpen = opened.pending;
+      await this.command({ op: "init", config: { scope: config.scope, session_id: config.session_id, runtime_id: this.runtimeId, started_ms: this.started, provider: config.provider ?? "claude", subscription: config.subscription, endpoint: config.endpoint, remote: config.remote ?? false, executor: config.executor, hands: this.hands, event_coalesce_ms: config.event_coalesce_ms ?? 0, tools: config.tools ?? [] } });
+      this.timings.record("sdk.open", performance.now() - initStarted);
     } catch (error) {
-      runtime.terminate(error);
+      this.terminate(error);
       throw error;
     }
-    runtime.counters.initializations++;
-    return runtime;
+    this.counters.initializations++;
   }
 
   get metrics(): Readonly<RuntimeMetrics> {
@@ -125,18 +129,54 @@ export class AgentRuntime {
     return this.wasm.memory.buffer.byteLength;
   }
 
-  get opened(): readonly string[] {
-    return this.pendingAtOpen;
+  async submit(scope: string, input: { request_id: string; prompt: string; hand?: string; metadata: unknown }): Promise<{ submitted: "accepted" | "existing" | "conflict"; turn: TurnView }> {
+    return await this.command({ op: "submit", scope, ...input }) as { submitted: "accepted" | "existing" | "conflict"; turn: TurnView };
   }
 
-  run(input: AgentInput): Promise<TurnOutcome> {
+  async turn(scope: string, request_id: string): Promise<TurnView | null> {
+    return (await this.command({ op: "turn", scope, request_id }) as { turn: TurnView | null }).turn;
+  }
+
+  async pending(scope: string): Promise<TurnView[]> {
+    return (await this.command({ op: "pending", scope }) as { turns: TurnView[] }).turns;
+  }
+
+  async page(scope: string, after: number, limit: number, request_id?: string): Promise<LogPage> {
+    return await this.command({ op: "page", scope, after, limit, request_id }) as LogPage;
+  }
+
+  async interrupted(scope: string, request_id: string, note: string): Promise<void> {
+    await this.command({ op: "interrupted", scope, request_id, note });
+  }
+
+  async import(scope: string, turns: unknown[]): Promise<number> {
+    return await this.command({ op: "import", scope, turns }) as number;
+  }
+
+  async cancel(scope: string, request_id: string, fields: Record<string, unknown>): Promise<{ turn: TurnView | null; dequeued?: boolean }> {
+    this.counters.cancellations++;
+    return await this.command({ op: "cancel", scope, request_id, fields }) as { turn: TurnView | null; dequeued?: boolean };
+  }
+
+  async drive(next?: string): Promise<Driven> {
+    if (this.closed) throw this.failure ?? new Error("agent runtime is closed");
     this.counters.runs++;
-    return this.turn({ op: "run", input: { request_id: input.request_id, prompt: input.prompt, hand: input.hand } });
-  }
-
-  resume(request_id: string, hand?: string): Promise<TurnOutcome> {
-    this.counters.resumes++;
-    return this.turn({ op: "resume", request_id, hand });
+    let result: Driven;
+    try {
+      result = await this.command({ op: "drive", next }) as Driven;
+    } catch {
+      result = { retry: true };
+    }
+    const status = result.finished?.report.status;
+    if (status === "completed") this.counters.completed++;
+    else if (status === "cancelled") this.counters.cancelled++;
+    else if (status === "failed") this.counters.failed++;
+    else if (result.retry) this.counters.retries++;
+    else if (result.busy) this.counters.rejected_runs++;
+    else if (result.waiting) this.counters.waits++;
+    else if (result.resumed !== undefined) this.counters.resumes++;
+    if (result.retry) await this.dispose().catch(() => undefined);
+    return result;
   }
 
   async attach(hand: string, connection: string): Promise<void> {
@@ -153,16 +193,6 @@ export class AgentRuntime {
   async detach(connection: string): Promise<void> {
     if (this.closed || !this.attached.delete(connection)) return;
     await this.command({ op: "detach", connection });
-  }
-
-  async cancel(request_id?: string): Promise<TurnOutcome> {
-    if (this.closed) return { retry: true };
-    this.counters.cancellations++;
-    return this.record(await this.command({ op: "cancel", request_id }) as TurnOutcome);
-  }
-
-  async pending(): Promise<RuntimeActivity> {
-    return await this.command({ op: "pending" }) as RuntimeActivity;
   }
 
   async settle(): Promise<boolean> {
@@ -186,35 +216,6 @@ export class AgentRuntime {
     });
   }
 
-  private async turn(command: unknown): Promise<TurnOutcome> {
-    if (this.closed) throw this.failure ?? new Error("agent runtime is closed");
-    if (this.running) {
-      this.counters.rejected_runs++;
-      this.counters.waits++;
-      return { waiting: true };
-    }
-    this.running = true;
-    let result: TurnOutcome;
-    try {
-      result = await this.command(command) as TurnOutcome;
-    } catch {
-      result = { retry: true };
-    } finally {
-      this.running = false;
-    }
-    return this.record(result);
-  }
-
-  private async record(result: TurnOutcome): Promise<TurnOutcome> {
-    if (result.ok) this.counters.completed++;
-    else if (result.cancelled) this.counters.cancelled++;
-    else if (result.retry) this.counters.retries++;
-    else if (result.waiting) this.counters.waits++;
-    else if (result.error !== undefined) this.counters.failed++;
-    if (result.retry) await this.dispose().catch(() => undefined);
-    return result;
-  }
-
   dispose(): Promise<void> {
     this.disposal ??= this.shutdown();
     return this.disposal;
@@ -223,7 +224,7 @@ export class AgentRuntime {
   private async shutdown(): Promise<void> {
     this.counters.disposals++;
     let failure: unknown;
-    if (!this.stopped) {
+    if (!this.stopped && this.opened) {
       try { await this.command({ op: "dispose" }); } catch (error) { failure = error; }
     }
     this.terminate(new Error("agent runtime disposed"));
@@ -237,7 +238,6 @@ export class AgentRuntime {
     if (body) request.body = body;
     this.counters.bridge_request_bytes += length + (body?.byteLength ?? 0);
     this.timings.record("bridge.decode", performance.now() - received);
-    if (request.op === "events") request.events = request.events.map((event: object) => ({ ...event, host_timing: { runtime_id: this.runtimeId, received_ms: received - this.started } }));
     this.counters.host_calls++;
     this.inflight.set(id, () => {});
     void Promise.resolve()
@@ -303,6 +303,7 @@ export class AgentRuntime {
         this.onCancel(id, () => { clearTimeout(timer); resolve(null); });
       });
       case "http_start": {
+        if (!this.options.dispatch) throw new Error("agent runtime is not open");
         this.counters.model_requests++;
         const controller = new AbortController();
         this.onCancel(id, () => controller.abort());
@@ -452,22 +453,19 @@ export class AgentRuntime {
       }
       case "events": {
         this.counters.event_batches++;
-        if (this.options.events) {
-          await this.options.events(request.events);
-          this.counters.events += request.events.length;
-        } else {
-          for (const value of request.events) {
-            if (this.stopped) throw new Error("agent runtime disposed");
-            await this.options.event(value);
-            this.counters.events++;
-          }
-        }
+        this.counters.events += request.events.length;
+        this.options.published(request.events);
         this.notify();
         return null;
       }
+      case "turn_finished": return await this.options.finishing?.(request.request_id) ?? {};
       case "store": {
         this.counters.store_calls++;
         return this.store.transaction(request.operation, request.statements, this.checkpointTimings);
+      }
+      case "log": {
+        this.counters.log_calls++;
+        return this.store.transaction(request.operation, request.statements, undefined, this.store.log);
       }
       default: throw new Error("unsupported host operation");
     }

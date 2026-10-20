@@ -10,7 +10,7 @@ const TURNS = Number(values.turns);
 const DELTAS = Number(values.deltas);
 const CODEX_TURNS = Number(values["codex-turns"]);
 const ROUNDS = 3;
-const KEYS = ["store_calls", "statements", "bridge_request_bytes", "bridge_reply_bytes", "rows_written", "rows_read"];
+const KEYS = ["store_calls", "log_calls", "statements", "bridge_request_bytes", "bridge_reply_bytes", "rows_written", "rows_read", "object_statements", "object_rows_written", "object_rows_read"];
 const STORE_PATHS = ["nanocode_worker::wasm::store", "nanocode_durability_core::sql", "nanocode_durability_core::store"];
 const IDLE = new Set(["(idle)", "(program)", "(garbage collector)"]);
 let calls = 0;
@@ -138,20 +138,19 @@ function attribute(profile, source, turns) {
 
 async function turn(session, provider, id) {
   const started = performance.now();
-  const submitted = await request("http://worker/sessions/" + session + "/turns", { method: "POST", body: JSON.stringify({ request_id: id, prompt: "prompt " + id, provider }) });
-  if (submitted.status !== 202) throw new Error("Submit rejected: " + await submitted.text());
-  for (;;) {
-    const result = await (await request("http://worker/sessions/" + session + "/turns/" + id)).json();
-    if (result.status === "completed") return performance.now() - started;
-    if (["failed", "cancelled"].includes(result.status)) throw new Error("Turn " + id + " " + result.status + ": " + JSON.stringify(result));
-    await sleep(2);
-  }
+  const submitted = await mf.dispatchFetch("http://worker/sessions/" + session + "/turns", { method: "POST", headers: { ...headers, accept: "text/event-stream" }, body: JSON.stringify({ request_id: id, prompt: "prompt " + id, provider }) });
+  if (submitted.status !== 200 || !submitted.headers.get("content-type")?.includes("text/event-stream")) throw new Error("Submit rejected: " + await submitted.text());
+  const text = await submitted.text();
+  const events = text.split("\n\n").filter(block => block.startsWith("id: ")).map(block => JSON.parse(block.slice(block.indexOf("data: ") + 6)));
+  const result = events.find(entry => entry.event?.type === "result")?.event;
+  if (result?.status !== "completed") throw new Error("Turn " + id + " " + result?.status + ": " + JSON.stringify(result));
+  return performance.now() - started;
 }
 
 async function sample(session) {
   const value = await (await request("http://worker/sessions/" + session + "/metrics")).json();
   const runtime = value.runtime ?? {};
-  return { store_calls: runtime.store_calls ?? 0, statements: value.checkpoints?.statements ?? 0, bridge_request_bytes: runtime.bridge_request_bytes ?? 0, bridge_reply_bytes: runtime.bridge_reply_bytes ?? 0, rows_written: value.checkpoints?.rows_written ?? 0, rows_read: value.checkpoints?.rows_read ?? 0, database_bytes: value.database_bytes, persisted: value.persisted, operations: value.checkpoints?.operations };
+  return { store_calls: runtime.store_calls ?? 0, log_calls: runtime.log_calls ?? 0, statements: value.checkpoints?.statements ?? 0, bridge_request_bytes: runtime.bridge_request_bytes ?? 0, bridge_reply_bytes: runtime.bridge_reply_bytes ?? 0, rows_written: value.checkpoints?.rows_written ?? 0, rows_read: value.checkpoints?.rows_read ?? 0, object_statements: value.sql?.statements ?? 0, object_rows_written: value.sql?.rows_written ?? 0, object_rows_read: value.sql?.rows_read ?? 0, database_bytes: value.database_bytes, persisted: value.persisted, operations: value.checkpoints?.operations, log_operations: value.log?.operations };
 }
 
 async function scenario(name, provider, count, profiler) {
@@ -182,6 +181,7 @@ async function scenario(name, provider, count, profiler) {
     database_bytes: before.database_bytes,
     persisted: before.persisted,
     operations: before.operations,
+    log_operations: before.log_operations,
     restored: { milliseconds: restoreMs, workerd_cpu_ms: workerdCpu() - restoreCpu, ...Object.fromEntries(KEYS.map(key => [key, restored[key]])) },
     series: turns,
   };

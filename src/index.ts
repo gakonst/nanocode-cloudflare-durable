@@ -3,7 +3,7 @@ import { AgentRuntime } from "./host";
 import { CheckpointStore } from "./store";
 import { EventHub } from "./events";
 import { RemoteExecutor } from "./remote/host";
-import { DEFAULT_EXECUTOR, EXECUTOR_ID, RECENT_MODEL_LIMIT, headerJson, json, sessionUuid, type AgentResult, type HostTool, type HostToolCall, type ModelDispatch, type ModelProvider, type PrivateBinding, type SessionDescriptor } from "./contracts";
+import { DEFAULT_EXECUTOR, EXECUTOR_ID, RECENT_MODEL_LIMIT, headerJson, json, sessionUuid, type HostTool, type HostToolCall, type LoggedEvent, type LogPage, type ModelDispatch, type ModelProvider, type PrivateBinding, type SessionDescriptor, type TurnView } from "./contracts";
 import { Timings, timingDifference, type TimingSnapshot } from "./timing";
 
 export type { HostTool, HostToolCall, ModelDispatch, ModelProvider, PrivateBinding, SessionAuthority, SessionDescriptor, SocketDispatch } from "./contracts";
@@ -33,9 +33,8 @@ export type NanocodeOptions<E extends NanocodeEnv> = {
   tools?: { definitions: HostTool[]; call(call: HostToolCall, env: E, signal: AbortSignal): Promise<unknown> };
 };
 
-type Job = { request_id: string; prompt: string; status: string; result: string | null; scope: string; descriptor: string; cancel_requested: number; first_seq: number | null; last_seq: number | null };
-type Running = { job: Job; runtime: AgentRuntime };
-type TurnTiming = { started: number; admitted_at?: number; admission_ms?: number; pump_wait_ms?: number; runtime_open_ms?: number; runtime_reused?: boolean; run_ms?: number; recovered?: boolean; checkpoints: TimingSnapshot; runtime?: TimingSnapshot };
+type TurnTiming = { started: number; admitted_at?: number; admission_ms?: number; pump_wait_ms?: number; runtime_open_ms?: number; runtime_reused?: boolean; run_started?: number; run_ms?: number; recovered?: boolean; checkpoints: TimingSnapshot; runtime?: TimingSnapshot };
+type LegacyJob = { request_id: string; prompt: string; status: string; result: string | null; scope?: string; descriptor?: string; cancel_requested?: number; first_seq?: number | null; last_seq?: number | null };
 
 function policy(value: string, name: string): number {
   const number = Number(value);
@@ -53,52 +52,74 @@ const handName = (value: unknown): value is string => typeof value === "string" 
 const HAND_TAG = "hand";
 const WATCH_TAG = "watch";
 type Watch = { watch: string; cursor: number };
+type Watcher = { state: Watch; scope: string; descriptor: SessionDescriptor };
+const OWNER = "owner";
+const UNFINISHED = new Set(["queued", "running"]);
+const INTERRUPTED = "Agent execution interrupted; recovery scheduled";
 
 export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E>) {
   class AgentSession extends DurableObject<E> {
     private readonly store: CheckpointStore;
+    private readonly instances = new Map<string, Promise<AgentRuntime>>();
     private readonly runtimes = new Map<string, Promise<AgentRuntime>>();
     private readonly residents = new Map<string, AgentRuntime>();
+    private readonly blocked = new Set<string>();
+    private readonly watchers = new Map<WebSocket, Watcher>();
+    private unfinished?: boolean;
+    private flushing = false;
+    private reflush = false;
     private readonly hands = new Map<string, Map<string, { connection: string; executor: RemoteExecutor; ready: boolean }>>();
     private readonly connections = new Map<string, RemoteExecutor>();
     private readonly handSockets = new Map<WebSocket, RemoteExecutor>();
     private linger?: ReturnType<typeof setTimeout>;
-    private watchersPending = false;
-    private running?: Running;
     private pumping = false;
     private recorded = false;
     private deleted = false;
-    private readonly eventHub = new EventHub();
+    private readonly eventHub = new EventHub(() => policy(this.env.EVENT_PAGE_SIZE, "EVENT_PAGE_SIZE"));
     private readonly modelDiagnostics: { scope: string; value: unknown }[] = [];
     private readonly timings = new Map<string, Timings>();
     private readonly turnTimings = new Map<string, TurnTiming>();
-    private readonly eventTurns = new Map<string, string>();
-    private readonly counts = { runtime_initializations: 0, model_dispatches: 0, events_written: 0, event_turn_queries: 0, event_turn_cache_hits: 0, preparation_writes: 0, preparation_writes_skipped: 0, effect_syncs: 0, alarms: 0, direct_starts: 0, recoveries: 0, runtime_retirements: 0, host_tool_calls: 0 };
+    private readonly counts = { runtime_initializations: 0, model_dispatches: 0, events_written: 0, preparation_writes: 0, preparation_writes_skipped: 0, effect_syncs: 0, alarms: 0, direct_starts: 0, recoveries: 0, runtime_retirements: 0, host_tool_calls: 0 };
 
     constructor(ctx: DurableObjectState, env: E) {
       super(ctx, env);
       this.store = new CheckpointStore(ctx.storage);
       ctx.storage.sql.exec(`
-        CREATE TABLE IF NOT EXISTS jobs (request_id TEXT PRIMARY KEY, prompt TEXT NOT NULL, status TEXT NOT NULL, result TEXT);
         CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-        CREATE TABLE IF NOT EXISTS events (seq INTEGER PRIMARY KEY, scope TEXT NOT NULL, request_id TEXT, body TEXT NOT NULL, created_at INTEGER NOT NULL);
-        CREATE INDEX IF NOT EXISTS unfinished_jobs ON jobs(status);
         DROP INDEX IF EXISTS scoped_events;
         DROP INDEX IF EXISTS scoped_request_events;
         DROP TABLE IF EXISTS grant_fences;
-        CREATE TABLE IF NOT EXISTS event_turns (scope TEXT NOT NULL, turn_id TEXT NOT NULL, request_id TEXT NOT NULL, PRIMARY KEY (scope, turn_id));
         CREATE TABLE IF NOT EXISTS hand_sockets (connection TEXT PRIMARY KEY, scope TEXT NOT NULL, hand TEXT NOT NULL, catalog TEXT NOT NULL) WITHOUT ROWID;
         CREATE TABLE IF NOT EXISTS watch_sockets (id TEXT PRIMARY KEY, scope TEXT NOT NULL, descriptor TEXT NOT NULL) WITHOUT ROWID;
       `);
       ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair("ping", "pong"));
-      const columns = new Set(ctx.storage.sql.exec("PRAGMA table_info(jobs)").toArray().map(row => row.name));
-      if (!columns.has("scope")) ctx.storage.sql.exec("ALTER TABLE jobs ADD COLUMN scope TEXT NOT NULL DEFAULT 'owner'");
-      if (!columns.has("descriptor")) ctx.storage.sql.exec("ALTER TABLE jobs ADD COLUMN descriptor TEXT NOT NULL DEFAULT '{}'");
-      if (!columns.has("cancel_requested")) ctx.storage.sql.exec("ALTER TABLE jobs ADD COLUMN cancel_requested INTEGER NOT NULL DEFAULT 0");
-      if (!columns.has("first_seq")) ctx.storage.sql.exec("ALTER TABLE jobs ADD COLUMN first_seq INTEGER");
-      if (!columns.has("last_seq")) ctx.storage.sql.exec("ALTER TABLE jobs ADD COLUMN last_seq INTEGER");
       this.restoreHands();
       this.restoreWatchers();
+      if (this.store.row("SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'jobs'")) void ctx.blockConcurrencyWhile(() => this.migrate());
+    }
+
+    private async migrate(): Promise<void> {
+      const columns = new Set(this.ctx.storage.sql.exec("PRAGMA table_info(jobs)").toArray().map(row => row.name));
+      const select = ["request_id", "prompt", "status", "result", ...["scope", "descriptor", "cancel_requested", "first_seq", "last_seq"].filter(column => columns.has(column))].join(", ");
+      const jobs = this.ctx.storage.sql.exec<LegacyJob>(`SELECT ${select} FROM jobs ORDER BY rowid`).toArray();
+      const ranges = new Map<string, { first: number | null; last: number | null }>();
+      if (this.store.row("SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'events'")) {
+        for (const row of this.ctx.storage.sql.exec<{ request_id: string; first: number | null; last: number | null }>("SELECT request_id, MIN(seq) AS first, MAX(CASE WHEN body LIKE '{\"type\":\"result\"%' THEN seq END) AS last FROM events WHERE request_id IS NOT NULL GROUP BY request_id")) ranges.set(row.request_id, row);
+      }
+      const scopes = new Map<string, unknown[]>();
+      for (const job of jobs) {
+        const scope = job.scope ?? OWNER;
+        let descriptor: SessionDescriptor | Record<string, never>;
+        try { descriptor = this.descriptorOf(JSON.parse(job.descriptor ?? "{}")); } catch { descriptor = {}; }
+        const result = job.result ? JSON.parse(job.result) : undefined;
+        const unfinished = UNFINISHED.has(job.status);
+        const range = ranges.get(job.request_id);
+        let list = scopes.get(scope);
+        if (!list) scopes.set(scope, list = []);
+        list.push({ request_id: job.request_id, status: job.status, prompt: job.prompt, hand: descriptor.hand, metadata: descriptor, cancel_requested: !!job.cancel_requested, note: unfinished && typeof result?.error === "string" ? result.error : undefined, first_seq: job.first_seq ?? range?.first ?? undefined, last_seq: unfinished ? undefined : job.last_seq ?? range?.last ?? undefined, result: unfinished ? undefined : result });
+      }
+      for (const [scope, turns] of scopes) await (await this.instance(scope)).import(scope, turns);
+      this.ctx.storage.sql.exec("DROP TABLE IF EXISTS event_turns; DROP TABLE jobs");
     }
 
     async fetch(request: Request): Promise<Response> {
@@ -126,8 +147,8 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
           }
           this.recorded = true;
         }
-        if (request.method === "GET" && parts[2] === "metrics") return json({ ...this.counts, object_id: this.ctx.id.toString(), database_bytes: this.ctx.storage.sql.databaseSize, model_diagnostics: this.modelDiagnostics.filter(entry => entry.scope === scope).map(entry => entry.value), timing: this.timings.get(scope)?.snapshot() ?? {}, checkpoints: { ...this.store.metrics, timing: this.residents.get(scope)?.metrics.timing.checkpoints ?? {} }, resident_runtimes: this.runtimes.size, runtime: this.residents.get(scope)?.metrics, persisted: this.store.persisted(scope) });
-        if (request.method === "GET" && parts[2] === "events") return this.events(scope, url, request.headers.get("accept")?.includes("text/event-stream"), descriptor);
+        if (request.method === "GET" && parts[2] === "metrics") return json({ ...this.counts, object_id: this.ctx.id.toString(), database_bytes: this.ctx.storage.sql.databaseSize, model_diagnostics: this.modelDiagnostics.filter(entry => entry.scope === scope).map(entry => entry.value), timing: this.timings.get(scope)?.snapshot() ?? {}, checkpoints: { ...this.store.metrics, timing: this.residents.get(scope)?.metrics.timing.checkpoints ?? {} }, log: this.store.log, resident_runtimes: this.runtimes.size, runtime: this.residents.get(scope)?.metrics, persisted: this.store.persisted(scope) });
+        if (request.method === "GET" && parts[2] === "events") return await this.events(scope, url, request.headers.get("accept")?.includes("text/event-stream"));
         if (parts[2] === "socket") return this.watch(scope, url, request, descriptor);
         if (parts[2] === "hands") {
           if (request.method !== "GET") return json({ error: "method not allowed" }, 405);
@@ -137,8 +158,8 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
         if (parts[2] === "cancel" && parts.length === 4 && request.method === "POST") return await this.cancel(decodeURIComponent(parts[3]), scope);
         if (parts[2] !== "turns") return json({ error: "route not found" }, 404);
         if (request.method === "GET" && parts.length === 4) {
-          const job = this.job(decodeURIComponent(parts[3]));
-          return job && job.scope === scope ? json(this.publicJob(job)) : json({ error: "request not found" }, 404);
+          const turn = await (await this.instance(scope)).turn(scope, decodeURIComponent(parts[3]));
+          return turn ? json(turn.report) : json({ error: "request not found" }, 404);
         }
         if (request.method !== "POST" || parts.length !== 3) return json({ error: "method not allowed" }, 405);
         let input: any;
@@ -170,44 +191,42 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
         descriptor.provider = input.provider ?? boundProvider ?? "claude";
         if (descriptor.provider === "codex" && descriptor.session_id && descriptor.session_id[14] !== "7") return json({ error: "Codex requires a new thread with a UUIDv7 session" }, 409);
         if (descriptor.provider === "codex") descriptor.subscription = descriptor.codex_subscription ?? true;
-        const existing = this.job(input.request_id);
-        if (existing && (existing.prompt !== input.prompt || existing.scope !== scope || this.descriptor(existing).hand !== input.hand)) return json({ error: "request_id already belongs to different input or authority" }, 409);
-        if (!existing) {
-          policy(this.env.RECOVERY_DELAY_MS, "RECOVERY_DELAY_MS");
+        policy(this.env.RECOVERY_DELAY_MS, "RECOVERY_DELAY_MS");
+        const current = this.store.row("SELECT value FROM metadata WHERE key = 'authority'")?.value;
+        if (current && current !== identity) throw new Error("session authority mismatch");
+        const submitted = await (await this.instance(scope)).submit(scope, { request_id: input.request_id, prompt: input.prompt, hand: input.hand, metadata: descriptor });
+        if (submitted.submitted === "conflict") return json({ error: "request_id already belongs to different input or authority" }, 409);
+        const turn = submitted.turn;
+        if (submitted.submitted === "accepted") {
           this.ctx.storage.transactionSync(() => {
-            const current = this.store.row("SELECT value FROM metadata WHERE key = 'authority'")?.value;
-            if (current && current !== identity) throw new Error("session authority mismatch");
-            if (!current) this.ctx.storage.sql.exec("INSERT INTO metadata VALUES ('authority', ?)", identity);
+            if (!current) this.ctx.storage.sql.exec("INSERT INTO metadata VALUES ('authority', ?) ON CONFLICT(key) DO NOTHING", identity);
             this.ctx.storage.sql.exec("INSERT INTO metadata VALUES (?, ?) ON CONFLICT(key) DO NOTHING", providerKey, descriptor.provider!);
             this.ctx.storage.sql.exec("INSERT INTO metadata VALUES (?, ?) ON CONFLICT(key) DO NOTHING", executorKey, executor);
             this.sessionId(scope, descriptor.session_id);
             this.ctx.storage.sql.exec("INSERT INTO metadata VALUES (?, ?) ON CONFLICT(key) DO NOTHING", `background:${scope}`, JSON.stringify(descriptor));
-            const queued = this.insertEvent(scope, input.request_id, { type: "queued", request_id: input.request_id });
-            this.ctx.storage.sql.exec("INSERT INTO jobs (request_id, prompt, status, result, scope, descriptor, cancel_requested, first_seq) VALUES (?, ?, 'queued', NULL, ?, ?, 0, ?)", input.request_id, input.prompt, scope, JSON.stringify(descriptor), queued);
           });
+          this.unfinished = true;
           this.turnTimings.set(input.request_id, { started: admitted, checkpoints: {} });
         }
-        const job = existing ?? this.job(input.request_id)!;
-        if ((job.status === "queued" || job.status === "running") && !this.pumping) await this.ctx.storage.setAlarm(Date.now() + policy(this.env.RECOVERY_DELAY_MS, "RECOVERY_DELAY_MS"));
-        if (!existing) {
+        const unfinished = UNFINISHED.has(turn.report.status);
+        if (unfinished && !this.pumping) await this.ctx.storage.setAlarm(Date.now() + policy(this.env.RECOVERY_DELAY_MS, "RECOVERY_DELAY_MS"));
+        if (submitted.submitted === "accepted") {
           const timing = this.turnTimings.get(input.request_id);
           if (timing) {
             timing.admission_ms = performance.now() - admitted;
             timing.admitted_at = performance.now();
           }
         }
-        if ((job.status === "queued" || job.status === "running") && !this.pumping) {
+        if (unfinished && !this.pumping) {
           this.counts.direct_starts++;
           this.ctx.waitUntil(this.pump(true));
         }
         if (streaming) {
           const cursor = Number(url.searchParams.get("after") ?? "0");
-          const terminal = !["queued", "running"].includes(job.status);
-          const last = terminal ? job.last_seq ?? this.store.row("SELECT seq FROM events WHERE scope = ? AND request_id = ? ORDER BY seq DESC LIMIT 1", scope, input.request_id)?.seq : undefined;
-          if (terminal && (last === undefined || cursor >= Number(last))) return new Response(null, { headers: { "content-type": "text/event-stream", "cache-control": "no-store" } });
-          return this.events(scope, url, true, descriptor, input.request_id);
+          if (!unfinished && (turn.last_seq === null || cursor >= turn.last_seq)) return new Response(null, { headers: { "content-type": "text/event-stream", "cache-control": "no-store" } });
+          return await this.events(scope, url, true, input.request_id);
         }
-        return json(this.publicJob(job), ["queued", "running"].includes(job.status) ? 202 : 200);
+        return json(turn.report, unfinished ? 202 : 200);
       } catch (error) {
         if (error instanceof URIError) return json({ error: "invalid request encoding" }, 400);
         return json({ error: "session operation failed" }, 503);
@@ -231,14 +250,15 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
       let runtime: AgentRuntime | undefined;
       let immediate = false;
       let waiting = false;
-      let activeJob: Job | undefined;
+      let active: string | undefined;
       try {
         if (!watchdogArmed) await this.ctx.storage.setAlarm(Date.now() + delay);
-        const job = this.ctx.storage.sql.exec<Job>("SELECT * FROM jobs WHERE status IN ('queued', 'running') ORDER BY rowid LIMIT 1").toArray()[0];
+        const next = (await (await this.instance(OWNER)).pending(OWNER))[0];
+        this.unfinished = !!next;
         const background = this.store.row("SELECT key, value FROM metadata WHERE key LIKE 'background:%' ORDER BY key LIMIT 1");
-        if (!job && !background) return;
-        scope = job?.scope ?? String(background!.key).slice("background:".length);
-        const descriptor: SessionDescriptor = job ? this.descriptor(job) : JSON.parse(String(background!.value));
+        if (!next && !background) return;
+        scope = next ? OWNER : String(background!.key).slice("background:".length);
+        const descriptor: SessionDescriptor = next ? this.descriptorOf(next.metadata) : JSON.parse(String(background!.value));
         let sessionId!: string;
         let preparationRequired = !watchdogArmed;
         this.ctx.storage.transactionSync(() => {
@@ -248,20 +268,20 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
             preparationRequired = true;
           }
           sessionId = this.sessionId(scope!, descriptor.session_id, () => { preparationRequired = true; });
-          if (job) {
-            activeJob = job;
-            if (job.status === "running") this.counts.recoveries++;
-          }
         });
+        if (next) {
+          active = next.report.request_id;
+          if (next.report.status === "running") this.counts.recoveries++;
+        }
         const prepared = performance.now();
         if (preparationRequired) this.counts.preparation_writes++;
         else this.counts.preparation_writes_skipped++;
         let timing: TurnTiming | undefined;
-        if (job) {
-          timing = this.turnTimings.get(job.request_id);
+        if (active) {
+          timing = this.turnTimings.get(active);
           if (!timing) {
             timing = { started: prepared, recovered: true, checkpoints: {} };
-            this.turnTimings.set(job.request_id, timing);
+            this.turnTimings.set(active, timing);
           }
           timing.pump_wait_ms = prepared - (timing.admitted_at ?? prepared);
           timing.runtime_reused = this.runtimes.has(scope);
@@ -274,49 +294,37 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
           timing.runtime_open_ms = performance.now() - runtimeStarted;
           timing.runtime = timing.runtime_reused ? runtime.metrics.timing.spans : undefined;
           timing.checkpoints = timing.runtime_reused ? runtime.metrics.timing.checkpoints : {};
+          timing.run_started = performance.now();
         }
-        const state = await runtime.pending();
-        const first = state.pending[0];
-        const pendingJob = first ? this.job(first) : undefined;
-        activeJob = pendingJob?.scope === scope && ["queued", "running"].includes(pendingJob.status) ? pendingJob : !first ? job : undefined;
-        if (activeJob) {
-          this.running = { job: activeJob, runtime };
-          this.ctx.storage.transactionSync(() => {
-            this.ctx.storage.sql.exec("UPDATE jobs SET status = 'running', result = NULL WHERE request_id = ?", activeJob!.request_id);
-            this.insertEvent(scope!, activeJob!.request_id, { type: "running", request_id: activeJob!.request_id });
-          });
-          const turnTiming = this.turnTimings.get(activeJob.request_id);
-          const hand = this.descriptor(activeJob).hand;
-          const latest = this.job(activeJob.request_id)!;
-          const runStarted = performance.now();
-          const result = latest.cancel_requested ? await runtime.cancel(activeJob.request_id) : await runtime.run({ request_id: activeJob.request_id, prompt: activeJob.prompt, hand });
-          if (turnTiming) turnTiming.run_ms = performance.now() - runStarted;
-          if (result.retry) throw new Error("runtime recovery required");
-          waiting = !!result.waiting;
-          if (!result.waiting) this.finish(activeJob, result);
-        } else if (first) {
-          const result = await runtime.resume(first, pendingJob ? this.descriptor(pendingJob).hand : undefined);
-          if (result.retry) throw new Error("runtime recovery required");
-          waiting = !!result.waiting;
+        if (next?.cancel_requested && next.report.status === "running") this.blocked.add(scope);
+        const driven = await runtime.drive(active);
+        this.blocked.delete(scope);
+        if (driven.retry) throw new Error("runtime recovery required");
+        if (driven.finished) {
+          this.turnTimings.delete(driven.finished.report.request_id);
+          this.unfinished = undefined;
         }
-        this.running = undefined;
+        waiting = !!driven.waiting;
         const version = this.eventHub.version;
         if (await runtime.settle()) {
           this.ctx.storage.sql.exec("DELETE FROM metadata WHERE key = ?", `background:${scope}`);
         }
-        else if (waiting || !this.store.row("SELECT request_id FROM jobs WHERE status IN ('queued', 'running') LIMIT 1")) {
+        else if (waiting || this.queueKnownEmpty()) {
           await this.eventHub.wait(delay, version);
         }
-        immediate = !!this.store.row("SELECT request_id FROM jobs WHERE status IN ('queued', 'running') LIMIT 1");
+        immediate = !this.queueKnownEmpty();
       } catch {
-        if (activeJob) this.turnTimings.delete(activeJob.request_id);
-        if (activeJob) this.ctx.storage.sql.exec("UPDATE jobs SET result = ? WHERE request_id = ? AND status = 'running'", JSON.stringify({ error: "Agent execution interrupted; recovery scheduled" }), activeJob.request_id);
+        if (scope) this.blocked.delete(scope);
         if (scope) { this.runtimes.delete(scope); this.residents.delete(scope); this.releaseHands(scope); }
         if (runtime) await runtime.dispose().catch(() => {});
+        if (active) {
+          this.turnTimings.delete(active);
+          this.unfinished = true;
+          await this.instance(scope ?? OWNER).then(reader => reader.interrupted(scope ?? OWNER, active!, INTERRUPTED)).catch(() => {});
+        }
       } finally {
-        this.running = undefined;
         if (this.deleted) { this.pumping = false; return; }
-        const unfinished = this.store.row("SELECT request_id FROM jobs WHERE status IN ('queued', 'running') LIMIT 1");
+        const unfinished = !this.queueKnownEmpty();
         const background = this.store.row("SELECT key FROM metadata WHERE key LIKE 'background:%' LIMIT 1");
         if (!unfinished && !background) this.releaseIdle();
         this.pumping = false;
@@ -326,11 +334,15 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
       }
     }
 
-    private descriptor(job: Job): SessionDescriptor {
-      const value = JSON.parse(job.descriptor);
-      if (value.account_id) return value;
+    private queueKnownEmpty(): boolean {
+      return this.unfinished === false;
+    }
+
+    private descriptorOf(value: unknown): SessionDescriptor {
+      const descriptor = value as SessionDescriptor | null;
+      if (descriptor?.account_id) return descriptor;
       const identity = this.store.row("SELECT value FROM metadata WHERE key = 'authority'")?.value;
-      if (!identity) throw new Error(`job ${job.request_id} has no session authority`);
+      if (!identity) throw new Error("turn has no session authority");
       return { ...JSON.parse(String(identity)), session_id: "", subscription: this.env.MODEL_AUTH === "subscription" };
     }
 
@@ -368,7 +380,8 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
             : undefined;
           void connecting?.catch(() => {});
           try {
-            const created = await AgentRuntime.create({ session_id: sessionId, provider: descriptor.provider ?? "claude", subscription: descriptor.subscription, endpoint: descriptor.provider === "codex" ? (descriptor.subscription ? "https://chatgpt.com/backend-api/codex" : "https://api.openai.com/v1") : `https://api.anthropic.com/v1/messages${descriptor.subscription ? "?beta=true" : ""}`, remote: enabled, executor: descriptor.executor_id, hands: this.handsMode(scope, descriptor), event_coalesce_ms: duration(this.env.EVENT_COALESCE_MS, "EVENT_COALESCE_MS"), tools: options.tools?.definitions }, this.store, {
+            const created = await this.instance(scope, true);
+            await created.open({ scope, session_id: sessionId, provider: descriptor.provider ?? "claude", subscription: descriptor.subscription, endpoint: descriptor.provider === "codex" ? (descriptor.subscription ? "https://chatgpt.com/backend-api/codex" : "https://api.openai.com/v1") : `https://api.anthropic.com/v1/messages${descriptor.subscription ? "?beta=true" : ""}`, remote: enabled, executor: descriptor.executor_id, hands: this.handsMode(scope, descriptor), event_coalesce_ms: duration(this.env.EVENT_COALESCE_MS, "EVENT_COALESCE_MS"), tools: options.tools?.definitions }, {
           tools: options.tools && {
             call: async (name, input, signal) => {
               if (this.dispatchBlocked(scope)) throw new Error("request authority stopped");
@@ -426,9 +439,7 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
             }
             return response;
           },
-          wake: () => this.eventHub.notify(),
-          event: event => this.appendEvent(scope, null, event),
-          events: events => this.appendEvents(scope, null, events),
+          finishing: id => this.finishing(id, created),
           socket: {
             open: async (request, signal, timing) => {
               if (this.dispatchBlocked(scope)) throw new Error("request authority stopped");
@@ -546,19 +557,26 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
       const id = crypto.randomUUID();
       this.ctx.storage.sql.exec("INSERT INTO watch_sockets VALUES (?, ?, ?)", id, scope, JSON.stringify(descriptor));
       this.ctx.acceptWebSocket(server, [WATCH_TAG]);
-      server.serializeAttachment({ watch: id, cursor: after } satisfies Watch);
+      const state: Watch = { watch: id, cursor: after };
+      server.serializeAttachment(state);
+      this.watchers.set(server, { state, scope, descriptor });
       this.notifyWatchers();
       return new Response(null, { status: 101, webSocket: client });
     }
 
-    private watcher(socket: WebSocket): { state: Watch; scope: string; descriptor: SessionDescriptor } | undefined {
+    private watcher(socket: WebSocket): Watcher | undefined {
+      const known = this.watchers.get(socket);
+      if (known) return known;
       const state = socket.deserializeAttachment() as Watch | null;
       const row = state ? this.store.row("SELECT scope, descriptor FROM watch_sockets WHERE id = ?", state.watch) : undefined;
       if (!state || !row) return undefined;
-      return { state, scope: String(row.scope), descriptor: JSON.parse(String(row.descriptor)) };
+      const watcher = { state, scope: String(row.scope), descriptor: JSON.parse(String(row.descriptor)) };
+      this.watchers.set(socket, watcher);
+      return watcher;
     }
 
     private forgetWatcher(socket: WebSocket): void {
+      this.watchers.delete(socket);
       const state = socket.deserializeAttachment() as Watch | null;
       if (state?.watch) this.ctx.storage.sql.exec("DELETE FROM watch_sockets WHERE id = ?", state.watch);
     }
@@ -568,40 +586,67 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
       this.ctx.storage.sql.exec("DELETE FROM watch_sockets WHERE id NOT IN (SELECT value FROM json_each(?))", JSON.stringify(live));
     }
 
-    private notifyWatchers(): void {
-      if (this.watchersPending) return;
-      this.watchersPending = true;
-      queueMicrotask(() => {
-        this.watchersPending = false;
-        this.flushWatchers();
-      });
-    }
-
-    private flushWatchers(): void {
-      const page = policy(this.env.EVENT_PAGE_SIZE, "EVENT_PAGE_SIZE");
-      const byScope = new Map<string, { socket: WebSocket; state: Watch }[]>();
+    private watching(): { socket: WebSocket; watcher: Watcher }[] {
+      const list = [];
       for (const socket of this.ctx.getWebSockets(WATCH_TAG)) {
         const watcher = this.watcher(socket);
         if (!watcher) { try { socket.close(1011, "watch registration was lost"); } catch {} continue; }
-        let list = byScope.get(watcher.scope);
-        if (!list) byScope.set(watcher.scope, list = []);
-        list.push({ socket, state: watcher.state });
+        list.push({ socket, watcher });
+      }
+      return list;
+    }
+
+    private deliver(socket: WebSocket, state: Watch, event: LoggedEvent): void {
+      if (event.seq <= state.cursor) return;
+      try { socket.send(JSON.stringify({ type: "event", seq: event.seq, request_id: event.request_id, created_at: event.created_at, event: event.event })); state.cursor = event.seq; } catch {}
+    }
+
+    private published(scope: string, events: LoggedEvent[]): void {
+      if (!events.length || this.deleted) return;
+      this.counts.events_written += events.length;
+      this.eventHub.publish(events);
+      let behind = false;
+      for (const { socket, watcher } of this.watching()) {
+        if (watcher.scope !== scope) continue;
+        if (watcher.state.cursor < events[0].seq - 1) { behind = true; continue; }
+        const cursor = watcher.state.cursor;
+        for (const event of events) this.deliver(socket, watcher.state, event);
+        if (watcher.state.cursor !== cursor) socket.serializeAttachment(watcher.state);
+      }
+      if (behind) this.notifyWatchers();
+    }
+
+    private notifyWatchers(): void {
+      if (this.flushing) { this.reflush = true; return; }
+      this.flushing = true;
+      this.ctx.waitUntil((async () => {
+        try {
+          do {
+            this.reflush = false;
+            await this.flushWatchers();
+          } while (this.reflush && !this.deleted);
+        } catch {} finally { this.flushing = false; }
+      })());
+    }
+
+    private async flushWatchers(): Promise<void> {
+      const page = policy(this.env.EVENT_PAGE_SIZE, "EVENT_PAGE_SIZE");
+      const byScope = new Map<string, { socket: WebSocket; watcher: Watcher }[]>();
+      for (const entry of this.watching()) {
+        let list = byScope.get(entry.watcher.scope);
+        if (!list) byScope.set(entry.watcher.scope, list = []);
+        list.push(entry);
       }
       for (const [scope, list] of byScope) {
-        let after = Math.min(...list.map(entry => entry.state.cursor));
+        let after = Math.min(...list.map(entry => entry.watcher.state.cursor));
+        const before = list.map(entry => entry.watcher.state.cursor);
         for (;;) {
-          const rows = this.ctx.storage.sql.exec<{ seq: number; request_id: string | null; body: string; created_at: number }>("SELECT seq, request_id, body, created_at FROM events WHERE scope = ? AND seq > ? ORDER BY seq LIMIT ?", scope, after, page).toArray();
-          for (const row of rows) {
-            const message = `{"type":"event","seq":${row.seq},"request_id":${JSON.stringify(row.request_id)},"created_at":${row.created_at},"event":${row.body}}`;
-            for (const entry of list) {
-              if (row.seq <= entry.state.cursor) continue;
-              try { entry.socket.send(message); entry.state.cursor = row.seq; } catch {}
-            }
-          }
-          if (rows.length < page) break;
-          after = rows.at(-1)!.seq;
+          const rows = await (await this.instance(scope)).page(scope, after, page);
+          for (const event of rows.events) for (const { socket, watcher } of list) this.deliver(socket, watcher.state, event);
+          if (!rows.has_more) break;
+          after = rows.next_cursor;
         }
-        for (const entry of list) entry.socket.serializeAttachment(entry.state);
+        list.forEach(({ socket, watcher }, index) => { if (watcher.state.cursor !== before[index]) socket.serializeAttachment(watcher.state); });
       }
     }
 
@@ -619,24 +664,25 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
         const response = await this.fetch(new Request(`https://session.internal/internal/cancel/${encodeURIComponent(input.request_id)}`, { method: "POST", headers }));
         socket.send(JSON.stringify({ type: "cancel", request_id: input.request_id, status: response.status, body: await response.json() }));
       } else if (input?.type === "warm") {
-        const warmed = !watcher.descriptor.read_only && await this.warm(watcher.scope).catch(() => false);
+        const warmed = !watcher.descriptor.read_only && await this.warm(watcher.scope, watcher.descriptor).catch(() => false);
         socket.send(JSON.stringify({ type: "warm", warmed }));
       } else {
         socket.send(JSON.stringify({ type: "error", error: "unknown message type" }));
       }
     }
 
-    private async warm(scope: string): Promise<boolean> {
+    private async warm(scope: string, base: SessionDescriptor): Promise<boolean> {
       const sessionId = this.store.row("SELECT value FROM metadata WHERE key = ?", scope === "owner" ? "session_id" : `session_id:${scope}`)?.value;
-      const last = this.ctx.storage.sql.exec<Job>("SELECT * FROM jobs WHERE scope = ? ORDER BY rowid DESC LIMIT 1", scope).toArray()[0];
-      if (!sessionId || !last) return false;
-      const descriptor = this.descriptor(last);
+      if (!sessionId) return false;
+      const provider = (this.store.row("SELECT value FROM metadata WHERE key = ?", `model_provider:${scope}`)?.value ?? "claude") as ModelProvider;
+      const executor = this.store.row("SELECT value FROM metadata WHERE key = ?", `executor:${scope}`)?.value ?? (this.env.RUNNER_ENABLED === "true" ? DEFAULT_EXECUTOR : "");
+      const descriptor: SessionDescriptor = { ...base, executor_id: String(executor) || undefined, hand: undefined, provider, subscription: provider === "codex" ? base.codex_subscription ?? true : base.subscription };
       const runtime = await this.runtime(scope, String(sessionId), descriptor);
       await runtime.preconnect();
-      if (!this.pumping && !this.store.row("SELECT request_id FROM jobs WHERE status IN ('queued', 'running') LIMIT 1") && !this.store.row("SELECT key FROM metadata WHERE key LIKE 'background:%' LIMIT 1")) this.releaseIdle();
+      this.unfinished ??= (await runtime.pending(scope)).length > 0;
+      if (!this.pumping && !this.unfinished && !this.store.row("SELECT key FROM metadata WHERE key LIKE 'background:%' LIMIT 1")) this.releaseIdle();
       return true;
     }
-
     private executorEnabled(descriptor: SessionDescriptor): boolean {
       return !!descriptor.executor_id || this.env.RUNNER_ENABLED === "true";
     }
@@ -649,7 +695,7 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
       if (this.linger !== undefined) clearTimeout(this.linger);
       this.linger = setTimeout(() => {
         this.linger = undefined;
-        if (this.pumping || this.store.row("SELECT request_id FROM jobs WHERE status IN ('queued', 'running') LIMIT 1")) return;
+        if (this.pumping || !this.queueKnownEmpty()) return;
         this.releaseConnections();
       }, duration(this.env.MODEL_SOCKET_LINGER_MS, "MODEL_SOCKET_LINGER_MS"));
     }
@@ -700,9 +746,10 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
       if (this.linger !== undefined) clearTimeout(this.linger);
       this.linger = undefined;
       for (const socket of this.ctx.getWebSockets()) { try { socket.close(1000, "session deleted"); } catch {} }
-      const runtimes = [...this.runtimes.values()];
+      const runtimes = [...this.runtimes.values(), ...this.instances.values()];
       this.runtimes.clear();
       this.residents.clear();
+      this.instances.clear();
       this.eventHub.notify();
       await Promise.all(runtimes.map(resident => resident.then(runtime => runtime.dispose()).catch(() => {})));
       await this.ctx.storage.deleteAlarm();
@@ -710,32 +757,27 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
       return json({ deleted: true });
     }
 
-    private finish(job: Job, result: AgentResult): void {
-      const status = result.cancelled ? "cancelled" : result.error ? "failed" : "completed";
-      const timing = this.turnTimings.get(job.request_id);
-      const runtime = this.running?.job.request_id === job.request_id ? this.running.runtime.metrics.timing : undefined;
-      const { started, admitted_at, checkpoints, runtime: before, ...phases } = timing ?? { started: performance.now(), checkpoints: {} };
-      const measured = { ...result, timing: { ...phases, observed_ms: performance.now() - started, runtime_id: runtime?.runtime_id, checkpoint_spans: timingDifference(runtime?.checkpoints ?? {}, checkpoints), runtime_spans: runtime ? timingDifference(runtime.spans, before ?? {}) : undefined } };
-      this.ctx.storage.transactionSync(() => {
-        const last = this.insertEvent(job.scope, job.request_id, { type: "result", request_id: job.request_id, status, ...measured });
-        this.ctx.storage.sql.exec("UPDATE jobs SET status = ?, result = ?, last_seq = ? WHERE request_id = ?", status, JSON.stringify(measured), last, job.request_id);
-      });
-      this.turnTimings.delete(job.request_id);
+    private finishing(id: string, current: AgentRuntime): Record<string, unknown> {
+      const timing = this.turnTimings.get(id);
+      const runtime = current.metrics.timing;
+      const { started, admitted_at, checkpoints, runtime: before, run_started, ...phases } = timing ?? { started: performance.now(), checkpoints: {} };
+      if (run_started !== undefined) phases.run_ms = performance.now() - run_started;
+      return { timing: { ...phases, observed_ms: performance.now() - started, runtime_id: runtime.runtime_id, checkpoint_spans: timingDifference(runtime.checkpoints, checkpoints), runtime_spans: timingDifference(runtime.spans, before ?? {}) } };
     }
 
     private async cancel(id: string, scope: string): Promise<Response> {
-      const job = this.job(id);
-      if (!job || job.scope !== scope) return json({ error: "request not found" }, 404);
-      if (!["queued", "running"].includes(job.status)) return json(this.publicJob(job));
-      this.ctx.storage.sql.exec("UPDATE jobs SET cancel_requested = 1 WHERE request_id = ?", id);
-      if (job.status === "queued") this.finish(job, { cancelled: true, error: "request cancelled" });
-      else {
-        const resident = this.runtimes.get(scope);
-        if (resident) this.ctx.waitUntil(resident.then(runtime => runtime.cancel(id)).then(() => {}).catch(() => {}));
-      }
+      const timing = this.turnTimings.get(id);
+      const { started, admitted_at, checkpoints, runtime: before, run_started, ...phases } = timing ?? { started: performance.now(), checkpoints: {} };
+      const fields = { cancelled: true, error: "request cancelled", timing: { ...phases, observed_ms: performance.now() - started, checkpoint_spans: {} } };
+      const { turn, dequeued } = await (await this.instance(scope)).cancel(scope, id, fields);
+      if (!turn) return json({ error: "request not found" }, 404);
+      const running = turn.report.status === "running";
+      if (!running && !dequeued) return json(turn.report);
+      if (running) this.blocked.add(scope);
+      else this.turnTimings.delete(id);
       if (!this.pumping) await this.ctx.storage.setAlarm(Date.now());
       await this.ctx.storage.sync();
-      return json(this.publicJob(this.job(id)!), job.status === "running" ? 202 : 200);
+      return json(turn.report, running ? 202 : 200);
     }
 
     private async socketEffect(scope: string, descriptor: SessionDescriptor): Promise<void> {
@@ -754,88 +796,40 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
     }
 
     private dispatchBlocked(scope: string): boolean {
-      return !!this.store.row("SELECT request_id FROM jobs WHERE scope = ? AND status = 'running' AND cancel_requested = 1 LIMIT 1", scope);
+      return this.blocked.has(scope);
     }
 
-    private events(scope: string, url: URL, streaming = false, descriptor?: SessionDescriptor, requestId?: string): Response {
+    private instance(scope: string, unopened = false): Promise<AgentRuntime> {
+      let current = this.instances.get(scope);
+      if (!current) {
+        current = AgentRuntime.instantiate(this.store, { published: events => this.published(scope, events), wake: () => this.eventHub.notify() });
+        const created = current;
+        this.instances.set(scope, created);
+        void created.catch(() => { if (this.instances.get(scope) === created) this.instances.delete(scope); });
+      }
+      const instance = current;
+      return instance.then(runtime => {
+        if (!runtime.closed && !(unopened && runtime.opened)) return runtime;
+        if (this.instances.get(scope) === instance) this.instances.delete(scope);
+        if (!runtime.closed) void runtime.dispose().catch(() => {});
+        return this.instance(scope, unopened);
+      });
+    }
+
+    private async events(scope: string, url: URL, streaming = false, requestId?: string): Promise<Response> {
       const after = Number(url.searchParams.get("after") ?? "0");
       const limit = Number(url.searchParams.get("limit") ?? this.env.EVENT_PAGE_SIZE);
       const maximum = policy(this.env.EVENT_PAGE_SIZE, "EVENT_PAGE_SIZE");
       if (!Number.isSafeInteger(after) || after < 0 || !Number.isSafeInteger(limit) || limit < 1 || limit > maximum) return json({ error: `after must be a nonnegative integer and limit must be between 1 and ${maximum}` }, 400);
-      const first = requestId === undefined ? null : this.job(requestId)?.first_seq ?? null;
-      const read = (cursor: number) => {
-        if (first !== null) cursor = Math.max(cursor, first - 1);
-        const query = requestId === undefined
-          ? this.ctx.storage.sql.exec<{ seq: number; request_id: string | null; body: string; created_at: number }>("SELECT seq, request_id, body, created_at FROM events WHERE scope = ? AND seq > ? ORDER BY seq LIMIT ?", scope, cursor, limit)
-          : this.ctx.storage.sql.exec<{ seq: number; request_id: string | null; body: string; created_at: number }>("SELECT seq, request_id, body, created_at FROM events WHERE scope = ? AND request_id = ? AND seq > ? ORDER BY seq LIMIT ?", scope, requestId, cursor, limit);
-        const events = query.toArray().map(row => ({ seq: row.seq, request_id: row.request_id, created_at: row.created_at, event: JSON.parse(row.body) }));
-        return { events, next_cursor: events.at(-1)?.seq ?? cursor, has_more: events.length === limit };
-      };
+      const read = async (cursor: number): Promise<LogPage> => this.eventHub.recent(cursor, requestId) ?? await (await this.instance(scope)).page(scope, cursor, limit, requestId);
       if (streaming) return this.eventHub.stream(after, policy(this.env.EVENT_STREAM_KEEPALIVE_MS, "EVENT_STREAM_KEEPALIVE_MS"), read, requestId === undefined ? undefined : event => (event.event as { type?: unknown } | undefined)?.type === "result");
-      return json(read(after));
-    }
-
-    private insertEvent(scope: string, requestId: string | null, event: unknown, turns?: Map<string, string>): number {
-      const value = event as any;
-      const sdk = value?.source === "agent" ? value.event : value?.source === "subagent" ? value.update?.event : undefined;
-      const turnId = sdk?.payload?.turn_id;
-      const acceptedId = sdk?.payload?.request_id;
-      if (value?.source === "agent" && typeof turnId === "string" && typeof acceptedId === "string" && this.job(acceptedId)?.scope === scope) {
-        this.ctx.storage.sql.exec("INSERT INTO event_turns VALUES (?, ?, ?) ON CONFLICT(scope, turn_id) DO NOTHING", scope, turnId, acceptedId);
-      }
-      if (typeof turnId === "string") {
-        requestId = turnId;
-        if (value?.source === "agent") {
-          const key = JSON.stringify([scope, turnId]);
-          const cached = turns?.get(key) ?? this.eventTurns.get(key);
-          if (cached !== undefined) {
-            requestId = cached;
-            this.counts.event_turn_cache_hits++;
-          } else {
-            this.counts.event_turn_queries++;
-            const mapped = this.store.row("SELECT request_id FROM event_turns WHERE scope = ? AND turn_id = ?", scope, turnId)?.request_id;
-            if (mapped !== undefined) {
-              requestId = String(mapped);
-              turns?.set(key, requestId);
-            }
-          }
-        }
-      }
-      else if (typeof acceptedId === "string") requestId = acceptedId;
-      const seq = this.ctx.storage.sql.exec<{ seq: number }>("INSERT INTO events (scope, request_id, body, created_at) VALUES (?, ?, ?, ?) RETURNING seq", scope, requestId, JSON.stringify(event), Date.now()).one().seq;
-      this.counts.events_written++;
-      this.eventHub.notify();
-      this.notifyWatchers();
-      return seq;
-    }
-
-    private async appendEvent(scope: string, requestId: string | null, event: unknown): Promise<void> {
-      return this.appendEvents(scope, requestId, [event]);
-    }
-
-    private async appendEvents(scope: string, requestId: string | null, events: unknown[]): Promise<void> {
-      const started = performance.now();
-      const turns = new Map<string, string>();
-      this.ctx.storage.transactionSync(() => { for (const event of events) this.insertEvent(scope, requestId, event, turns); });
-      for (const [key, value] of turns) {
-        this.eventTurns.set(key, value);
-        while (this.eventTurns.size > 512) this.eventTurns.delete(this.eventTurns.keys().next().value!);
-      }
-      this.scopeTimings(scope).record("events.insert", performance.now() - started);
+      return json(await (await this.instance(scope)).page(scope, after, limit));
     }
 
     private scopeTimings(scope: string): Timings {
       let value = this.timings.get(scope);
       if (!value) { value = new Timings(); this.timings.set(scope, value); }
       return value;
-    }
-
-    private job(id: string): Job | undefined {
-      return this.ctx.storage.sql.exec<Job>("SELECT * FROM jobs WHERE request_id = ?", id).toArray()[0];
-    }
-
-    private publicJob(job: Job) {
-      return { request_id: job.request_id, status: job.status, ...(job.result ? JSON.parse(job.result) : {}) };
     }
   }
 
