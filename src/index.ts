@@ -1,7 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
 import { AgentRuntime, EventHub, HostFailure, RECENT_MODEL_LIMIT, RemoteExecutor, RemoteRefusal, Timings, sessionUuid, timingDifference, type HostTool, type LoggedEvent, type LogPage, type ModelProvider, type TimingSnapshot, type TurnView } from "nanocode-wasm";
 import wasm from "nanocode-wasm/nanocode_wasm.wasm";
-import { CheckpointStore, Metadata } from "./store";
+import { CheckpointStore, Metadata, SQLITE_VALUE_LIMIT_BYTES } from "./store";
 import { ExecutorRejection, connectExecutor } from "./remote";
 import { DEFAULT_EXECUTOR, EXECUTOR_ID, headerJson, json, type HostToolCall, type ModelDispatch, type PrivateBinding, type SessionDescriptor } from "./contracts";
 
@@ -14,6 +14,7 @@ export interface NanocodeEnv {
   RECOVERY_DELAY_MS: string;
   EVENT_STREAM_KEEPALIVE_MS: string;
   EVENT_PAGE_SIZE: string;
+  EVENT_TAIL_BYTES: string;
   EVENT_COALESCE_MS: string;
   MODEL_SOCKET_LINGER_MS: string;
   RUNTIME_MEMORY_BUDGET_BYTES: string;
@@ -50,6 +51,29 @@ function duration(value: string, name: string): number {
 }
 
 const handName = (value: unknown): value is string => typeof value === "string" && EXECUTOR_ID.test(value);
+const TOO_LARGE = `request bodies are limited to ${SQLITE_VALUE_LIMIT_BYTES} bytes`;
+const decoder = new TextDecoder();
+
+async function bodyText(request: Request): Promise<string | undefined> {
+  if (!request.body) return "";
+  const reader = request.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > SQLITE_VALUE_LIMIT_BYTES) {
+      await reader.cancel().catch(() => {});
+      return undefined;
+    }
+    chunks.push(value);
+  }
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
+  return decoder.decode(bytes);
+}
 const HAND_TAG = "hand";
 const HAND_REPLACED = "another hand attached under this name";
 const INVALID_HAND = "hand names are 1 to 48 lowercase letters, digits, _ or -, starting with a letter or digit; pass --name";
@@ -94,7 +118,7 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
     private pumping = false;
     private recorded = false;
     private deleted = false;
-    private readonly eventHub = new EventHub(() => policy(this.env.EVENT_PAGE_SIZE, "EVENT_PAGE_SIZE"));
+    private readonly eventHub = new EventHub(() => policy(this.env.EVENT_PAGE_SIZE, "EVENT_PAGE_SIZE"), () => policy(this.env.EVENT_TAIL_BYTES, "EVENT_TAIL_BYTES"));
     private readonly modelDiagnostics: { scope: string; value: unknown }[] = [];
     private readonly timings = new Map<string, Timings>();
     private readonly turnTimings = new Map<string, TurnTiming>();
@@ -188,8 +212,10 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
           return turn ? json(turn.report) : json({ error: "request not found" }, 404);
         }
         if (request.method !== "POST" || parts.length !== 3) return json({ error: "method not allowed" }, 405);
+        const body = await bodyText(request);
+        if (body === undefined) return json({ error: TOO_LARGE }, 413);
         let input: any;
-        try { input = await request.json(); } catch { return json({ error: "invalid JSON" }, 400); }
+        try { input = JSON.parse(body); } catch { return json({ error: "invalid JSON" }, 400); }
         if (typeof input?.request_id !== "string" || !input.request_id.trim() || typeof input.prompt !== "string" || !input.prompt.trim()) return json({ error: "request_id and prompt must be nonempty strings" }, 400);
         if (input.provider !== undefined && input.provider !== "claude" && input.provider !== "codex") return json({ error: "provider must be claude or codex" }, 400);
         if (input.executor !== undefined && (typeof input.executor !== "string" || !EXECUTOR_ID.test(input.executor))) return json({ error: "invalid executor" }, 400);
@@ -224,6 +250,7 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
           const current = this.metadata.get("authority");
           if (current && current !== identity) throw new Error("session authority mismatch");
           submitted = await (await this.instance(scope)).submit(scope, { request_id: input.request_id, prompt: input.prompt, hand: input.hand, metadata: descriptor });
+          if (submitted.submitted === "too_large") return json({ error: "request exceeds the session's storage limit", bytes: submitted.bytes, limit: submitted.limit }, 413);
           if (submitted.submitted === "conflict") return json({ error: "request_id already belongs to different input or authority" }, 409);
           if (submitted.submitted === "accepted") {
             this.metadata.transaction(() => {
@@ -714,10 +741,10 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
       try { socket.send(JSON.stringify({ type: "event", seq: event.seq, request_id: event.request_id, created_at: event.created_at, event: event.event })); state.cursor = event.seq; } catch {}
     }
 
-    private published(scope: string, events: LoggedEvent[]): void {
+    private published(scope: string, events: LoggedEvent[], bytes: number[]): void {
       if (!events.length || this.deleted) return;
       this.counts.events_written += events.length;
-      this.eventHub.publish(events);
+      this.eventHub.publish(events, bytes);
       let behind = false;
       for (const { socket, watcher } of this.watching()) {
         if (watcher.scope !== scope) continue;
@@ -983,7 +1010,7 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
       if (this.deleted) return Promise.reject(new Error("session deleted"));
       let current = this.instances.get(scope);
       if (!current) {
-        current = AgentRuntime.instantiate(wasm, this.store, { published: events => this.published(scope, events), wake: () => this.eventHub.notify() });
+        current = AgentRuntime.instantiate(wasm, this.store, { published: (events, bytes) => this.published(scope, events, bytes), wake: () => this.eventHub.notify() });
         const created = current;
         this.instances.set(scope, created);
         void created.catch(() => { if (this.instances.get(scope) === created) this.instances.delete(scope); });
@@ -1026,12 +1053,14 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
     const account = typeof principal === "string" ? principal : principal.account;
     const url = new URL(request.url);
     if (url.pathname === "/health") return json({ ok: true, model: "claude-opus-5-5", models: { claude: "claude-opus-5-5", codex: "gpt-6.1-sol" }, auth: env.MODEL_AUTH ?? "api_key" });
-    if (url.pathname === "/metrics" && request.method === "GET") return options.egress(env).fetch(new Request(url.searchParams.get("probe") === "codex" ? "https://egress.internal/probe/codex" : "https://egress.internal/metrics"));
+    const head = request.method === "HEAD";
+    if (url.pathname === "/metrics" && (request.method === "GET" || head)) return options.egress(env).fetch(new Request(url.searchParams.get("probe") === "codex" ? "https://egress.internal/probe/codex" : "https://egress.internal/metrics"));
     const match = /^\/sessions\/([^/]+)(?:\/(turns|events|metrics|socket|hands)(?:\/([^/]+)(?:\/(cancel))?)?)?$/.exec(url.pathname);
     if (!match || (match[3] !== undefined && match[2] !== "turns" && match[2] !== "hands") || (match[4] !== undefined && match[2] !== "turns")) return json({ error: "route not found" }, 404);
     let name: string;
     try { name = decodeURIComponent(match[1]); } catch { return json({ error: "invalid session encoding" }, 400); }
     if (!name || name.includes("\0")) return json({ error: "invalid session name" }, 400);
+    if (Number(request.headers.get("content-length") ?? 0) > SQLITE_VALUE_LIMIT_BYTES) return json({ error: TOO_LARGE }, 413);
     const mode = (provider: ModelProvider) => options.subscription ? options.subscription(account, env, provider) : env.MODEL_AUTH === "subscription";
     const [subscription, codex_subscription] = await Promise.all([mode("claude"), mode("codex")]);
     const caller = typeof principal === "object" ? principal : undefined;
@@ -1041,15 +1070,17 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
     else if (match[3]) path += `/${match[3]}`;
     const headers = new Headers(request.headers);
     headers.delete("authorization");
+    if (head) headers.delete("upgrade");
     headers.set("x-nanocode-descriptor", headerJson(descriptor));
     const target = new URL(request.url);
     target.pathname = path;
     const dispatched = performance.now();
-    const response = await env.SESSIONS.get(env.SESSIONS.idFromName(JSON.stringify([account, name])), { locationHint: env.SESSION_LOCATION_HINT }).fetch(new Request(target, { method: request.method, headers, body: request.body, redirect: "manual" }));
+    const response = await env.SESSIONS.get(env.SESSIONS.idFromName(JSON.stringify([account, name])), { locationHint: env.SESSION_LOCATION_HINT }).fetch(new Request(target, { method: head ? "GET" : request.method, headers, body: head ? null : request.body, redirect: "manual" }));
     if (response.webSocket) return response;
     const responseHeaders = new Headers(response.headers);
     responseHeaders.set("server-timing", `public_pre_session;dur=${dispatched - started}, session_response;dur=${performance.now() - dispatched}`);
-    return new Response(response.body, { status: response.status, statusText: response.statusText, headers: responseHeaders });
+    if (head) await response.body?.cancel();
+    return new Response(head ? null : response.body, { status: response.status, statusText: response.statusText, headers: responseHeaders });
   }
 
   async function deleteSession(account: string, name: string, env: E): Promise<boolean> {

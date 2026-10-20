@@ -107,7 +107,7 @@ export function localOptions({ provider, agent = {}, workers = [], persistence, 
         compatibilityDate: "2026-10-16",
         durableObjects: { SESSIONS: { className: "AgentSession", useSQLite: true } },
         serviceBindings: { GATEWAY_UPSTREAM: "gateway-upstream" },
-        bindings: { AI_GATEWAY_ID: "local", ACCESS_TOKEN_SHA256: createHash("sha256").update(LOCAL_TOKEN).digest("hex"), MODEL_AUTH: "api_key", RECOVERY_DELAY_MS: "1000", EVENT_PAGE_SIZE: "128", EVENT_COALESCE_MS: "100", MODEL_SOCKET_LINGER_MS: "0", RUNTIME_MEMORY_BUDGET_BYTES: "67108864", EVENT_STREAM_KEEPALIVE_MS: "100", REMOTE_MAX_FRAME_BYTES: "1048576", REMOTE_TIMEOUT_MS: "30000", ...agent },
+        bindings: { AI_GATEWAY_ID: "local", ACCESS_TOKEN_SHA256: createHash("sha256").update(LOCAL_TOKEN).digest("hex"), MODEL_AUTH: "api_key", RECOVERY_DELAY_MS: "1000", EVENT_PAGE_SIZE: "128", EVENT_TAIL_BYTES: "4194304", EVENT_COALESCE_MS: "100", MODEL_SOCKET_LINGER_MS: "0", RUNTIME_MEMORY_BUDGET_BYTES: "67108864", EVENT_STREAM_KEEPALIVE_MS: "100", REMOTE_MAX_FRAME_BYTES: "1048576", REMOTE_TIMEOUT_MS: "30000", ...agent },
         outboundService: async () => { throw new Error("The Worker attempted direct outbound network access"); },
       },
       {

@@ -1,9 +1,11 @@
 import { Miniflare, convertV4MiniflareOptions } from "miniflare";
-import { writeFileSync } from "node:fs";
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { performance } from "node:perf_hooks";
 import { GATEWAY_KEY, LOCAL_TOKEN, localOptions } from "./local-runtime.mjs";
 
 const STRING_LIMIT = 8 * 1024 * 1024;
+const UNFINISHED = new Set(["queued", "running"]);
 const replyBytes = Number(process.env.LIMITS_REPLY_BYTES ?? STRING_LIMIT + 1_000_000);
 const held = [];
 
@@ -33,7 +35,9 @@ const provider = async request => {
   return sse(input.model, ["limits-ok"]);
 };
 
-const mf = new Miniflare(convertV4MiniflareOptions(localOptions({ provider, agent: { RECOVERY_DELAY_MS: "500" } })));
+const persistence = resolve(mkdtempSync("output/local-state-"));
+const options = () => convertV4MiniflareOptions(localOptions({ provider, persistence, agent: { RECOVERY_DELAY_MS: "500" } }));
+let mf = new Miniflare(options());
 const authorization = `Bearer ${LOCAL_TOKEN}`;
 const assertions = [];
 const failures = [];
@@ -44,6 +48,16 @@ const post = (name, body) => route(`${name}/turns`, { method: "POST", headers: {
 const status = async (name, id) => (await route(`${name}/turns/${id}`)).json();
 const metrics = async name => (await route(`${name}/metrics`)).json();
 const ids = text => [...text.matchAll(/^id: (\d+)$/gm)].map(match => Number(match[1]));
+
+async function events(name) {
+  const all = [];
+  for (let after = 0; ;) {
+    const page = await (await route(`${name}/events?after=${after}&limit=16`)).json();
+    all.push(...page.events);
+    if (!page.has_more) return all;
+    after = page.next_cursor;
+  }
+}
 
 async function settle(name, id, timeout = 10000) {
   const started = performance.now();
@@ -87,18 +101,104 @@ try {
   check(prompts[STRING_LIMIT + 10_000].status === 413, "A prompt above the SQLite string limit is refused as too large instead of as a retryable 503");
 
   {
+    const boundary = {};
+    for (const gap of [100, 200, 300, 400, 500, 600, 700, 800, 1000]) {
+      const name = `limits-boundary-${gap}-${Date.now()}`;
+      const bytes = STRING_LIMIT - gap;
+      const response = await post(name, { request_id: "edge", prompt: "b".repeat(bytes) });
+      const body = await response.json();
+      const entry = boundary[gap] = { prompt_bytes: bytes, status: response.status, error: body.error, bytes: body.bytes, limit: body.limit };
+      if (response.status >= 300) continue;
+      const final = await settle(name, "edge", 4000);
+      entry.final = final.status;
+      entry.note = final.error;
+      if (UNFINISHED.has(final.status)) {
+        await route(`${name}/turns/edge/cancel`, { method: "POST" });
+        entry.after_cancel = (await settle(name, "edge", 5000)).status;
+        continue;
+      }
+      const accepted = (await events(name)).find(event => event.event?.event?.type === "input.accepted");
+      entry.input_bytes = accepted?.event.event.payload.input.length ?? null;
+    }
+    report.admission_boundary = boundary;
+    const admitted = Object.values(boundary).filter(entry => entry.status === 202);
+    const refused = Object.values(boundary).filter(entry => entry.status === 413);
+    check(admitted.length > 0 && refused.length > 0 && admitted.length + refused.length === Object.keys(boundary).length, "Prompts within a few hundred bytes of the limit are either admitted or refused with 413");
+    check(admitted.every(entry => entry.final === "completed" && entry.input_bytes === entry.prompt_bytes), "Every admitted prompt completes and its input.accepted event is logged with the whole prompt");
+    check(refused.every(entry => entry.limit === STRING_LIMIT && entry.bytes > STRING_LIMIT), "A refused prompt's 413 names the bytes its turn needs and the limit");
+  }
+
+  {
     const name = `limits-reply-${Date.now()}`;
     const admitted = await post(name, { request_id: "giant", prompt: "Send a giant reply" });
-    const stuck = await settle(name, "giant", 3000);
-    const cancel = await route(`${name}/turns/giant/cancel`, { method: "POST" });
-    const cancelled = await settle(name, "giant", 5000);
+    const finished = await settle(name, "giant", 8000);
+    if (UNFINISHED.has(finished.status)) await route(`${name}/turns/giant/cancel`, { method: "POST" });
+    const omitted = (await events(name)).filter(event => event.event?.type === "omitted").map(event => event.event);
     const follow = await post(name, { request_id: "after", prompt: "Say hello" });
     const after = await settle(name, "after", 5000);
     const quiet = await until(async () => (await metrics(name)).alarm_at === null, 5000);
     const m = await metrics(name);
-    report.oversized_event = { reply_bytes: replyBytes, admitted: admitted.status, before_cancel: { status: stuck.status, note: stuck.error }, cancel: cancel.status, after_cancel: { status: cancelled.status, error: cancelled.error }, next_turn: after.status, alarm_at: m.alarm_at, recoveries: m.recoveries };
-    check(cancel.status < 300 && cancelled.status === "cancelled", "Cancelling a turn whose events cannot be stored ends it instead of recovering it forever");
-    check(after.status === "completed" && quiet, "The next turn runs after that cancellation and the session stops re-arming its alarm");
+    report.oversized_event = { reply_bytes: replyBytes, admitted: admitted.status, finished: { status: finished.status, error: finished.error }, omitted, next_turn: { admitted: follow.status, status: after.status }, alarm_at: m.alarm_at, recoveries: m.recoveries };
+    check(finished.status === "failed" && /result is \d+ bytes/.test(finished.error ?? ""), "A turn whose result exceeds the SQLite value limit fails by itself with an error naming its size instead of recovering until cancelled");
+    check(omitted.some(event => event.event_type === "assistant.message" && event.bytes > STRING_LIMIT) && omitted.every(event => event.request_id === "giant"), "Its oversized events are logged as omitted markers naming their type and size");
+    check(after.status === "completed" && quiet && m.recoveries === 0, "The next turn runs and the session stops re-arming its alarm without a recovery");
+  }
+
+  {
+    const name = `limits-body-${Date.now()}`;
+    const body = JSON.stringify({ request_id: "body", prompt: "c".repeat(10_000_000) });
+    const sizedStarted = performance.now();
+    const sized = await route(`${name}/turns`, { method: "POST", headers: { "content-type": "application/json" }, body });
+    const sizedReply = { status: sized.status, body: await sized.json(), ms: performance.now() - sizedStarted };
+    const encoded = new TextEncoder().encode(body);
+    const stream = new ReadableStream({ start(controller) { for (let offset = 0; offset < encoded.length; offset += 65536) controller.enqueue(encoded.subarray(offset, offset + 65536)); controller.close(); } });
+    const chunkedStarted = performance.now();
+    const chunked = await route(`${name}/turns`, { method: "POST", headers: { "content-type": "application/json" }, body: stream, duplex: "half" });
+    const chunkedReply = { status: chunked.status, body: await chunked.json(), ms: performance.now() - chunkedStarted };
+    const m = await metrics(name);
+    report.body_limit = { body_bytes: encoded.length, content_length: sizedReply, chunked: chunkedReply, submits: m.log?.operations?.submit ?? 0 };
+    check(sized.status === 413 && /request bodies are limited to 8388608 bytes/.test(sizedReply.body.error), "A body whose Content-Length exceeds the SQLite value limit gets 413 before it is read");
+    check(chunked.status === 413 && /request bodies are limited to 8388608 bytes/.test(chunkedReply.body.error) && !m.log?.operations?.submit, "A chunked body is cut off at the limit with 413 and never reaches the session log");
+  }
+
+  {
+    const name = `limits-head-${Date.now()}`;
+    await post(name, { request_id: "one", prompt: "Say hello" });
+    await settle(name, "one");
+    const head = {};
+    for (const path of ["turns/one", "events?after=0", "metrics", "hands"]) {
+      const get = await route(`${name}/${path}`);
+      await get.arrayBuffer();
+      const answered = await route(`${name}/${path}`, { method: "HEAD" });
+      head[path] = { get: get.status, head: answered.status, body_bytes: (await answered.arrayBuffer()).byteLength, same_type: answered.headers.get("content-type") === get.headers.get("content-type") };
+    }
+    const stream = await route(`${name}/events?after=0`, { method: "HEAD", headers: { accept: "text/event-stream" } });
+    head.stream = { head: stream.status, body_bytes: (await stream.arrayBuffer()).byteLength, type: stream.headers.get("content-type") };
+    const health = await mf.dispatchFetch("http://worker/health", { method: "HEAD", headers: { authorization } });
+    head.health = { head: health.status, body_bytes: (await health.arrayBuffer()).byteLength };
+    report.head = head;
+    check(Object.values(head).every(entry => entry.head === 200 && entry.body_bytes === 0 && (entry.get === undefined || (entry.get === 200 && entry.same_type))), "HEAD on GET routes answers like GET without a body");
+  }
+
+  {
+    const name = `limits-legacy-${Date.now()}`;
+    const storage = async () => mf.unsafeGetDurableObjectStorage("nanocode", "AgentSession", { name: JSON.stringify(["owner", name]) });
+    await (await route(`${name}/metrics`)).json();
+    const legacy = await storage();
+    await legacy.exec("CREATE TABLE jobs (request_id TEXT PRIMARY KEY, prompt TEXT NOT NULL, status TEXT NOT NULL, result TEXT, scope TEXT, descriptor TEXT, cancel_requested INTEGER, first_seq INTEGER, last_seq INTEGER)");
+    const descriptor = JSON.stringify({ account_id: "owner", session_id: "", session_name: name, subscription: false });
+    const jobs = ["legacy-0", "legacy-1", "legacy-2"];
+    for (const id of jobs) await legacy.exec("INSERT INTO jobs (request_id, prompt, status, scope, descriptor) VALUES (?, ?, 'queued', 'owner', ?)", id, `${id} ${"d".repeat(3_000_000)}`, descriptor);
+    await mf.dispose();
+    mf = new Miniflare(options());
+    await mf.ready;
+    const reply = await route(`${name}/turns/legacy-0`).then(async response => ({ status: response.status, body: (await response.text()).slice(0, 200) }), error => ({ error: String(error) }));
+    const next = await post(name, { request_id: "after-legacy", prompt: "Say hello" }).then(response => response.status, error => String(error));
+    const finals = {};
+    for (const id of [...jobs, "after-legacy"]) finals[id] = (await settle(name, id, 15000).catch(error => ({ status: String(error) }))).status;
+    const tables = await storage().then(legacy => legacy.exec("SELECT name FROM sqlite_schema WHERE type = 'table' AND name = 'jobs'")).then(rows => rows.length, error => String(error));
+    report.legacy_migration = { jobs: jobs.length, prompt_bytes: 3_000_000, first_read: reply, next_turn: next, finals, jobs_table_left: tables > 0 };
+    check(reply.status === 200 && Object.values(finals).every(final => final === "completed") && !tables, "A pre-inbox session whose unfinished prompts exceed the SQLite value limit migrates and runs its turns");
   }
 
   {

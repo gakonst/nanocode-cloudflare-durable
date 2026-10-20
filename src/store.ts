@@ -58,7 +58,10 @@ export class Metadata {
   }
 }
 
+export const SQLITE_VALUE_LIMIT_BYTES = 8_388_608;
+
 export class CheckpointStore implements SqlHost {
+  readonly value_limit = SQLITE_VALUE_LIMIT_BYTES;
   readonly timings = new Timings();
   readonly metrics = metrics();
   readonly log = metrics();
