@@ -1,5 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
-import { AgentRuntime, EventHub, HostFailure, RECENT_MODEL_LIMIT, RemoteExecutor, Timings, sessionUuid, timingDifference, type HostTool, type LoggedEvent, type LogPage, type ModelProvider, type TimingSnapshot, type TurnView } from "nanocode-wasm";
+import { AgentRuntime, EventHub, HostFailure, RECENT_MODEL_LIMIT, RemoteExecutor, RemoteRefusal, Timings, sessionUuid, timingDifference, type HostTool, type LoggedEvent, type LogPage, type ModelProvider, type TimingSnapshot, type TurnView } from "nanocode-wasm";
 import wasm from "nanocode-wasm/nanocode_wasm.wasm";
 import { CheckpointStore, Metadata } from "./store";
 import { ExecutorRejection, connectExecutor } from "./remote";
@@ -51,6 +51,7 @@ function duration(value: string, name: string): number {
 
 const handName = (value: unknown): value is string => typeof value === "string" && EXECUTOR_ID.test(value);
 const HAND_TAG = "hand";
+const HAND_REPLACED = "another hand attached under this name";
 const WATCH_TAG = "watch";
 type Watch = { watch: string; cursor: number };
 type Watcher = { state: Watch; scope: string; descriptor: SessionDescriptor };
@@ -454,20 +455,22 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
             failed: () => remoteFailed || remote?.failure !== undefined,
             execute: async (request: any, id: number) => {
               const executor = request.connection != null ? this.connections.get(request.connection) : await connecting;
-              if (!executor) throw new Error(request.connection != null ? "hand is not connected" : "remote executor is not configured");
+              if (!executor) throw new RemoteRefusal(request.connection != null ? "hand is not connected" : "remote executor is not configured");
               if (request.connection != null && request.op === "remote_catalog") executor.claim(owner);
               else if (request.connection != null && !executor.owns(owner)) {
-                if (request.op === "remote_send") throw new Error("hand connection moved to a newer runtime");
+                if (request.op === "remote_send") throw new RemoteRefusal("hand connection moved to a newer runtime");
                 return request.op === "remote_poll" ? { closed: "connection moved to a newer runtime" } : null;
               }
-              if (request.op === "remote_send" && request.durable !== false) await this.durable(scope);
+              if (request.op === "remote_send" && request.durable !== false) {
+                try { await this.durable(scope); } catch (error) { throw new RemoteRefusal(error instanceof Error ? error.message : String(error)); }
+              }
               if (request.op === "remote_send" && request.dispatches && this.dispatchBlocked(scope)) {
-                await executor.dispose();
-                throw new Error("request authority stopped");
+                setTimeout(() => void executor.dispose(), 0);
+                throw new RemoteRefusal("request authority stopped");
               }
               if (request.op === "remote_send" && request.connection != null && !await this.handAllowed(request.connection)) {
-                await executor.dispose();
-                throw new Error("the hand's access token expired or was revoked");
+                setTimeout(() => void executor.dispose(), 0);
+                throw new RemoteRefusal("the hand's access token expired or was revoked");
               }
               return executor.execute(request, id);
             },
@@ -544,13 +547,13 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
 
     private async registerHand(scope: string, requested: string | undefined, executor: Executor, descriptor: SessionDescriptor): Promise<void> {
       try { await executor.ready(); } catch { this.handSockets.delete(executor.socket); return; }
-      let advertised: string | null;
-      try { advertised = await (await this.instance(scope)).catalog(executor.catalog!, this.handLimits().max_frame_bytes); }
+      let advertised: { name: string | null; runtime_id: string | null };
+      try { advertised = await (await this.instance(scope)).identity(executor.catalog!, this.handLimits().max_frame_bytes); }
       catch (error) {
         this.handSockets.delete(executor.socket);
         return executor.reject(error instanceof Error ? error.message : String(error));
       }
-      const hand = requested ?? advertised;
+      const hand = requested ?? advertised.name;
       if (!handName(hand)) {
         this.handSockets.delete(executor.socket);
         return executor.dispose();
@@ -559,10 +562,13 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
       this.ctx.storage.sql.exec("INSERT INTO hand_sockets (connection, scope, hand, catalog, descriptor) VALUES (?, ?, ?, ?, ?)", connection, scope, hand, executor.catalog!, JSON.stringify(descriptor));
       this.handAuthority.set(connection, descriptor);
       executor.socket.serializeAttachment({ connection });
+      const current = this.hands.get(scope)?.get(hand)?.executor;
+      const incumbent = current && advertised.runtime_id !== null ? (await (await this.instance(scope)).identity(current.catalog!, this.handLimits().max_frame_bytes).catch(() => undefined))?.runtime_id : undefined;
       const previous = this.hands.get(scope)?.get(hand);
       this.indexHand(scope, hand, connection, executor, false);
       const hands = this.hands.get(scope)!;
-      if (previous) await previous.executor.dispose();
+      if (previous && previous.executor === current && incumbent && incumbent !== advertised.runtime_id) previous.executor.refuse(HAND_REPLACED);
+      else if (previous) await previous.executor.dispose();
       const resident = this.runtimes.get(scope);
       const runtime = resident && await resident.catch(() => undefined);
       if (runtime && hands.get(hand)?.connection === connection) await runtime.attach(hand, connection).catch(() => {});
