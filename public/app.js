@@ -10,7 +10,7 @@ const EVERY = ["none", "low", "medium", "high", "xhigh", "max"];
 const THINKING = ["low", "medium", "high", "xhigh", "max"];
 const HARNESSES = [
   { id: "claude", label: "Claude", models: [{ id: "claude-haiku-5-5", label: "Haiku 5.5", name: "Claude Haiku 5.5", efforts: EVERY, effort: "medium" }, { id: "claude-sonnet-5-5", label: "Sonnet 5.5", name: "Claude Sonnet 5.5", efforts: THINKING, effort: "high" }] },
-  { id: "codex", label: "Codex", models: [{ id: "gpt-6-luna", label: "Luna", name: "GPT-6 Luna", efforts: EVERY, effort: "medium" }, { id: "gpt-6.1-sol", label: "Sol", name: "GPT-6.1 Sol", efforts: THINKING, effort: "medium" }] },
+  { id: "codex", label: "Codex", models: [{ id: "gpt-6-luna", label: "Luna", name: "GPT-6 Luna", efforts: EVERY, effort: "medium" }, { id: "gpt-6.1-sol", label: "Sol", name: "GPT-6.1 Sol", efforts: THINKING, effort: "medium" }, { id: "glm-5.3", label: "GLM-5.3", name: "GLM-5.3 on Workers AI", efforts: ["low", "medium", "high"], effort: "low" }] },
 ];
 const MODELS = HARNESSES.flatMap(harness => harness.models);
 const COMMANDS = [

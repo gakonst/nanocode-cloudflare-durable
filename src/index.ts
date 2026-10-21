@@ -9,10 +9,13 @@ export type { HostTool, ModelProvider } from "nanocode-ts";
 export type { HostToolCall, ModelDispatch, PrivateBinding, SessionAuthority, SessionDescriptor, SocketDispatch, Thinking } from "./contracts";
 export { THINKING } from "./contracts";
 
+const WORKERS_AI_MODELS = new Set(["glm-5.3"]);
+
 export interface NanocodeEnv {
   SESSIONS: DurableObjectNamespace;
   MODEL_AUTH?: string;
   CLAUDE_MODEL?: string;
+  WORKERS_AI_ACCOUNT_ID?: string;
   RECOVERY_DELAY_MS: string;
   EVENT_STREAM_KEEPALIVE_MS: string;
   EVENT_PAGE_SIZE: string;
@@ -542,7 +545,7 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
           void connecting?.catch(() => {});
           try {
             const created = await this.instance(scope, true);
-            await created.open({ scope, session_id: sessionId, provider: descriptor.provider ?? "claude", model: descriptor.model ?? (descriptor.provider === "codex" ? undefined : this.env.CLAUDE_MODEL), subscription: descriptor.subscription, endpoint: descriptor.provider === "codex" ? (descriptor.subscription ? "https://chatgpt.com/backend-api/codex" : "https://api.openai.com/v1") : `https://api.anthropic.com/v1/messages${descriptor.subscription ? "?beta=true" : ""}`, remote: enabled, executor: descriptor.executor_id, hands: this.handsMode(scope, descriptor), event_coalesce_ms: duration(this.env.EVENT_COALESCE_MS, "EVENT_COALESCE_MS"), tools: options.tools?.definitions }, {
+            await created.open({ scope, session_id: sessionId, provider: descriptor.provider ?? "claude", model: descriptor.model ?? (descriptor.provider === "codex" ? undefined : this.env.CLAUDE_MODEL), subscription: descriptor.subscription, endpoint: descriptor.provider === "codex" ? (descriptor.subscription ? "https://chatgpt.com/backend-api/codex" : "https://api.openai.com/v1") : `https://api.anthropic.com/v1/messages${descriptor.subscription ? "?beta=true" : ""}`, ...(descriptor.provider === "codex" && WORKERS_AI_MODELS.has(descriptor.model ?? "") ? { gateway: "workers_ai" as const, cloudflare_account_id: this.env.WORKERS_AI_ACCOUNT_ID } : {}), remote: enabled, executor: descriptor.executor_id, hands: this.handsMode(scope, descriptor), event_coalesce_ms: duration(this.env.EVENT_COALESCE_MS, "EVENT_COALESCE_MS"), tools: options.tools?.definitions }, {
           tools: options.tools && {
             call: async (name, input, signal) => {
               if (this.dispatchBlocked(scope)) throw new Error("request authority stopped");

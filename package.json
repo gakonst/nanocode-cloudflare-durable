@@ -8,12 +8,12 @@
     "dev": "wrangler dev",
     "dry-run": "wrangler deploy --dry-run --outdir output/deploy",
     "deploy": "wrangler deploy",
-    "deploy:demo": "CLOUDFLARE_ACCOUNT_ID=0a39052b0a32ba8c8444345fe21b7595 wrangler deploy --name nanocode-cloudflare-durable --var CHAT_PUBLIC:1 --var CLAUDE_MODEL:claude-haiku-5-5 --var AI_GATEWAY_ID:nanocode-cloudflare-durable",
+    "deploy:demo": "CLOUDFLARE_ACCOUNT_ID=0a39052b0a32ba8c8444345fe21b7595 wrangler deploy --name nanocode-cloudflare-durable --var CHAT_PUBLIC:1 --var CLAUDE_MODEL:claude-haiku-5-5 --var AI_GATEWAY_ID:nanocode-cloudflare-durable --var WORKERS_AI_ACCOUNT_ID:0a39052b0a32ba8c8444345fe21b7595",
     "measure": "node scripts/measure-local.mjs",
     "drill": "node scripts/drill.mjs"
   },
   "dependencies": {
-    "nanocode-ts": "github:gakonst/nanocode-ts#e79b665113011d4f8808e867191bd92b9a775c20"
+    "nanocode-ts": "github:gakonst/nanocode-ts#dc7f502af663ed22e18b7e611eb2878190a30e8c"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "5.20261016.1",
