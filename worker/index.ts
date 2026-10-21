@@ -62,6 +62,7 @@ const nanocode = createNanocode<Env>({
   egress: env => aiGateway(env.AI, env.AI_GATEWAY_ID, env.OPENAI_SERVICE_TIER),
   tools: charge,
   chaos: true,
+  subagents: false,
 });
 
 export const { AgentSession } = nanocode;

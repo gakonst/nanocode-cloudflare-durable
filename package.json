@@ -13,7 +13,7 @@
     "drill": "node scripts/drill.mjs"
   },
   "dependencies": {
-    "nanocode-ts": "github:gakonst/nanocode-ts#dc7f502af663ed22e18b7e611eb2878190a30e8c"
+    "nanocode-ts": "github:gakonst/nanocode-ts#a5aa761d598215692073a15ff3707de8339e4f45"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "5.20261016.1",
