@@ -3,10 +3,11 @@ import { AgentRuntime, EventHub, HostFailure, RECENT_MODEL_LIMIT, RemoteExecutor
 import wasm from "nanocode-ts/nanocode_wasm.wasm";
 import { CheckpointStore, Metadata, SQLITE_VALUE_LIMIT_BYTES } from "./store";
 import { ExecutorRejection, connectExecutor } from "./remote";
-import { DEFAULT_EXECUTOR, EXECUTOR_ID, headerJson, json, type HostToolCall, type ModelDispatch, type PrivateBinding, type SessionDescriptor } from "./contracts";
+import { DEFAULT_EXECUTOR, EXECUTOR_ID, headerJson, json, THINKING, type HostToolCall, type ModelDispatch, type PrivateBinding, type SessionDescriptor, type Thinking } from "./contracts";
 
 export type { HostTool, ModelProvider } from "nanocode-ts";
-export type { HostToolCall, ModelDispatch, PrivateBinding, SessionAuthority, SessionDescriptor, SocketDispatch } from "./contracts";
+export type { HostToolCall, ModelDispatch, PrivateBinding, SessionAuthority, SessionDescriptor, SocketDispatch, Thinking } from "./contracts";
+export { THINKING } from "./contracts";
 
 export interface NanocodeEnv {
   SESSIONS: DurableObjectNamespace;
@@ -102,6 +103,7 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
     private readonly instances = new Map<string, Promise<AgentRuntime>>();
     private readonly runtimes = new Map<string, Promise<AgentRuntime>>();
     private readonly residents = new Map<string, AgentRuntime>();
+    private readonly efforts = new WeakMap<AgentRuntime, Thinking>();
     private readonly blocked = new Set<string>();
     private readonly driving = new Map<string, string>();
     private binding?: Promise<void>;
@@ -227,6 +229,8 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
         try { input = JSON.parse(body); } catch { return json({ error: "invalid JSON" }, 400); }
         if (typeof input?.request_id !== "string" || !input.request_id.trim() || typeof input.prompt !== "string" || !input.prompt.trim()) return json({ error: "request_id and prompt must be nonempty strings" }, 400);
         if (input.provider !== undefined && input.provider !== "claude" && input.provider !== "codex") return json({ error: "provider must be claude or codex" }, 400);
+        if (input.model !== undefined && (typeof input.model !== "string" || !input.model)) return json({ error: "model must be a nonempty model ID" }, 400);
+        if (input.thinking !== undefined && !THINKING.includes(input.thinking)) return json({ error: `thinking must be one of ${THINKING.join(", ")}` }, 400);
         if (input.executor !== undefined && (typeof input.executor !== "string" || !EXECUTOR_ID.test(input.executor))) return json({ error: "invalid executor" }, 400);
         if (input.hand !== undefined && !handName(input.hand)) return json({ error: "hand must be the name of an attached hand" }, 400);
         const streaming = request.headers.get("accept")?.includes("text/event-stream");
@@ -234,6 +238,7 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
         if (streaming && !cursor) return json({ error: "invalid event cursor" }, 400);
         const executorKey = `executor:${scope}`;
         const providerKey = `model_provider:${scope}`;
+        const modelKey = `model:${scope}`;
         const sessionKey = this.sessionKey(scope);
         const unbound = () => this.metadata.get(executorKey) === undefined && this.metadata.get(providerKey) === undefined && this.metadata.get(sessionKey) === undefined;
         while (this.binding && unbound()) await this.binding;
@@ -254,6 +259,10 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
           const rejected = await (await this.instance(scope)).admit(input.request_id, boundProvider === undefined ? null : String(boundProvider), descriptor.provider!);
           if (rejected === "reserved_request_id") return json({ error: "request_id prefix is reserved" }, 400);
           if (rejected === "provider_changed") return json({ error: "session provider is immutable; create a new session" }, 409);
+          const boundModel = this.metadata.get(modelKey) ?? (initialized ? null : undefined);
+          if (boundModel !== undefined && input.model !== undefined && input.model !== boundModel) return json({ error: "session model is immutable; create a new session" }, 409);
+          descriptor.model = input.model ?? (boundModel === null ? undefined : boundModel);
+          descriptor.thinking = input.thinking;
           if (descriptor.provider === "codex") descriptor.subscription = descriptor.codex_subscription ?? true;
           policy(this.env.RECOVERY_DELAY_MS, "RECOVERY_DELAY_MS");
           const current = this.metadata.get("authority");
@@ -265,6 +274,7 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
             this.metadata.transaction(() => {
               this.metadata.insert("authority", identity);
               this.metadata.insert(providerKey, descriptor.provider!);
+              if (descriptor.model !== undefined) this.metadata.insert(modelKey, descriptor.model);
               this.metadata.insert(executorKey, executor);
               this.sessionId(scope, descriptor.session_id);
             });
@@ -374,6 +384,18 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
           retryAt = await this.unavailable(scope, next, error instanceof HostFailure ? error : new HostFailure(error instanceof Error ? error.message : String(error), "runtime", false), delay);
           immediate = retryAt === undefined;
           return;
+        }
+        const thinking = next && !next.cancel_requested ? descriptor.thinking : undefined;
+        if (thinking && this.efforts.get(runtime) !== thinking) {
+          try {
+            await runtime.setThinking(thinking);
+            this.efforts.set(runtime, thinking);
+          } catch (error) {
+            if (active) this.blocked.delete(active);
+            retryAt = await this.unavailable(scope, next, new HostFailure(error instanceof Error ? error.message : String(error), "configuration", true), delay);
+            immediate = retryAt === undefined;
+            return;
+          }
         }
         if (!marked && !accepted) mark();
         if (preparationRequired) this.counts.preparation_writes++;
@@ -514,7 +536,7 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
           void connecting?.catch(() => {});
           try {
             const created = await this.instance(scope, true);
-            await created.open({ scope, session_id: sessionId, provider: descriptor.provider ?? "claude", model: descriptor.provider === "codex" ? undefined : this.env.CLAUDE_MODEL, subscription: descriptor.subscription, endpoint: descriptor.provider === "codex" ? (descriptor.subscription ? "https://chatgpt.com/backend-api/codex" : "https://api.openai.com/v1") : `https://api.anthropic.com/v1/messages${descriptor.subscription ? "?beta=true" : ""}`, remote: enabled, executor: descriptor.executor_id, hands: this.handsMode(scope, descriptor), event_coalesce_ms: duration(this.env.EVENT_COALESCE_MS, "EVENT_COALESCE_MS"), tools: options.tools?.definitions }, {
+            await created.open({ scope, session_id: sessionId, provider: descriptor.provider ?? "claude", model: descriptor.model ?? (descriptor.provider === "codex" ? undefined : this.env.CLAUDE_MODEL), subscription: descriptor.subscription, endpoint: descriptor.provider === "codex" ? (descriptor.subscription ? "https://chatgpt.com/backend-api/codex" : "https://api.openai.com/v1") : `https://api.anthropic.com/v1/messages${descriptor.subscription ? "?beta=true" : ""}`, remote: enabled, executor: descriptor.executor_id, hands: this.handsMode(scope, descriptor), event_coalesce_ms: duration(this.env.EVENT_COALESCE_MS, "EVENT_COALESCE_MS"), tools: options.tools?.definitions }, {
           tools: options.tools && {
             call: async (name, input, signal) => {
               if (this.dispatchBlocked(scope)) throw new Error("request authority stopped");

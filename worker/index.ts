@@ -16,6 +16,11 @@ const ACCOUNT = "owner";
 const PUBLIC_ACCOUNT = "public";
 const PUBLIC_PROMPT_CHARACTERS = 2000;
 const PUBLIC_ROUTE = /^\/sessions\/[^/]+\/(?:turns(?:\/[^/]+(?:\/cancel)?)?|events|crash)$/;
+const PUBLIC_MODELS: Record<string, readonly string[]> = {
+  "claude-haiku-5-5": ["none", "low", "medium", "high", "xhigh", "max"],
+  "claude-sonnet-5-5": ["low", "medium", "high", "xhigh", "max"],
+  "claude-opus-5-5": ["low", "medium", "high", "xhigh", "max"],
+};
 
 async function owner(request: Request, env: Env): Promise<boolean> {
   const header = request.headers.get("authorization") ?? "";
@@ -40,9 +45,13 @@ async function admit(request: Request, env: Env): Promise<Response | undefined> 
   if (!PUBLIC_ROUTE.test(pathname)) return refuse("this route needs the access token", 403);
   if (!(await env.PUBLIC_LIMITS.get(env.PUBLIC_LIMITS.idFromName(client(request.headers.get("cf-connecting-ip")!))).admit())) return refuse("too many requests, try again in a minute", 429);
   if (request.method !== "POST" || !pathname.endsWith("/turns")) return;
-  const body = await request.clone().json().catch(() => undefined) as { prompt?: unknown; provider?: unknown } | undefined;
+  const body = await request.clone().json().catch(() => undefined) as { model?: unknown; prompt?: unknown; provider?: unknown; thinking?: unknown } | undefined;
   if (typeof body?.prompt === "string" && body.prompt.length > PUBLIC_PROMPT_CHARACTERS) return refuse(`prompts are limited to ${PUBLIC_PROMPT_CHARACTERS} characters`, 413);
   if (body?.provider !== undefined && body.provider !== "claude") return refuse("this deployment serves Claude only", 403);
+  const model = String(body?.model ?? env.CLAUDE_MODEL ?? "claude-opus-5-5");
+  const efforts = PUBLIC_MODELS[model];
+  if (!efforts) return refuse(`this deployment serves ${Object.keys(PUBLIC_MODELS).join(", ")}`, 403);
+  if (body?.thinking !== undefined && !efforts.includes(String(body.thinking))) return refuse(`${model} takes ${efforts.join(", ")}`, 403);
 }
 
 const nanocode = createNanocode<Env>({

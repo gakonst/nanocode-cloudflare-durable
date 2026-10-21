@@ -1,4 +1,8 @@
-import type { ModelProvider } from "nanocode-ts";
+import type { AgentConfiguration, ModelProvider } from "nanocode-ts";
+
+export type Thinking = NonNullable<AgentConfiguration["thinking"]>;
+
+export const THINKING: readonly Thinking[] = ["none", "low", "medium", "high", "xhigh", "max"];
 
 export const EXECUTOR_ID = /^[a-z0-9][a-z0-9_-]{0,47}$/;
 export const DEFAULT_EXECUTOR = "default";
@@ -11,6 +15,8 @@ export type SessionAuthority = {
 
 export type SessionDescriptor = SessionAuthority & {
   provider?: ModelProvider;
+  model?: string;
+  thinking?: Thinking;
   session_name: string;
   subscription: boolean;
   codex_subscription?: boolean;
