@@ -8,8 +8,6 @@ const REVEAL_MS = 100;
 const FRAME_MS = 16;
 const MODELS = [
   { id: "claude-haiku-5-5", label: "Haiku 5.5", efforts: ["none", "low", "medium", "high", "xhigh", "max"], effort: "medium" },
-  { id: "claude-sonnet-5-5", label: "Sonnet 5.5", efforts: ["low", "medium", "high", "xhigh", "max"], effort: "high" },
-  { id: "claude-opus-5-5", label: "Opus 5.5", efforts: ["low", "medium", "high", "xhigh", "max"], effort: "medium" },
 ];
 
 const elements = {
