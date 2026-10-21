@@ -18,8 +18,6 @@ const PUBLIC_PROMPT_CHARACTERS = 2000;
 const PUBLIC_ROUTE = /^\/sessions\/[^/]+\/(?:turns(?:\/[^/]+(?:\/cancel)?)?|events|crash)$/;
 const PUBLIC_MODELS: Record<string, readonly string[]> = {
   "claude-haiku-5-5": ["none", "low", "medium", "high", "xhigh", "max"],
-  "claude-sonnet-5-5": ["low", "medium", "high", "xhigh", "max"],
-  "claude-opus-5-5": ["low", "medium", "high", "xhigh", "max"],
 };
 
 async function owner(request: Request, env: Env): Promise<boolean> {
