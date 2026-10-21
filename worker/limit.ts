@@ -6,12 +6,12 @@ export const PUBLIC_WINDOW_MS = 60_000;
 type Window = { start: number; count: number };
 
 export class PublicLimit extends DurableObject {
-  admit(): boolean {
+  async admit(): Promise<boolean> {
     const now = Date.now();
-    const saved = this.ctx.storage.kv.get<Window>("window");
+    const saved = await this.ctx.storage.get<Window>("window");
     const window = saved && now - saved.start < PUBLIC_WINDOW_MS ? saved : { start: now, count: 0 };
     if (window.count >= PUBLIC_REQUESTS) return false;
-    this.ctx.storage.kv.put("window", { start: window.start, count: window.count + 1 });
+    await this.ctx.storage.put("window", { start: window.start, count: window.count + 1 }, { allowUnconfirmed: true });
     return true;
   }
 }
