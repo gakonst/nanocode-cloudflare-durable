@@ -26,7 +26,7 @@
         <section aria-label="Agent" class="chat" id="chat">
           <div aria-live="polite" class="log" id="log"><p class="entry entry-tool">Ask a question to start a turn.</p></div>
           <p aria-live="polite" class="typing" id="typing"></p>
-          <label class="row">
+          <label class="row" id="access">
             <span aria-hidden="true" class="chevron">#</span>
             <input aria-label="Access token" class="input" id="token" placeholder="Access token" type="password" />
           </label>
@@ -40,7 +40,7 @@
             <button class="suggestion" data-prompt="List your tools" type="button">List your tools</button>
             <button class="suggestion" id="crash" type="button">Kill the next tool call</button>
           </div>
-          <p class="status"><span id="status">claude-opus-5-5 · new session · idle</span><button class="suggestion" id="reset" type="button">New session</button></p>
+          <p class="status"><span id="status">Claude · new session · idle</span><button class="suggestion" id="reset" type="button">New session</button></p>
         </section>
         <p><a href="/how-it-works">Read how it works →</a></p>
       </div>

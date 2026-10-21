@@ -11,6 +11,7 @@ export type { HostToolCall, ModelDispatch, PrivateBinding, SessionAuthority, Ses
 export interface NanocodeEnv {
   SESSIONS: DurableObjectNamespace;
   MODEL_AUTH?: string;
+  CLAUDE_MODEL?: string;
   RECOVERY_DELAY_MS: string;
   EVENT_STREAM_KEEPALIVE_MS: string;
   EVENT_PAGE_SIZE: string;
@@ -513,7 +514,7 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
           void connecting?.catch(() => {});
           try {
             const created = await this.instance(scope, true);
-            await created.open({ scope, session_id: sessionId, provider: descriptor.provider ?? "claude", subscription: descriptor.subscription, endpoint: descriptor.provider === "codex" ? (descriptor.subscription ? "https://chatgpt.com/backend-api/codex" : "https://api.openai.com/v1") : `https://api.anthropic.com/v1/messages${descriptor.subscription ? "?beta=true" : ""}`, remote: enabled, executor: descriptor.executor_id, hands: this.handsMode(scope, descriptor), event_coalesce_ms: duration(this.env.EVENT_COALESCE_MS, "EVENT_COALESCE_MS"), tools: options.tools?.definitions }, {
+            await created.open({ scope, session_id: sessionId, provider: descriptor.provider ?? "claude", model: descriptor.provider === "codex" ? undefined : this.env.CLAUDE_MODEL, subscription: descriptor.subscription, endpoint: descriptor.provider === "codex" ? (descriptor.subscription ? "https://chatgpt.com/backend-api/codex" : "https://api.openai.com/v1") : `https://api.anthropic.com/v1/messages${descriptor.subscription ? "?beta=true" : ""}`, remote: enabled, executor: descriptor.executor_id, hands: this.handsMode(scope, descriptor), event_coalesce_ms: duration(this.env.EVENT_COALESCE_MS, "EVENT_COALESCE_MS"), tools: options.tools?.definitions }, {
           tools: options.tools && {
             call: async (name, input, signal) => {
               if (this.dispatchBlocked(scope)) throw new Error("request authority stopped");
@@ -1063,7 +1064,8 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
     if (!principal) return json({ error: "unauthorized" }, 401);
     const account = typeof principal === "string" ? principal : principal.account;
     const url = new URL(request.url);
-    if (url.pathname === "/health") return json({ ok: true, model: "claude-opus-5-5", models: { claude: "claude-opus-5-5", codex: "gpt-6.1-sol" }, auth: env.MODEL_AUTH ?? "api_key" });
+    const claude = env.CLAUDE_MODEL ?? "claude-opus-5-5";
+    if (url.pathname === "/health") return json({ ok: true, model: claude, models: { claude, codex: "gpt-6.1-sol" }, auth: env.MODEL_AUTH ?? "api_key" });
     const head = request.method === "HEAD";
     if (url.pathname === "/metrics" && (request.method === "GET" || head)) return options.egress(env).fetch(new Request(url.searchParams.get("probe") === "codex" ? "https://egress.internal/probe/codex" : "https://egress.internal/metrics"));
     const match = /^\/sessions\/([^/]+)(?:\/(turns|events|metrics|socket|hands|crash)(?:\/([^/]+)(?:\/(cancel))?)?)?$/.exec(url.pathname);

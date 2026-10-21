@@ -8,6 +8,7 @@
     "dev": "wrangler dev",
     "dry-run": "wrangler deploy --dry-run --outdir output/deploy",
     "deploy": "wrangler deploy",
+    "deploy:demo": "wrangler deploy --name nanocode-cloudflare-durable --var CHAT_PUBLIC:1 --var CLAUDE_MODEL:claude-haiku-5-5",
     "measure": "node scripts/measure-local.mjs",
     "drill": "node scripts/drill.mjs"
   },

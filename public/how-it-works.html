@@ -35,7 +35,7 @@
                                      ▲
                                      │ alarm after a reset
                            session Durable Object ─▶ resumes the turn</pre></div>
-        <p>To try it, open the <a href="/">home page</a> with the deployment's access token, press "Kill the next tool call", then ask for a charge. The object resets during the charge, its alarm starts it again, and the agent reports that the charge may have gone through.</p>
+        <p>To try it, open the <a href="/">home page</a>, press "Kill the next tool call", then ask for a charge. The object resets during the charge, its alarm starts it again, and the agent reports that the charge may have gone through.</p>
 
         <h2>The Agent</h2>
         <p><code>createNanocode</code> returns the session Durable Object class and the Worker's <code>fetch</code> handler. The deployment passes its authentication, its model egress, its host tools and the crash route.</p>
@@ -91,7 +91,7 @@ return this.storage.transactionSync(() =&gt;
 
         <h2>Limits</h2>
         <ul>
-          <li><strong>Access:</strong> Every request to the Worker needs the deployment's access token. The pages are static assets that need none.</li>
+          <li><strong>Access:</strong> Anyone can run turns on Claude Haiku 5.5, with prompts of up to 2,000 characters and 30 session requests a minute per IP address. Metrics, the session socket and hands need the access token. The pages are static assets.</li>
           <li><strong>Recovery delay:</strong> A reset turn resumes when its alarm fires, at most <code>RECOVERY_DELAY_MS</code> after the reset, 5 s in this deployment.</li>
           <li><strong>Steering:</strong> A message sent during a turn becomes the next turn.</li>
         </ul>

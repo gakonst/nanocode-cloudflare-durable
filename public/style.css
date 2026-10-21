@@ -178,6 +178,8 @@ code, kbd, pre, samp { font: inherit; font-feature-settings: inherit; }
 
 .row { align-items: center; border-top: 1px solid var(--rule); display: flex; gap: 0.5rem; padding: 0.5rem 1rem; }
 
+.row[hidden] { display: none; }
+
 .chevron { color: var(--accent); font-variation-settings: "wght" 700; }
 
 .input { background-color: transparent; border: none; color: var(--text); flex: 1; font: inherit; resize: none; }
