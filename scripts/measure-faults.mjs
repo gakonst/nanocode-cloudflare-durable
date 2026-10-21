@@ -311,7 +311,7 @@ async function operations(name) {
   };
   try { visit(JSON.parse(state.payload)); } catch { return { unreadable: true }; }
   while (pages.length) {
-    const [record] = await sql(name, "SELECT value FROM records WHERE state_id = ? AND key = ?", root.value, pages.shift());
+    const [record] = await sql(name, "SELECT value FROM blobs WHERE state_id = ?1 AND key = ?2 UNION ALL SELECT value FROM records WHERE state_id = ?1 AND key = ?2", root.value, pages.shift());
     if (!record?.value?.startsWith("=")) return { unreadable: true };
     const page = JSON.parse(record.value.slice(1));
     collect(page.operations ?? {});

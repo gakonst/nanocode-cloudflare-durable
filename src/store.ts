@@ -84,8 +84,9 @@ export class CheckpointStore implements SqlHost {
   }
 
   persisted(scope: string): Row | undefined {
-    const tables = new Set(this.storage.sql.exec("SELECT name FROM sqlite_schema WHERE type = 'table' AND name IN ('records', 'turns')").toArray().map(row => row.name));
-    const stored = tables.has("records") ? "(SELECT COUNT(*) FROM states) AS states, (SELECT COUNT(*) FROM records) AS records" : "0 AS states, 0 AS records";
+    const tables = new Set(this.storage.sql.exec("SELECT name FROM sqlite_schema WHERE type = 'table' AND name IN ('records', 'blobs', 'turns')").toArray().map(row => row.name));
+    const count = (table: string) => tables.has(table) ? `(SELECT COUNT(*) FROM ${table})` : "0";
+    const stored = tables.has("records") ? `(SELECT COUNT(*) FROM states) AS states, ${count("records")} + ${count("blobs")} AS records` : "0 AS states, 0 AS records";
     if (!tables.has("turns")) return this.row(`SELECT ${stored}, 0 AS unfinished`);
     return this.row(`SELECT ${stored}, (SELECT COUNT(*) FROM turns WHERE scope = ? AND status IN ('queued', 'running')) AS unfinished`, scope);
   }
