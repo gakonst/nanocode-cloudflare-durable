@@ -3,6 +3,8 @@
 /dist/
 /.wrangler/
 /output/
+/public/client.js
+/public/models.js
 /.dev.vars
 /.dev.vars.*
 /.env

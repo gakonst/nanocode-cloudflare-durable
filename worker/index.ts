@@ -1,6 +1,7 @@
 import { createNanocode, type NanocodeEnv } from "../src/index";
 import { aiGateway } from "./gateway";
 import { client, PublicLimit } from "./limit";
+import { PUBLIC_MODELS } from "./models";
 import { charge } from "./tools";
 
 interface Env extends NanocodeEnv {
@@ -17,13 +18,6 @@ const ACCOUNT = "owner";
 const PUBLIC_ACCOUNT = "public";
 const PUBLIC_PROMPT_CHARACTERS = 2000;
 const PUBLIC_ROUTE = /^\/sessions\/[^/]+\/(?:turns(?:\/[^/]+(?:\/cancel)?)?|events|crash|warm)$/;
-const PUBLIC_MODELS: Record<string, { provider: "claude" | "codex"; efforts: readonly string[] }> = {
-  "claude-haiku-5-5": { provider: "claude", efforts: ["none", "low", "medium", "high", "xhigh", "max"] },
-  "claude-sonnet-5-5": { provider: "claude", efforts: ["low", "medium", "high", "xhigh", "max"] },
-  "gpt-6-luna": { provider: "codex", efforts: ["none", "low", "medium", "high", "xhigh", "max"] },
-  "gpt-6.1-sol": { provider: "codex", efforts: ["low", "medium", "high", "xhigh", "max"] },
-  "glm-5.3": { provider: "codex", efforts: ["low", "medium", "high"] },
-};
 
 async function owner(request: Request, env: Env): Promise<boolean> {
   const header = request.headers.get("authorization") ?? "";
