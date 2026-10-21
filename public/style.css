@@ -138,6 +138,22 @@ code, kbd, pre, samp { font: inherit; font-feature-settings: inherit; }
 
 .dot { color: var(--accent); }
 
+.demos { align-items: center; column-gap: var(--cell); display: flex; flex-wrap: wrap; row-gap: 0.25rem; }
+
+.toggle { border: 1px solid var(--rule); display: inline-flex; }
+
+.page .demo { align-items: center; display: flex; gap: var(--cell); padding: 0.25rem var(--cell); text-decoration-line: none; }
+
+.demo + .demo { border-left: 1px solid var(--rule); }
+
+.demo:hover { background-color: var(--accent); color: var(--on-accent); }
+
+.demo:active { background-color: var(--text); color: var(--bg); }
+
+.demo[aria-current="page"]:not(:hover) { background-color: var(--text); box-shadow: inset 0 -2px 0 var(--accent); color: var(--bg); }
+
+.logo { fill: currentColor; flex-shrink: 0; height: 1em; width: auto; }
+
 .lead { max-width: 54ch; }
 
 .key {
