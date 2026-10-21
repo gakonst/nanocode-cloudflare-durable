@@ -16,8 +16,15 @@
     <meta property="og:title" content="nanocode on Cloudflare" />
     <meta property="og:type" content="website" />
     <meta property="og:url" content="https://nanocode.xyz/cloudflare/" />
-    <meta name="twitter:card" content="summary_large_image" />
-    <meta name="twitter:image" content="https://nanocode.xyz/og/cloudflare.png" />
+    <meta name="twitter:card" content="player" />
+    <meta name="twitter:description" content="nanocode agents made durable in Cloudflare Durable Objects with nanocode-ts." />
+    <meta name="twitter:image" content="https://nanocode.xyz/player/cloudflare.jpg" />
+    <meta name="twitter:player" content="https://nanocode.xyz/cloudflare/" />
+    <meta name="twitter:player:height" content="480" />
+    <meta name="twitter:player:width" content="480" />
+    <meta name="twitter:site" content="@nanocodexyz" />
+    <meta name="twitter:title" content="nanocode on Cloudflare" />
+    <script>if (self !== top) document.documentElement.setAttribute("data-xframe", "");</script>
     <link rel="icon" href="favicon.svg" />
     <link as="font" crossorigin="" href="fonts/CommitMono-VF.woff2" rel="preload" type="font/woff2" />
     <link rel="stylesheet" href="style.css" />
@@ -54,17 +61,17 @@
             <input aria-label="Access token" class="input" id="token" placeholder="Access token" type="password" />
           </label>
           <div class="picker" hidden id="picker" role="listbox"></div>
-          <form class="row" id="form">
+          <div class="row">
             <span aria-hidden="true" class="chevron">❯</span>
             <textarea aria-label="Prompt" class="input" id="prompt" placeholder="Ask the agent, or type / for commands" rows="1"></textarea>
-            <button class="send" id="send" type="submit"><kbd class="key">ENTER</kbd></button>
-          </form>
+            <button class="send" id="send" type="button"><kbd class="key">ENTER</kbd></button>
+          </div>
           <div class="suggestions" id="suggestions">
             <button class="suggestion" data-prompt="Charge me $42" type="button">Charge me $42</button>
             <button class="suggestion" data-prompt="List your tools" type="button">List your tools</button>
             <button class="suggestion" id="crash" type="button">Kill the next tool call</button>
           </div>
-          <p class="status"><span id="status">Claude · new session · idle</span><button class="suggestion" id="reset" type="button">New session</button></p>
+          <p class="status"><span id="status">Claude · new session · idle</span><button class="suggestion" id="reset" type="button">New session</button><a class="site" href="https://nanocode.xyz/" rel="noreferrer" target="_blank">nanocode.xyz →</a></p>
         </section>
         <p><a href="how-it-works">Read how it works →</a></p>
       </div>

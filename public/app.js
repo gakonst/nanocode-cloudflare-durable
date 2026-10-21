@@ -19,7 +19,6 @@ const elements = {
   access: document.getElementById("access"),
   chat: document.getElementById("chat"),
   crash: document.getElementById("crash"),
-  form: document.getElementById("form"),
   log: document.getElementById("log"),
   picker: document.getElementById("picker"),
   prompt: document.getElementById("prompt"),
@@ -405,10 +404,7 @@ async function crash() {
 elements.token.value = localStorage.getItem(TOKEN) ?? "";
 elements.token.addEventListener("input", () => localStorage.setItem(TOKEN, elements.token.value));
 elements.token.addEventListener("change", () => void configure());
-elements.form.addEventListener("submit", event => {
-  event.preventDefault();
-  void ask(elements.prompt.value.trim());
-});
+elements.send.addEventListener("click", () => void ask(elements.prompt.value.trim()));
 elements.prompt.addEventListener("input", () => {
   if (picker?.kind === "model") highlight = 0;
   renderMenu();
@@ -440,7 +436,7 @@ elements.prompt.addEventListener("keydown", event => {
   }
   if (event.key !== "Enter" || event.shiftKey) return;
   event.preventDefault();
-  elements.form.requestSubmit();
+  void ask(elements.prompt.value.trim());
 });
 for (const suggestion of elements.suggestions) suggestion.addEventListener("click", () => void ask(suggestion.dataset.prompt));
 elements.crash.addEventListener("click", () => void crash());
