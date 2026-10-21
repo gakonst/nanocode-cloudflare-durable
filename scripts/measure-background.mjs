@@ -391,7 +391,7 @@ try {
   const final = await settled("bg-final");
   check(final.state.status === "completed" && final.state.ok?.session_id === root, "later root job completed in the same SDK session", final.state);
   await until(async () => await marker() === 0, "Background marker was not cleared after cancellation scenario");
-  const persisted = await sql("SELECT payload FROM states UNION ALL SELECT value AS payload FROM records UNION ALL SELECT body AS payload FROM events UNION ALL SELECT metadata AS payload FROM turns UNION ALL SELECT prompt AS payload FROM turns");
+  const persisted = await sql("SELECT payload FROM states UNION ALL SELECT value AS payload FROM records UNION ALL SELECT value AS payload FROM blobs UNION ALL SELECT body AS payload FROM events UNION ALL SELECT metadata AS payload FROM turns UNION ALL SELECT prompt AS payload FROM turns");
   check(!JSON.stringify(persisted).includes("local-provider"), "provider credential absent from agent persistence");
   check(anomalies.length === 0, "provider saw only expected requests", anomalies);
   check(!calls.some(call => call.duplicate), "no model request repeated a prompt inside one turn", calls.filter(call => call.duplicate).map(({ phase, actor, kind }) => ({ phase, actor, kind })), false);
