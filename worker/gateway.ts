@@ -10,10 +10,10 @@ function json(value: unknown, status = 200): Response {
   return Response.json(value, { status, headers: { "cache-control": "no-store" } });
 }
 
-function shape(query: unknown): { input_items: number; continued: boolean } {
-  const body = typeof query === "object" && query !== null ? query as { input?: unknown; messages?: unknown; previous_response_id?: unknown } : {};
+function shape(query: unknown): { input_items: number; continued: boolean; model?: unknown; effort?: unknown } {
+  const body = typeof query === "object" && query !== null ? query as { input?: unknown; messages?: unknown; previous_response_id?: unknown; model?: unknown; output_config?: { effort?: unknown }; reasoning?: { effort?: unknown }; thinking?: { type?: unknown } } : {};
   const items = Array.isArray(body.input) ? body.input : Array.isArray(body.messages) ? body.messages : [];
-  return { input_items: items.length, continued: typeof body.previous_response_id === "string" };
+  return { input_items: items.length, continued: typeof body.previous_response_id === "string", model: body.model, effort: body.output_config?.effort ?? body.reasoning?.effort ?? (body.thinking?.type === "disabled" ? "none" : undefined) };
 }
 
 function modelError(provider: ModelProvider, status: number, type: string, message: string): Response {
