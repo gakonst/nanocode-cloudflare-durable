@@ -233,6 +233,12 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
         if (input.thinking !== undefined && !THINKING.includes(input.thinking)) return json({ error: `thinking must be one of ${THINKING.join(", ")}` }, 400);
         if (input.executor !== undefined && (typeof input.executor !== "string" || !EXECUTOR_ID.test(input.executor))) return json({ error: "invalid executor" }, 400);
         if (input.hand !== undefined && !handName(input.hand)) return json({ error: "hand must be the name of an attached hand" }, 400);
+        if (input.steer !== undefined && typeof input.steer !== "boolean") return json({ error: "steer must be a boolean" }, 400);
+        if (input.steer) {
+          const resident = this.residents.get(scope);
+          if (resident && this.driving.has(scope) && await resident.steer(input.request_id, input.prompt)) return json({ request_id: input.request_id, status: "steered" });
+          return json({ error: "no running turn takes steering; submit the message as a turn" }, 409);
+        }
         const streaming = request.headers.get("accept")?.includes("text/event-stream");
         const cursor = streaming ? this.cursor(url, request) : undefined;
         if (streaming && !cursor) return json({ error: "invalid event cursor" }, 400);
