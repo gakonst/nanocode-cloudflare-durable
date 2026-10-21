@@ -313,3 +313,5 @@ code, kbd, pre, samp { font: inherit; font-feature-settings: inherit; }
 .card:active { background-color: var(--text); color: var(--bg); }
 
 .card-title { font-variation-settings: "wght" 700; }
+
+.entry .code { background: var(--surface); border: 1px solid var(--rule); color: var(--text); margin-block: 0.5rem; }
