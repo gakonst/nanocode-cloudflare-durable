@@ -16,6 +16,7 @@
   ],
   "vars": {
     "AI_GATEWAY_ID": "default",
+    "OPENAI_SERVICE_TIER": "",
     "ACCESS_TOKEN_SHA256": "",
     "CHAT_PUBLIC": "",
     "MODEL_AUTH": "api_key",

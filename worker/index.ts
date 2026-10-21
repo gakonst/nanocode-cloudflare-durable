@@ -6,6 +6,7 @@ import { charge } from "./tools";
 interface Env extends NanocodeEnv {
   AI: Ai;
   AI_GATEWAY_ID: string;
+  OPENAI_SERVICE_TIER: string;
   ACCESS_TOKEN_SHA256: string;
   CHAT_PUBLIC: string;
   PUBLIC_LIMITS: DurableObjectNamespace<PublicLimit>;
@@ -15,7 +16,7 @@ const DIGEST = /^[0-9a-f]{64}$/;
 const ACCOUNT = "owner";
 const PUBLIC_ACCOUNT = "public";
 const PUBLIC_PROMPT_CHARACTERS = 2000;
-const PUBLIC_ROUTE = /^\/sessions\/[^/]+\/(?:turns(?:\/[^/]+(?:\/cancel)?)?|events|crash)$/;
+const PUBLIC_ROUTE = /^\/sessions\/[^/]+\/(?:turns(?:\/[^/]+(?:\/cancel)?)?|events|crash|warm)$/;
 const PUBLIC_MODELS: Record<string, { provider: "claude" | "codex"; efforts: readonly string[] }> = {
   "claude-haiku-5-5": { provider: "claude", efforts: ["none", "low", "medium", "high", "xhigh", "max"] },
   "claude-sonnet-5-5": { provider: "claude", efforts: ["low", "medium", "high", "xhigh", "max"] },
@@ -46,7 +47,7 @@ async function admit(request: Request, env: Env): Promise<Response | undefined> 
   if (pathname === "/health") return;
   if (!PUBLIC_ROUTE.test(pathname)) return refuse("this route needs the access token", 403);
   if (!(await env.PUBLIC_LIMITS.get(env.PUBLIC_LIMITS.idFromName(client(request.headers.get("cf-connecting-ip")!))).admit())) return refuse("too many requests, try again in a minute", 429);
-  if (request.method !== "POST" || !pathname.endsWith("/turns")) return;
+  if (request.method !== "POST" || !/\/(?:turns|warm)$/.test(pathname)) return;
   const body = await request.clone().json().catch(() => undefined) as { model?: unknown; prompt?: unknown; provider?: unknown; thinking?: unknown } | undefined;
   if (typeof body?.prompt === "string" && body.prompt.length > PUBLIC_PROMPT_CHARACTERS) return refuse(`prompts are limited to ${PUBLIC_PROMPT_CHARACTERS} characters`, 413);
   const provider = body?.provider ?? "claude";
@@ -58,7 +59,7 @@ async function admit(request: Request, env: Env): Promise<Response | undefined> 
 
 const nanocode = createNanocode<Env>({
   authenticate,
-  egress: env => aiGateway(env.AI, env.AI_GATEWAY_ID),
+  egress: env => aiGateway(env.AI, env.AI_GATEWAY_ID, env.OPENAI_SERVICE_TIER),
   tools: charge,
   chaos: true,
 });

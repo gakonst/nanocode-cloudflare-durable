@@ -5,6 +5,7 @@ const RESULT_CHARACTERS = 160;
 const TYPING_DELAY_MS = 500;
 const CRASH_AFTER_MS = 1500;
 const REVEAL_MS = 30;
+const WARM_MS = 10000;
 const FRAME_MS = 16;
 const EVERY = ["none", "low", "medium", "high", "xhigh", "max"];
 const THINKING = ["low", "medium", "high", "xhigh", "max"];
@@ -42,6 +43,7 @@ let typingTimer;
 let picker = null;
 let highlight = 0;
 let warmed;
+let used = 0;
 let queued = [];
 let stream = { posted: 0, shown: 0, text: "" };
 let live;
@@ -400,6 +402,7 @@ function reset() {
   picker = null;
   queued = [];
   warmed = undefined;
+  used = 0;
   const { model, thinking } = state;
   localStorage.removeItem(KEY);
   state = { ...load(), model, thinking };
@@ -455,6 +458,7 @@ async function ask(text, echoed = false) {
   if (!text || command(text)) return;
   if (busy) return void steer(text);
   state.session ??= warmed ?? identifier("web");
+  used = performance.now();
   const requestId = identifier("turn");
   state.open = requestId;
   elements.prompt.value = "";
@@ -470,6 +474,7 @@ async function ask(text, echoed = false) {
     enqueue({
       run: () => {
         state.open = undefined;
+        used = performance.now();
         save();
         setBusy(false);
         const next = queued.shift();
@@ -522,9 +527,11 @@ elements.form.addEventListener("submit", event => {
 elements.prompt.addEventListener("input", () => {
   if (picker?.kind === "model") highlight = 0;
   renderMenu();
-  if (state.session || warmed || elements.prompt.value.startsWith("/")) return;
-  warmed = identifier("web");
-  void fetch(`sessions/${encodeURIComponent(warmed)}/turns/warm`, { headers: headers() }).catch(() => undefined);
+  if (busy || elements.prompt.value.startsWith("/") || (used && performance.now() - used < WARM_MS)) return;
+  used = performance.now();
+  const session = state.session ?? (warmed ??= identifier("web"));
+  const model = current();
+  void fetch(`sessions/${encodeURIComponent(session)}/warm`, { method: "POST", headers: headers({ "content-type": "application/json" }), body: JSON.stringify({ provider: harnessOf(model).id, model: model.id }) }).catch(() => undefined);
 });
 elements.prompt.addEventListener("keydown", event => {
   const choices = menuItems().filter(item => item.kind === "choice");
