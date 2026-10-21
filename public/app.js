@@ -4,7 +4,7 @@ const RECONNECT_MS = 1000;
 const RESULT_CHARACTERS = 160;
 const TYPING_DELAY_MS = 500;
 const CRASH_AFTER_MS = 1500;
-const REVEAL_MS = 100;
+const REVEAL_MS = 30;
 const FRAME_MS = 16;
 const EVERY = ["none", "low", "medium", "high", "xhigh", "max"];
 const THINKING = ["low", "medium", "high", "xhigh", "max"];
@@ -41,6 +41,7 @@ let typing = false;
 let typingTimer;
 let picker = null;
 let highlight = 0;
+let warmed;
 let queued = [];
 let stream = { posted: 0, shown: 0, text: "" };
 let live;
@@ -398,6 +399,7 @@ function reset() {
   live = undefined;
   picker = null;
   queued = [];
+  warmed = undefined;
   const { model, thinking } = state;
   localStorage.removeItem(KEY);
   state = { ...load(), model, thinking };
@@ -452,7 +454,7 @@ async function steer(text) {
 async function ask(text, echoed = false) {
   if (!text || command(text)) return;
   if (busy) return void steer(text);
-  state.session ??= identifier("web");
+  state.session ??= warmed ?? identifier("web");
   const requestId = identifier("turn");
   state.open = requestId;
   elements.prompt.value = "";
@@ -520,6 +522,9 @@ elements.form.addEventListener("submit", event => {
 elements.prompt.addEventListener("input", () => {
   if (picker?.kind === "model") highlight = 0;
   renderMenu();
+  if (state.session || warmed || elements.prompt.value.startsWith("/")) return;
+  warmed = identifier("web");
+  void fetch(`sessions/${encodeURIComponent(warmed)}/turns/warm`, { headers: headers() }).catch(() => undefined);
 });
 elements.prompt.addEventListener("keydown", event => {
   const choices = menuItems().filter(item => item.kind === "choice");
