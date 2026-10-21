@@ -166,9 +166,9 @@ async function follow(response, requestId) {
 }
 
 async function configure() {
-  const open = await fetch("/health").catch(() => undefined);
+  const open = await fetch("health").catch(() => undefined);
   elements.access.hidden = open?.ok === true;
-  const health = open?.ok ? open : await fetch("/health", { headers: headers() }).catch(() => undefined);
+  const health = open?.ok ? open : await fetch("health", { headers: headers() }).catch(() => undefined);
   if (health?.ok) model = (await health.json()).models.claude;
   render();
 }
@@ -180,7 +180,7 @@ function headers(extra = {}) {
 
 async function reconnect(requestId) {
   for (;;) {
-    const response = await fetch(`/sessions/${encodeURIComponent(state.session)}/events?after=${state.cursor ?? 0}`, { headers: headers({ accept: "text/event-stream" }) }).catch(() => undefined);
+    const response = await fetch(`sessions/${encodeURIComponent(state.session)}/events?after=${state.cursor ?? 0}`, { headers: headers({ accept: "text/event-stream" }) }).catch(() => undefined);
     if (response && await follow(response, requestId)) return;
     await new Promise(resolve => setTimeout(resolve, RECONNECT_MS));
   }
@@ -195,7 +195,7 @@ async function ask(text) {
   add({ kind: "user", text });
   setBusy(true);
   try {
-    const response = await fetch(`/sessions/${encodeURIComponent(state.session)}/turns?after=${state.cursor ?? 0}`, { method: "POST", headers: headers({ accept: "text/event-stream", "content-type": "application/json" }), body: JSON.stringify({ request_id: requestId, prompt: text }) });
+    const response = await fetch(`sessions/${encodeURIComponent(state.session)}/turns?after=${state.cursor ?? 0}`, { method: "POST", headers: headers({ accept: "text/event-stream", "content-type": "application/json" }), body: JSON.stringify({ request_id: requestId, prompt: text }) });
     if (!(await follow(response, requestId))) await reconnect(requestId);
   } catch (error) {
     add({ kind: "error", text: error instanceof Error ? error.message : String(error) });
@@ -208,7 +208,7 @@ async function ask(text) {
 
 async function crash() {
   if (!state.session) return add({ kind: "error", text: "Start a session before arming a crash." });
-  const response = await fetch(`/sessions/${encodeURIComponent(state.session)}/crash`, { method: "POST", headers: headers({ "content-type": "application/json" }), body: JSON.stringify({ after_ms: CRASH_AFTER_MS }) });
+  const response = await fetch(`sessions/${encodeURIComponent(state.session)}/crash`, { method: "POST", headers: headers({ "content-type": "application/json" }), body: JSON.stringify({ after_ms: CRASH_AFTER_MS }) });
   add(response.ok ? { kind: "tool", text: "Armed: the next tool call resets its Durable Object 1.5 s in." } : { kind: "error", text: `${response.status} ${await response.text()}` });
 }
 

@@ -5,15 +5,15 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>How It Works · nanocode on Cloudflare</title>
     <meta name="description" content="How nanocode on Cloudflare keeps a session in a Durable Object, and how a turn survives the object's reset." />
-    <link rel="icon" href="/favicon.svg" />
-    <link as="font" crossorigin="" href="/fonts/CommitMono-VF.woff2" rel="preload" type="font/woff2" />
-    <link rel="stylesheet" href="/style.css" />
+    <link rel="icon" href="favicon.svg" />
+    <link as="font" crossorigin="" href="fonts/CommitMono-VF.woff2" rel="preload" type="font/woff2" />
+    <link rel="stylesheet" href="style.css" />
   </head>
   <body>
     <header class="header">
       <nav aria-label="Site" class="navigation">
-        <a href="/">01 Home</a>
-        <a aria-current="page" href="/how-it-works">02 How it works</a>
+        <a href="./">01 Home</a>
+        <a aria-current="page" href="how-it-works">02 How it works</a>
         <a href="https://nanocode.xyz" rel="noreferrer">03 nanocode</a>
         <a href="https://github.com/gakonst/nanocode-ts" rel="noreferrer">04 nanocode-ts</a>
         <a href="https://github.com/gakonst/nanocode-cloudflare-durable" rel="noreferrer">05 GitHub</a>
@@ -35,7 +35,7 @@
                                      ▲
                                      │ alarm after a reset
                            session Durable Object ─▶ resumes the turn</pre></div>
-        <p>To try it, open the <a href="/">home page</a>, press "Kill the next tool call", then ask for a charge. The object resets during the charge, its alarm starts it again, and the agent reports that the charge may have gone through.</p>
+        <p>To try it, open the <a href="./">home page</a>, press "Kill the next tool call", then ask for a charge. The object resets during the charge, its alarm starts it again, and the agent reports that the charge may have gone through.</p>
 
         <h2>The Agent</h2>
         <p><code>createNanocode</code> returns the session Durable Object class and the Worker's <code>fetch</code> handler. The deployment passes its authentication, its model egress, its host tools and the crash route.</p>
@@ -102,7 +102,7 @@ return this.storage.transactionSync(() =&gt;
         <div class="cards">
           <a class="card" href="https://github.com/gakonst/nanocode-cloudflare-durable"><span class="card-title">Source →</span><span>The Worker, the session object, the app and the drill.</span></a>
           <a class="card" href="https://github.com/gakonst/nanocode-ts"><span class="card-title">nanocode-ts →</span><span>The runtime and its Durable Object SqlHost.</span></a>
-          <a class="card" href="https://nanocode-vercel-durable.vercel.app"><span class="card-title">nanocode on Vercel →</span><span>The same agent on durable-harness in Vercel Functions.</span></a>
+          <a class="card" href="https://nanocode.xyz/vercel"><span class="card-title">nanocode on Vercel →</span><span>The same agent on durable-harness in Vercel Functions.</span></a>
           <a class="card" href="https://nanocode.xyz/docs/introduction/getting-started"><span class="card-title">nanocode docs →</span><span>The SDK, its runtime and its hosts.</span></a>
         </div>
       </article>
