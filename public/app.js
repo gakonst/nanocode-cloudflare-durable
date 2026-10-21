@@ -1,5 +1,6 @@
 import { liveEvent, modelItems as models, serverEvents, thinkingItems as levels, Transcript } from "./client.js";
 import { harnesses as HARNESSES } from "./models.js";
+import { reply } from "./syntax.js";
 
 const KEY = "nanocode-cloudflare-durable";
 const TOKEN = `${KEY}:token`;
@@ -86,7 +87,9 @@ function render() {
       speaker.prepend(dot);
       turn.append(speaker);
     }
-    turn.append(paragraph(`entry entry-${entry.kind}${entry === live ? " entry-live" : ""}`, entry.kind === "reasoning" ? entry.text.replace(/\*\*(.+?)\*\*/g, "$1") : entry.text));
+    const body = entry.kind === "assistant" ? reply(entry.text) : paragraph("", entry.kind === "reasoning" ? entry.text.replace(/\*\*(.+?)\*\*/g, "$1") : entry.text);
+    body.className = `entry entry-${entry.kind}${entry === live ? " entry-live" : ""}`;
+    turn.append(body);
     return turn;
   })));
   elements.log.scrollTo({ top: elements.log.scrollHeight });

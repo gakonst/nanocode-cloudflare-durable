@@ -3,8 +3,8 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "build": "tsc --noEmit",
-    "check": "tsc --noEmit",
+    "build": "node scripts/build-syntax.mjs && npm run check",
+    "check": "tsc --noEmit && tsc --project tsconfig.ui.json",
     "dev": "wrangler dev",
     "dry-run": "wrangler deploy --dry-run --outdir output/deploy",
     "deploy": "wrangler deploy",
@@ -13,10 +13,12 @@
     "drill": "node scripts/drill.mjs"
   },
   "dependencies": {
+    "@pierre/highlights": "0.2.0",
     "nanocode-ts": "https://github.com/gakonst/nanocode-ts/releases/download/build-7fab7d8/nanocode-ts-7fab7d8.tgz"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "5.20261016.1",
+    "esbuild": "0.28.2",
     "typescript": "6.0.2",
     "wrangler": "4.151.1"
   },

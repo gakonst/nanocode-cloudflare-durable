@@ -9,3 +9,6 @@
 /.dev.vars.*
 /.env
 /.env.*
+
+/public/syntax.js
+/public/syntax/
