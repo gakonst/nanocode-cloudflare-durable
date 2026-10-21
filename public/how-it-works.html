@@ -65,7 +65,7 @@ return this.storage.transactionSync(() =&gt;
         <ul>
           <li><strong>Turns:</strong> A turn is a row in nanocode's turn inbox, keyed by its request id. A second request with the same id and prompt returns the same turn.</li>
           <li><strong>Tools:</strong> Before a host tool runs, the object waits for its storage to sync, so the tool's receipt is durable. After a reset, nanocode reports an interrupted call to the model as an unknown outcome.</li>
-          <li><strong>Models:</strong> The egress sends nanocode's requests to AI Gateway, which holds the provider credential. The Worker sends none.</li>
+          <li><strong>Models:</strong> The egress sends nanocode's requests to AI Gateway through the AI binding, and AI Gateway pays the provider from the account's Unified Billing credits. The Worker holds no provider key.</li>
           <li><strong>Events:</strong> nanocode logs every event in SQLite. A client streams them as server-sent events and resumes after the last event id it read.</li>
         </ul>
 
@@ -84,6 +84,8 @@ return this.storage.transactionSync(() =&gt;
           <thead><tr><th>Measurement</th><th>Result</th></tr></thead>
           <tbody>
             <tr><td>Drill on local workerd, 2026-10-20, alarm after 1 s</td><td>Reset at 2.0 s, turn completed at 2.5 s, one charge</td></tr>
+            <tr><td>Deployed Haiku turn, 2026-10-21</td><td>3.5 s on a new session, 1.1 s on the next turn</td></tr>
+            <tr><td>Deployed crash during the charge, 2026-10-21</td><td>Turn completed 7.3 s after submission, one charge</td></tr>
             <tr><td>Deployed Codex turn, 2026-10-19</td><td>6.8 s on a new session, 2.1 s on the next turn</td></tr>
             <tr><td>Deployed Claude turn, 2026-10-19</td><td>5.0 s from submission</td></tr>
           </tbody>
