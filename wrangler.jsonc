@@ -4,14 +4,15 @@
   "compatibility_date": "2026-10-16",
   "assets": { "directory": "./public" },
   "ai": { "binding": "AI" },
-  "ratelimits": [{ "name": "PUBLIC_LIMIT", "namespace_id": "1001", "simple": { "limit": 30, "period": 60 } }],
   "durable_objects": {
     "bindings": [
-      { "name": "SESSIONS", "class_name": "AgentSession" }
+      { "name": "SESSIONS", "class_name": "AgentSession" },
+      { "name": "PUBLIC_LIMITS", "class_name": "PublicLimit" }
     ]
   },
   "migrations": [
-    { "tag": "v1", "new_sqlite_classes": ["AgentSession"] }
+    { "tag": "v1", "new_sqlite_classes": ["AgentSession"] },
+    { "tag": "v2", "new_sqlite_classes": ["PublicLimit"] }
   ],
   "vars": {
     "AI_GATEWAY_ID": "default",

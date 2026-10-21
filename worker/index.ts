@@ -1,5 +1,6 @@
 import { createNanocode, type NanocodeEnv } from "../src/index";
 import { aiGateway } from "./gateway";
+import { client, PublicLimit } from "./limit";
 import { charge } from "./tools";
 
 interface Env extends NanocodeEnv {
@@ -7,7 +8,7 @@ interface Env extends NanocodeEnv {
   AI_GATEWAY_ID: string;
   ACCESS_TOKEN_SHA256: string;
   CHAT_PUBLIC: string;
-  PUBLIC_LIMIT: RateLimit;
+  PUBLIC_LIMITS: DurableObjectNamespace<PublicLimit>;
 }
 
 const DIGEST = /^[0-9a-f]{64}$/;
@@ -37,7 +38,7 @@ async function admit(request: Request, env: Env): Promise<Response | undefined> 
   const { pathname } = new URL(request.url);
   if (pathname === "/health") return;
   if (!PUBLIC_ROUTE.test(pathname)) return refuse("this route needs the access token", 403);
-  if (!(await env.PUBLIC_LIMIT.limit({ key: request.headers.get("cf-connecting-ip")! })).success) return refuse("too many requests, try again in a minute", 429);
+  if (!(await env.PUBLIC_LIMITS.get(env.PUBLIC_LIMITS.idFromName(client(request.headers.get("cf-connecting-ip")!))).admit())) return refuse("too many requests, try again in a minute", 429);
   if (request.method !== "POST" || !pathname.endsWith("/turns")) return;
   const body = await request.clone().json().catch(() => undefined) as { prompt?: unknown; provider?: unknown } | undefined;
   if (typeof body?.prompt === "string" && body.prompt.length > PUBLIC_PROMPT_CHARACTERS) return refuse(`prompts are limited to ${PUBLIC_PROMPT_CHARACTERS} characters`, 413);
@@ -52,6 +53,7 @@ const nanocode = createNanocode<Env>({
 });
 
 export const { AgentSession } = nanocode;
+export { PublicLimit };
 
 export default {
   async fetch(request, env) {
