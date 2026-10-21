@@ -8,7 +8,7 @@
     "dev": "wrangler dev",
     "dry-run": "wrangler deploy --dry-run --outdir output/deploy",
     "deploy": "wrangler deploy",
-    "deploy:demo": "CLOUDFLARE_ACCOUNT_ID=0a39052b0a32ba8c8444345fe21b7595 wrangler deploy --name nanocode-cloudflare-durable --var CHAT_PUBLIC:1 --var CLAUDE_MODEL:claude-haiku-5-5 --var AI_GATEWAY_ID:nanocode-cloudflare-durable --var WORKERS_AI_ACCOUNT_ID:0a39052b0a32ba8c8444345fe21b7595",
+    "deploy:demo": "CLOUDFLARE_ACCOUNT_ID=0a39052b0a32ba8c8444345fe21b7595 wrangler deploy --name nanocode-cloudflare-durable --var CHAT_PUBLIC:1 --var CLAUDE_MODEL:claude-haiku-5-5 --var AI_GATEWAY_ID:nanocode-cloudflare-durable --var WORKERS_AI_ACCOUNT_ID:0a39052b0a32ba8c8444345fe21b7595 --var OPENAI_SERVICE_TIER:priority",
     "measure": "node scripts/measure-local.mjs",
     "drill": "node scripts/drill.mjs"
   },

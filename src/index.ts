@@ -214,6 +214,20 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
           return this.attachHand(scope, parts.length === 4 ? decodeURIComponent(parts[3]) : undefined, request, descriptor);
         }
         if (parts[2] === "cancel" && parts.length === 4 && request.method === "POST") return await this.cancel(decodeURIComponent(parts[3]), scope);
+        if (parts[2] === "warm") {
+          if (request.method !== "POST") return json({ error: "method not allowed" }, 405);
+          const input = await request.json().catch(() => null) as { provider?: unknown; model?: unknown } | null;
+          const provider = this.metadata.get(`model_provider:${scope}`) ?? input?.provider ?? "claude";
+          if (provider !== "claude" && provider !== "codex") return json({ error: "provider must be claude or codex" }, 400);
+          const model = this.metadata.get(`model:${scope}`) ?? (typeof input?.model === "string" && input.model ? input.model : provider === "codex" ? "gpt-6.1-sol" : this.env.CLAUDE_MODEL ?? "claude-opus-5-5");
+          if (provider === "codex" && WORKERS_AI_MODELS.has(model)) {
+            await this.instance(scope);
+            return new Response(null, { status: 204 });
+          }
+          const [, warmed] = await Promise.all([this.instance(scope), options.egress(this.env).fetch(new Request("https://egress.internal/warm", { method: "POST", headers: { "x-nanocode-model": headerJson({ provider, model }) } }))]);
+          await warmed.body?.cancel();
+          return new Response(null, { status: warmed.ok ? 204 : warmed.status });
+        }
         if (parts[2] === "crash" && options.chaos && request.method === "POST") {
           const after = Number(((await request.json().catch(() => null)) as { after_ms?: unknown } | null)?.after_ms ?? 0);
           if (!Number.isSafeInteger(after) || after < 0) return json({ error: "after_ms must be a nonnegative integer" }, 400);
@@ -1099,7 +1113,7 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
     if (url.pathname === "/health") return json({ ok: true, model: claude, models: { claude, codex: "gpt-6.1-sol" }, auth: env.MODEL_AUTH ?? "api_key" });
     const head = request.method === "HEAD";
     if (url.pathname === "/metrics" && (request.method === "GET" || head)) return options.egress(env).fetch(new Request(url.searchParams.get("probe") === "codex" ? "https://egress.internal/probe/codex" : "https://egress.internal/metrics"));
-    const match = /^\/sessions\/([^/]+)(?:\/(turns|events|metrics|socket|hands|crash)(?:\/([^/]+)(?:\/(cancel))?)?)?$/.exec(url.pathname);
+    const match = /^\/sessions\/([^/]+)(?:\/(turns|events|metrics|socket|hands|crash|warm)(?:\/([^/]+)(?:\/(cancel))?)?)?$/.exec(url.pathname);
     if (!match || (match[3] !== undefined && match[2] !== "turns" && match[2] !== "hands") || (match[4] !== undefined && match[2] !== "turns")) return json({ error: "route not found" }, 404);
     let name: string;
     try { name = decodeURIComponent(match[1]); } catch { return json({ error: "invalid session encoding" }, 400); }
