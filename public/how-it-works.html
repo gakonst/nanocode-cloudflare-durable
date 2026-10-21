@@ -18,7 +18,7 @@
           <div class="menu-list">
             <a href="https://nanocode.xyz/docs/guides/xframes">xframes</a>
             <a href="https://nanocode.xyz/docs/guides/mpp-payments">nanocode-machines</a>
-            <a href="https://github.com/gakonst/nanocode-ts">nanocode-ts</a>
+            <a href="https://nanocode.xyz/docs/guides/nanocode-ts">nanocode-ts</a>
             <a href="https://nanocode.xyz/vercel">nanocode on Vercel</a>
             <a aria-current="page" href="https://nanocode.xyz/cloudflare/">nanocode on Cloudflare</a>
           </div>
@@ -32,7 +32,7 @@
     <main class="main">
       <article class="docs">
         <h1>How It Works</h1>
-        <p>nanocode on Cloudflare runs a nanocode agent in a Cloudflare Durable Object. The agent keeps its journal in the object's own SQLite, so a turn that loses its object continues in the next one from the last checkpoint.</p>
+        <p>nanocode on Cloudflare runs a nanocode agent in a Cloudflare Durable Object. The agent keeps its journal in the object's own SQLite, so a turn that loses its object continues in the next one from the last checkpoint. Its source is <a href="https://github.com/gakonst/nanocode-cloudflare-durable">gakonst/nanocode-cloudflare-durable</a>.</p>
 
         <h2>Overview</h2>
         <p>A request reaches the Worker, which forwards it to one Durable Object per account and session. The object runs the nanocode SDK compiled to WebAssembly from <a href="https://github.com/gakonst/nanocode-ts">nanocode-ts</a>, and its model requests go to Cloudflare AI Gateway through the <code>AI</code> binding.</p>
