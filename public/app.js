@@ -285,7 +285,7 @@ async function configure() {
     const model = MODELS.find(entry => entry.id === configured) ?? MODELS[0];
     if (model) {
       state.model = model.id;
-      if (!model.efforts.includes(state.thinking)) state.thinking = model.effort;
+      if (!model.efforts.includes(state.thinking)) state.thinking = model.efforts.includes("low") ? "low" : model.effort;
       save();
     }
   }
