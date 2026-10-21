@@ -19,6 +19,7 @@
     "ACCESS_TOKEN_SHA256": "",
     "CHAT_PUBLIC": "",
     "MODEL_AUTH": "api_key",
+    "WORKERS_AI_ACCOUNT_ID": "",
     "RECOVERY_DELAY_MS": "5000",
     "EVENT_STREAM_KEEPALIVE_MS": "5000",
     "EVENT_PAGE_SIZE": "128",

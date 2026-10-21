@@ -45,7 +45,7 @@ async function model(ai: Ai, gateway: string, request: Request): Promise<Respons
   } else {
     const opened = ai.gateway(gateway);
     try {
-      upstream = await opened.run({ provider: "openai", endpoint: "responses", headers, query }, { signal: request.signal });
+      upstream = await opened.run(dispatch.endpoint.endsWith("/chat/completions") ? { provider: "workers-ai", endpoint: "v1/chat/completions", headers, query } : { provider: "openai", endpoint: "responses", headers, query }, { signal: request.signal });
     } finally {
       (opened as Partial<Disposable>)[Symbol.dispose]?.();
     }
