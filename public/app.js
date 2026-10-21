@@ -371,7 +371,7 @@ async function ask(text, echoed = false) {
   const requestId = identifier("turn");
   state.open = requestId;
   elements.prompt.value = "";
-  if (!echoed) add({ kind: "user", text });
+  if (!echoed) note("user", text);
   setBusy(true);
   const model = current();
   try {
