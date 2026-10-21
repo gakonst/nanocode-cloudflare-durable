@@ -47,7 +47,7 @@ async function admit(request: Request, env: Env): Promise<Response | undefined> 
 
 const nanocode = createNanocode<Env>({
   authenticate,
-  egress: env => aiGateway(() => env.AI.gateway(env.AI_GATEWAY_ID)),
+  egress: env => aiGateway(env.AI, env.AI_GATEWAY_ID),
   tools: charge,
   chaos: true,
 });

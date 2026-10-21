@@ -24,7 +24,17 @@ function gateway(upstream) {
     async getUrl(provider) { return "https://gateway.invalid/local" + (provider ? "/" + provider : ""); },
   };
 }
-const local = env => ({ ...env, AI: { gateway: () => gateway(env.GATEWAY_UPSTREAM) } });
+function unified(upstream) {
+  return async (model, inputs, options) => {
+    if (!model.startsWith("anthropic/") || !options?.returnRawResponse || !options.gateway?.id) return Response.json({ error: "unsupported unified billing call" }, { status: 400 });
+    const headers = new Headers(options.extraHeaders);
+    if (headers.has("x-api-key") || headers.has("authorization")) return Response.json({ error: "the Worker sent a provider credential" }, { status: 400 });
+    headers.set("x-api-key", "${GATEWAY_KEY}");
+    const provider = model.slice("anthropic/".length).replaceAll(".", "-");
+    return upstream.fetch(new Request("https://provider.invalid/v1/messages", { method: "POST", headers, body: JSON.stringify({ ...inputs, model: provider }), signal: options.signal }));
+  };
+}
+const local = env => ({ ...env, AI: { gateway: () => gateway(env.GATEWAY_UPSTREAM), run: unified(env.GATEWAY_UPSTREAM) } });
 const timers = new Map();
 const schedule = globalThis.setTimeout;
 const unschedule = globalThis.clearTimeout;
