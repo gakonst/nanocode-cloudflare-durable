@@ -121,6 +121,10 @@ code, kbd, pre, samp { font: inherit; font-feature-settings: inherit; }
 
 .navigation a[aria-current="page"]:not(:hover) { background-color: var(--text); box-shadow: inset 0 -2px 0 var(--accent); color: var(--bg); }
 
+.menu-list { background-color: var(--bg); border: 1px solid var(--rule); display: none; flex-direction: column; gap: 0.25rem; margin-left: calc((var(--cell) + 1px) * -1); padding: 0.5rem var(--cell); position: fixed; }
+
+.menu:hover > .menu-list, .menu:focus-within > .menu-list { display: flex; }
+
 .main { padding: 3.25rem var(--gutter) 10rem; }
 
 @media (max-width: 1000px) {
