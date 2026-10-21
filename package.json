@@ -1,9 +1,9 @@
 {
-  "name": "nanocode-worker",
+  "name": "nanocode-cloudflare-durable",
   "private": true,
   "type": "module",
   "scripts": {
-    "build": "npm --prefix ../nanocode-wasm run build",
+    "build": "tsc --noEmit",
     "check": "tsc --noEmit",
     "dev": "wrangler dev",
     "dry-run": "wrangler deploy --dry-run --outdir output/deploy",
@@ -11,7 +11,7 @@
     "measure": "node scripts/measure-local.mjs"
   },
   "dependencies": {
-    "nanocode-wasm": "file:../nanocode-wasm"
+    "nanocode-ts": "github:gakonst/nanocode-ts#4cdd87b00dab1534932d0db179ffe07344eab072"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "5.20261016.1",

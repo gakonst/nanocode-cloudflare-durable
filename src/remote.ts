@@ -1,4 +1,4 @@
-import { RemoteExecutor, type RemotePolicy } from "nanocode-wasm";
+import { RemoteExecutor, type RemotePolicy } from "nanocode-ts";
 import { headerJson, type PrivateBinding, type SessionAuthority } from "./contracts";
 
 export class ExecutorRejection extends Error {

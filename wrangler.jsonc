@@ -2,10 +2,6 @@
   "name": "nanocode",
   "main": "worker/index.ts",
   "compatibility_date": "2026-10-16",
-  "build": {
-    "command": "npm run build",
-    "watch_dir": ["src", "../nanocode-wasm/src", "../nanocode-wasm/Cargo.toml", "../nanocode-wasm/Cargo.lock", "../nanocode-wasm/scripts/build.mjs", "../nanocodex/crates", "../nanocodex/Cargo.toml", "../nanocodex/Cargo.lock"]
-  },
   "ai": { "binding": "AI" },
   "durable_objects": {
     "bindings": [
