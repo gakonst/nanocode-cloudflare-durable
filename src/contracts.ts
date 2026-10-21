@@ -1,4 +1,4 @@
-import type { ModelProvider } from "nanocode-wasm";
+import type { ModelProvider } from "nanocode-ts";
 
 export const EXECUTOR_ID = /^[a-z0-9][a-z0-9_-]{0,47}$/;
 export const DEFAULT_EXECUTOR = "default";

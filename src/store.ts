@@ -1,4 +1,5 @@
-import { Timings, type SqlHost, type SqlKind, type Statement } from "nanocode-wasm";
+import { Timings, type SqlHost, type SqlKind, type Statement } from "nanocode-ts";
+import { DurableObjectSql, SQLITE_VALUE_LIMIT_BYTES } from "nanocode-ts/cloudflare";
 
 type Row = Record<string, SqlStorageValue>;
 
@@ -58,14 +59,24 @@ export class Metadata {
   }
 }
 
-export const SQLITE_VALUE_LIMIT_BYTES = 8_388_608;
+export { SQLITE_VALUE_LIMIT_BYTES };
 
 export class CheckpointStore implements SqlHost {
   readonly value_limit = SQLITE_VALUE_LIMIT_BYTES;
   readonly timings = new Timings();
   readonly metrics = metrics();
   readonly log = metrics();
-  constructor(readonly storage: DurableObjectStorage) {}
+  private readonly sql: DurableObjectSql;
+  constructor(readonly storage: DurableObjectStorage) {
+    this.sql = new DurableObjectSql(storage, observation => {
+      const into = observation.kind === "log" ? this.log : this.metrics;
+      into.operations[observation.operation] = (into.operations[observation.operation] ?? 0) + 1;
+      into.statements += observation.statements;
+      into.rows_read += observation.rows_read;
+      into.rows_written += observation.rows_written;
+      this.timings.record(observation.operation, observation.duration_ms);
+    });
+  }
 
   row(query: string, ...values: SqlStorageValue[]): Row | undefined {
     this.metrics.point_queries++;
@@ -80,20 +91,6 @@ export class CheckpointStore implements SqlHost {
   }
 
   transaction(kind: SqlKind, operation: string, statements: Statement[]): SqlStorageValue[][][] {
-    const started = performance.now();
-    const into = kind === "log" ? this.log : this.metrics;
-    into.operations[operation] = (into.operations[operation] ?? 0) + 1;
-    into.statements += statements.length;
-    try {
-      return this.storage.transactionSync(() => statements.map(([query, ...values]) => {
-        const cursor = this.storage.sql.exec(query, ...values);
-        const rows = [...cursor.raw()];
-        into.rows_read += cursor.rowsRead;
-        into.rows_written += cursor.rowsWritten;
-        return rows;
-      }));
-    } finally {
-      this.timings.record(operation, performance.now() - started);
-    }
+    return this.sql.transaction(kind, operation, statements);
   }
 }

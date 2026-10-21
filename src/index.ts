@@ -1,11 +1,11 @@
 import { DurableObject } from "cloudflare:workers";
-import { AgentRuntime, EventHub, HostFailure, RECENT_MODEL_LIMIT, RemoteExecutor, RemoteRefusal, Timings, sessionUuid, timingDifference, type HostTool, type LoggedEvent, type LogPage, type ModelProvider, type TimingSnapshot, type TurnView } from "nanocode-wasm";
-import wasm from "nanocode-wasm/nanocode_wasm.wasm";
+import { AgentRuntime, EventHub, HostFailure, RECENT_MODEL_LIMIT, RemoteExecutor, RemoteRefusal, Timings, sessionUuid, timingDifference, type HostTool, type LoggedEvent, type LogPage, type ModelProvider, type TimingSnapshot, type TurnView } from "nanocode-ts";
+import wasm from "nanocode-ts/nanocode_wasm.wasm";
 import { CheckpointStore, Metadata, SQLITE_VALUE_LIMIT_BYTES } from "./store";
 import { ExecutorRejection, connectExecutor } from "./remote";
 import { DEFAULT_EXECUTOR, EXECUTOR_ID, headerJson, json, type HostToolCall, type ModelDispatch, type PrivateBinding, type SessionDescriptor } from "./contracts";
 
-export type { HostTool, ModelProvider } from "nanocode-wasm";
+export type { HostTool, ModelProvider } from "nanocode-ts";
 export type { HostToolCall, ModelDispatch, PrivateBinding, SessionAuthority, SessionDescriptor, SocketDispatch } from "./contracts";
 
 export interface NanocodeEnv {
