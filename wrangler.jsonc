@@ -3,6 +3,7 @@
   "main": "worker/index.ts",
   "compatibility_date": "2026-10-16",
   "assets": { "directory": "./public" },
+  "build": { "command": "node scripts/assets.mjs" },
   "ai": { "binding": "AI" },
   "durable_objects": {
     "bindings": [
