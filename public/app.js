@@ -6,8 +6,17 @@ const TYPING_DELAY_MS = 500;
 const CRASH_AFTER_MS = 1500;
 const REVEAL_MS = 100;
 const FRAME_MS = 16;
-const MODELS = [
-  { id: "claude-haiku-5-5", label: "Haiku 5.5", efforts: ["none", "low", "medium", "high", "xhigh", "max"], effort: "medium" },
+const EVERY = ["none", "low", "medium", "high", "xhigh", "max"];
+const THINKING = ["low", "medium", "high", "xhigh", "max"];
+const HARNESSES = [
+  { id: "claude", label: "Claude", models: [{ id: "claude-haiku-5-5", label: "Haiku 5.5", name: "Claude Haiku 5.5", efforts: EVERY, effort: "medium" }, { id: "claude-sonnet-5-5", label: "Sonnet 5.5", name: "Claude Sonnet 5.5", efforts: THINKING, effort: "high" }] },
+  { id: "codex", label: "Codex", models: [{ id: "gpt-6-luna", label: "Luna", name: "GPT-6 Luna", efforts: EVERY, effort: "medium" }, { id: "gpt-6.1-sol", label: "Sol", name: "GPT-6.1 Sol", efforts: THINKING, effort: "medium" }] },
+];
+const MODELS = HARNESSES.flatMap(harness => harness.models);
+const COMMANDS = [
+  { label: "/model", detail: "choose harness, model and thinking for a new session" },
+  { label: "/effort", detail: "choose the thinking of the next turns" },
+  { label: "/new", detail: "start a new session" },
 ];
 
 const elements = {
@@ -30,7 +39,8 @@ let state = load();
 let busy = false;
 let typing = false;
 let typingTimer;
-let choosing = false;
+let picker = null;
+let highlight = 0;
 let stream = { posted: 0, shown: 0, text: "" };
 let live;
 let queue = [];
@@ -55,9 +65,13 @@ function current() {
   return MODELS.find(model => model.id === state.model) ?? MODELS[0];
 }
 
+function harnessOf(model) {
+  return HARNESSES.find(harness => harness.models.includes(model));
+}
+
 function render() {
   const shown = live ? [...state.entries, live] : state.entries;
-  elements.log.replaceChildren(...(shown.length === 0 ? [paragraph("entry entry-tool", "Pick a model and an effort, then ask a question to start a turn.")] : shown.map((entry, index) => {
+  elements.log.replaceChildren(...(shown.length === 0 ? [paragraph("entry entry-tool", "Ask a question to start a turn, or type /model to choose a model.")] : shown.map((entry, index) => {
     const previous = shown[index - 1];
     const label = entry.kind === "user" ? "you" : !previous || previous.kind === "user" ? "agent" : undefined;
     const turn = document.createElement("div");
@@ -82,52 +96,121 @@ function render() {
     elements.typing.replaceChildren(speaker, live?.kind === "reasoning" ? " is thinking" : " is typing");
   } else elements.typing.replaceChildren();
   const model = current();
-  elements.status.textContent = `Claude · ${model.label} · ${state.thinking ?? model.effort} · ${state.session ?? "new session"} · ${busy ? "running" : "idle"}`;
-  renderPicker(model);
+  elements.status.textContent = `${harnessOf(model).label} · ${model.label} · ${state.thinking ?? model.effort} · ${state.session ?? "new session"} · ${busy ? "running" : "idle"}`;
+  renderMenu();
   for (const control of [elements.prompt, elements.send, elements.reset, ...elements.suggestions]) control.disabled = busy;
   elements.crash.disabled = !state.session;
 }
 
-function renderPicker(model) {
-  const open = !state.session || choosing;
+function menuItems() {
+  if (picker?.kind === "model") return modelItems(elements.prompt.value);
+  if (picker?.kind === "thinking") return thinkingItems(picker.model);
+  const query = elements.prompt.value;
+  if (!/^\/\S*$/.test(query)) return [];
+  return COMMANDS.filter(entry => entry.label.startsWith(query)).map(entry => ({ kind: "choice", ...entry }));
+}
+
+function modelItems(query) {
+  const words = query.toLowerCase().split(/\s+/).filter(Boolean);
+  return HARNESSES.flatMap(harness => {
+    const models = harness.models.map(model => ({ kind: "choice", label: model.id, detail: `${model.name} · thinking ${model.efforts.join("/")}`, current: model.id === current().id })).filter(item => words.every(word => `${item.label} ${item.detail}`.toLowerCase().includes(word)));
+    return models.length ? [{ kind: "header", label: harness.label }, ...models] : [];
+  });
+}
+
+function thinkingItems(id) {
+  const model = MODELS.find(entry => entry.id === id);
+  const selected = id === current().id && model.efforts.includes(state.thinking) ? state.thinking : model.effort;
+  return model.efforts.map(level => ({ kind: "choice", label: level, detail: level === model.effort ? "default" : "", current: level === selected }));
+}
+
+function renderMenu() {
+  const items = menuItems();
+  const choices = items.filter(item => item.kind === "choice");
+  highlight = Math.min(highlight, Math.max(0, choices.length - 1));
+  const open = picker !== null || items.length > 0;
   elements.picker.hidden = !open;
-  if (!open) return;
-  const chevron = document.createElement("span");
-  chevron.ariaHidden = "true";
-  chevron.className = "chevron";
-  chevron.textContent = "❯";
-  const children = [chevron];
-  if (!state.session) {
-    children.push(label("model"), ...MODELS.map(entry => option(entry.label, entry.id === model.id, () => {
-      state.model = entry.id;
-      if (!entry.efforts.includes(state.thinking)) state.thinking = entry.effort;
-      save();
-      render();
-    })));
+  elements.prompt.placeholder = picker?.kind === "model" ? "type to filter" : "Ask the agent, or type / for commands";
+  if (!open) return elements.picker.replaceChildren();
+  const width = Math.max(0, ...choices.map(item => item.label.length));
+  const children = [];
+  if (picker) children.push(paragraph("picker-title", picker.kind === "model" ? "Model" : `Thinking · ${picker.model}`));
+  if (picker?.kind === "model") {
+    const filter = paragraph("picker-muted", "filter: ");
+    filter.append(span("picker-query", elements.prompt.value), span("picker-caret", "▏"));
+    children.push(filter);
+    if (choices.length === 0) children.push(paragraph("picker-muted", "  no matches"));
   }
-  children.push(label("effort"), ...model.efforts.map(level => option(level, level === (state.thinking ?? model.effort), () => {
-    choosing = false;
-    effort(level);
-  })));
+  let position = -1;
+  for (const item of items) {
+    if (item.kind === "header") {
+      children.push(paragraph("picker-header", item.label));
+      continue;
+    }
+    position += 1;
+    const index = position;
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "picker-choice";
+    button.role = "option";
+    button.ariaSelected = String(index === highlight);
+    button.style.gridTemplateColumns = `2ch ${width}ch 2ch auto`;
+    button.append(span("picker-marker", index === highlight ? "›" : ""), span("picker-label", item.label), span("picker-marker", item.current ? "✓" : ""), span("picker-detail", item.detail ?? ""));
+    button.addEventListener("mousemove", () => {
+      if (highlight === index) return;
+      highlight = index;
+      renderMenu();
+    });
+    button.addEventListener("click", () => choose(item));
+    children.push(button);
+  }
+  if (picker) children.push(paragraph("picker-muted", picker.kind === "model" ? "type to filter · enter select · esc cancel" : "enter select · esc cancel"));
+  elements.picker.ariaLabel = picker?.kind === "model" ? "Model" : picker ? "Thinking" : "Commands";
   elements.picker.replaceChildren(...children);
 }
 
-function label(text) {
+function span(className, text) {
   const element = document.createElement("span");
-  element.className = "picker-label";
+  element.className = className;
   element.textContent = text;
   return element;
 }
 
-function option(text, pressed, choose) {
-  const element = document.createElement("button");
-  element.className = "option";
-  element.type = "button";
-  element.disabled = busy;
-  element.ariaPressed = String(pressed);
-  element.textContent = text;
-  element.addEventListener("click", choose);
-  return element;
+function open(next) {
+  elements.prompt.value = "";
+  picker = next;
+  const items = next.kind === "model" ? modelItems("") : thinkingItems(next.model);
+  highlight = Math.max(0, items.filter(item => item.kind === "choice").findIndex(item => item.current));
+  renderMenu();
+}
+
+function close() {
+  picker = null;
+  elements.prompt.value = "";
+  renderMenu();
+}
+
+function pick(model) {
+  if (state.session && model !== current().id) {
+    close();
+    note("tool", "the model is fixed for this session; use /new before choosing another model");
+    return;
+  }
+  open({ kind: "thinking", model });
+}
+
+function think(model, level) {
+  close();
+  state.model = model;
+  state.thinking = level;
+  save();
+  note("tool", `using ${model} · thinking ${level}`);
+}
+
+function choose(item) {
+  if (picker?.kind === "model") pick(item.label);
+  else if (picker?.kind === "thinking") think(picker.model, item.label);
+  else command(item.label);
 }
 
 function paragraph(className, text) {
@@ -278,12 +361,12 @@ async function configure() {
   const open = await fetch("health").catch(() => undefined);
   elements.access.hidden = open?.ok === true;
   const health = open?.ok ? open : await fetch("health", { headers: headers() }).catch(() => undefined);
-  if (health?.ok && !state.model) {
+  if (health?.ok && !MODELS.some(entry => entry.id === state.model)) {
     const configured = (await health.json()).models.claude;
-    const model = MODELS.find(entry => entry.id === configured);
+    const model = MODELS.find(entry => entry.id === configured) ?? MODELS[0];
     if (model) {
       state.model = model.id;
-      state.thinking ??= model.effort;
+      if (!model.efforts.includes(state.thinking)) state.thinking = model.effort;
       save();
     }
   }
@@ -310,7 +393,7 @@ function reset() {
   queue = [];
   stream = { posted: 0, shown: 0, text: "" };
   live = undefined;
-  choosing = false;
+  picker = null;
   const { model, thinking } = state;
   localStorage.removeItem(KEY);
   state = { ...load(), model, thinking };
@@ -318,49 +401,35 @@ function reset() {
   render();
 }
 
-function chooseModel(query) {
-  if (!query) {
-    reset();
-    note("tool", "Pick a model and an effort below. Your next prompt starts a new session.");
-    return;
-  }
-  const words = query.split(" ");
-  const match = MODELS.find(model => words.every(word => `claude ${model.id} ${model.label}`.toLowerCase().includes(word)));
-  if (!match) {
-    note("error", `No model matches "${query}". Choose from ${MODELS.map(model => model.label).join(", ")}.`);
-    return;
-  }
-  const thinking = match.efforts.includes(state.thinking) ? state.thinking : match.effort;
-  reset();
-  state.model = match.id;
-  state.thinking = thinking;
-  save();
-  note("tool", `Your next prompt starts a new Claude · ${match.label} session at ${thinking} effort.`);
-}
-
-function effort(level) {
-  const model = current();
-  if (!model.efforts.includes(level)) {
-    note("error", `${model.label} takes ${model.efforts.join(", ")}, not ${level}.`);
-    return;
-  }
-  state.thinking = level;
-  save();
-  note("tool", state.session ? `Reasoning effort is ${level} from the next turn.` : `Your next session starts at ${level} effort.`);
-}
-
 function command(text) {
   const [name, ...words] = text.split(/\s+/);
-  if (name === "/model") chooseModel(words.join(" ").toLowerCase());
-  else if (name === "/effort" && words[0]) {
-    choosing = false;
-    effort(words[0].toLowerCase());
-  } else if (name === "/effort") {
-    choosing = true;
-    const model = current();
-    note("tool", `Reasoning effort is ${state.thinking ?? model.effort}. Pick one below, or type /effort followed by ${model.efforts.join(", ")}.`);
-  } else return false;
+  const argument = words.join(" ").toLowerCase();
+  if (name === "/new") {
+    elements.prompt.value = "";
+    reset();
+    note("tool", "new session");
+    return true;
+  }
+  if (name === "/model") {
+    if (!argument) {
+      open({ kind: "model" });
+      return true;
+    }
+    const match = MODELS.find(model => argument.split(" ").every(word => `${model.id} ${model.name}`.toLowerCase().includes(word)));
+    elements.prompt.value = "";
+    if (match) pick(match.id);
+    else note("error", `no model matches "${argument}"; choose one of ${MODELS.map(model => model.id).join(", ")}`);
+    return true;
+  }
+  if (name !== "/effort") return false;
+  const model = current();
+  if (!argument) {
+    open({ kind: "thinking", model: model.id });
+    return true;
+  }
   elements.prompt.value = "";
+  if (model.efforts.includes(argument)) think(model.id, argument);
+  else note("error", `${model.id} takes ${model.efforts.join("/")} thinking, not ${argument}`);
   return true;
 }
 
@@ -374,7 +443,7 @@ async function ask(text) {
   setBusy(true);
   const model = current();
   try {
-    const response = await fetch(`sessions/${encodeURIComponent(state.session)}/turns?after=${state.cursor ?? 0}`, { method: "POST", headers: headers({ accept: "text/event-stream", "content-type": "application/json" }), body: JSON.stringify({ request_id: requestId, prompt: text, model: model.id, thinking: state.thinking ?? model.effort }) });
+    const response = await fetch(`sessions/${encodeURIComponent(state.session)}/turns?after=${state.cursor ?? 0}`, { method: "POST", headers: headers({ accept: "text/event-stream", "content-type": "application/json" }), body: JSON.stringify({ request_id: requestId, prompt: text, provider: harnessOf(model).id, model: model.id, thinking: state.thinking ?? model.effort }) });
     if (!(await follow(response, requestId))) await reconnect(requestId);
   } catch (error) {
     note("error", error instanceof Error ? error.message : String(error));
@@ -429,7 +498,30 @@ elements.form.addEventListener("submit", event => {
   event.preventDefault();
   void ask(elements.prompt.value.trim());
 });
+elements.prompt.addEventListener("input", () => {
+  if (picker?.kind === "model") highlight = 0;
+  renderMenu();
+});
 elements.prompt.addEventListener("keydown", event => {
+  const choices = menuItems().filter(item => item.kind === "choice");
+  if (picker || choices.length > 0) {
+    if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+      event.preventDefault();
+      highlight = Math.min(Math.max(0, highlight + (event.key === "ArrowDown" ? 1 : -1)), Math.max(0, choices.length - 1));
+      renderMenu();
+      return;
+    }
+    if (event.key === "Escape") {
+      event.preventDefault();
+      close();
+      return;
+    }
+    if ((event.key === "Enter" && !event.shiftKey) || (event.key === "Tab" && !picker)) {
+      event.preventDefault();
+      if (choices[highlight]) choose(choices[highlight]);
+      return;
+    }
+  }
   if (event.key !== "Enter" || event.shiftKey) return;
   event.preventDefault();
   elements.form.requestSubmit();

@@ -34,16 +34,16 @@
         <h1>nanocode on Cloudflare<span class="dot">.</span><br />Durable agents in Durable Objects.</h1>
         <p class="lead">This agent runs in a Cloudflare Durable Object: the nanocode SDK compiled to WebAssembly, with its journal in the object's own SQLite. When the object resets mid-turn, its alarm starts it again, and the turn continues from the last checkpoint. Cloudflare AI Gateway serves its model requests.</p>
         <section aria-label="Agent" class="chat" id="chat">
-          <div aria-live="polite" class="log" id="log"><p class="entry entry-tool">Pick a model and an effort, then ask a question to start a turn.</p></div>
+          <div aria-live="polite" class="log" id="log"><p class="entry entry-tool">Ask a question to start a turn, or type /model to choose a model.</p></div>
           <p aria-live="polite" class="typing" id="typing"></p>
           <label class="row" id="access">
             <span aria-hidden="true" class="chevron">#</span>
             <input aria-label="Access token" class="input" id="token" placeholder="Access token" type="password" />
           </label>
-          <div class="row picker" hidden id="picker"></div>
+          <div class="picker" hidden id="picker" role="listbox"></div>
           <form class="row" id="form">
             <span aria-hidden="true" class="chevron">❯</span>
-            <textarea aria-label="Prompt" class="input" id="prompt" placeholder="Ask the agent, or type /model or /effort" rows="1"></textarea>
+            <textarea aria-label="Prompt" class="input" id="prompt" placeholder="Ask the agent, or type / for commands" rows="1"></textarea>
             <button class="send" id="send" type="submit"><kbd class="key">ENTER</kbd></button>
           </form>
           <div class="suggestions" id="suggestions">
