@@ -2,6 +2,7 @@
   "name": "nanocode",
   "main": "worker/index.ts",
   "compatibility_date": "2026-10-16",
+  "assets": { "directory": "./public" },
   "ai": { "binding": "AI" },
   "durable_objects": {
     "bindings": [
@@ -15,7 +16,7 @@
     "AI_GATEWAY_ID": "default",
     "ACCESS_TOKEN_SHA256": "",
     "MODEL_AUTH": "api_key",
-    "RECOVERY_DELAY_MS": "30000",
+    "RECOVERY_DELAY_MS": "5000",
     "EVENT_STREAM_KEEPALIVE_MS": "5000",
     "EVENT_PAGE_SIZE": "128",
     "EVENT_TAIL_BYTES": "4194304",

@@ -8,7 +8,8 @@
     "dev": "wrangler dev",
     "dry-run": "wrangler deploy --dry-run --outdir output/deploy",
     "deploy": "wrangler deploy",
-    "measure": "node scripts/measure-local.mjs"
+    "measure": "node scripts/measure-local.mjs",
+    "drill": "node scripts/drill.mjs"
   },
   "dependencies": {
     "nanocode-ts": "github:gakonst/nanocode-ts#4cdd87b00dab1534932d0db179ffe07344eab072"

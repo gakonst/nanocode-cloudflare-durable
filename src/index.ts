@@ -33,6 +33,7 @@ export type NanocodeOptions<E extends NanocodeEnv> = {
   recordSession?(account: string, name: string, env: E): Promise<boolean> | boolean;
   active?(account: string, grant: unknown, env: E): Promise<boolean> | boolean;
   tools?: { definitions: HostTool[]; call(call: HostToolCall, env: E, signal: AbortSignal): Promise<unknown> };
+  chaos?: boolean;
 };
 
 type TurnTiming = { started: number; admitted_at?: number; admission_ms?: number; pump_wait_ms?: number; runtime_open_ms?: number; runtime_reused?: boolean; run_started?: number; run_ms?: number; recovered?: boolean; checkpoints: TimingSnapshot; runtime?: TimingSnapshot };
@@ -122,6 +123,7 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
     private readonly modelDiagnostics: { scope: string; value: unknown }[] = [];
     private readonly timings = new Map<string, Timings>();
     private readonly turnTimings = new Map<string, TurnTiming>();
+    private crash?: number;
     private readonly counts = { runtime_initializations: 0, model_dispatches: 0, events_written: 0, preparation_writes: 0, preparation_writes_skipped: 0, effect_syncs: 0, alarms: 0, direct_starts: 0, recoveries: 0, runtime_retirements: 0, host_tool_calls: 0 };
 
     constructor(ctx: DurableObjectState, env: E) {
@@ -206,6 +208,12 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
           return this.attachHand(scope, parts.length === 4 ? decodeURIComponent(parts[3]) : undefined, request, descriptor);
         }
         if (parts[2] === "cancel" && parts.length === 4 && request.method === "POST") return await this.cancel(decodeURIComponent(parts[3]), scope);
+        if (parts[2] === "crash" && options.chaos && request.method === "POST") {
+          const after = Number(((await request.json().catch(() => null)) as { after_ms?: unknown } | null)?.after_ms ?? 0);
+          if (!Number.isSafeInteger(after) || after < 0) return json({ error: "after_ms must be a nonnegative integer" }, 400);
+          this.crash = after;
+          return json({ armed: true, after_ms: after });
+        }
         if (parts[2] !== "turns") return json({ error: "route not found" }, 404);
         if (request.method === "GET" && parts.length === 4) {
           const turn = await (await this.instance(scope)).turn(scope, decodeURIComponent(parts[3]));
@@ -511,6 +519,9 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
               if (this.dispatchBlocked(scope)) throw new Error("request authority stopped");
               await this.durable(scope);
               this.counts.host_tool_calls++;
+              const crash = this.crash;
+              this.crash = undefined;
+              if (crash !== undefined) setTimeout(() => this.ctx.abort(`chaos: the session object was reset during ${name}`), crash);
               return options.tools!.call({ authority: { account_id: authority.account_id, session_id: authority.session_id }, name, input, grant: this.turnGrant(scope, descriptor) }, this.env, signal);
             },
           },
@@ -1055,7 +1066,7 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
     if (url.pathname === "/health") return json({ ok: true, model: "claude-opus-5-5", models: { claude: "claude-opus-5-5", codex: "gpt-6.1-sol" }, auth: env.MODEL_AUTH ?? "api_key" });
     const head = request.method === "HEAD";
     if (url.pathname === "/metrics" && (request.method === "GET" || head)) return options.egress(env).fetch(new Request(url.searchParams.get("probe") === "codex" ? "https://egress.internal/probe/codex" : "https://egress.internal/metrics"));
-    const match = /^\/sessions\/([^/]+)(?:\/(turns|events|metrics|socket|hands)(?:\/([^/]+)(?:\/(cancel))?)?)?$/.exec(url.pathname);
+    const match = /^\/sessions\/([^/]+)(?:\/(turns|events|metrics|socket|hands|crash)(?:\/([^/]+)(?:\/(cancel))?)?)?$/.exec(url.pathname);
     if (!match || (match[3] !== undefined && match[2] !== "turns" && match[2] !== "hands") || (match[4] !== undefined && match[2] !== "turns")) return json({ error: "route not found" }, 404);
     let name: string;
     try { name = decodeURIComponent(match[1]); } catch { return json({ error: "invalid session encoding" }, 400); }

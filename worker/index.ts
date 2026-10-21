@@ -1,5 +1,6 @@
 import { createNanocode, type NanocodeEnv } from "../src/index";
 import { aiGateway } from "./gateway";
+import { charge } from "./tools";
 
 interface Env extends NanocodeEnv {
   AI: Ai;
@@ -21,6 +22,8 @@ async function authenticate(request: Request, env: Env): Promise<string | null> 
 const nanocode = createNanocode<Env>({
   authenticate,
   egress: env => aiGateway(() => env.AI.gateway(env.AI_GATEWAY_ID)),
+  tools: charge,
+  chaos: true,
 });
 
 export const { AgentSession } = nanocode;
