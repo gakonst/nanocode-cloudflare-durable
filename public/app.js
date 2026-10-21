@@ -41,6 +41,7 @@ let typing = false;
 let typingTimer;
 let picker = null;
 let highlight = 0;
+let queued = [];
 let stream = { posted: 0, shown: 0, text: "" };
 let live;
 let queue = [];
@@ -98,7 +99,7 @@ function render() {
   const model = current();
   elements.status.textContent = `${harnessOf(model).label} · ${model.label} · ${state.thinking ?? model.effort} · ${state.session ?? "new session"} · ${busy ? "running" : "idle"}`;
   renderMenu();
-  for (const control of [elements.prompt, elements.send, elements.reset, ...elements.suggestions]) control.disabled = busy;
+  for (const control of [elements.reset, ...elements.suggestions]) control.disabled = busy;
   elements.crash.disabled = !state.session;
 }
 
@@ -130,7 +131,7 @@ function renderMenu() {
   highlight = Math.min(highlight, Math.max(0, choices.length - 1));
   const open = picker !== null || items.length > 0;
   elements.picker.hidden = !open;
-  elements.prompt.placeholder = picker?.kind === "model" ? "type to filter" : "Ask the agent, or type / for commands";
+  elements.prompt.placeholder = picker?.kind === "model" ? "type to filter" : busy ? "Steer the running turn" : "Ask the agent, or type / for commands";
   if (!open) return elements.picker.replaceChildren();
   const width = Math.max(0, ...choices.map(item => item.label.length));
   const children = [];
@@ -269,9 +270,10 @@ function step() {
   let revealed = false;
   for (;;) {
     const next = queue[0];
-    if (next?.delta !== undefined && (!stream.kind || stream.kind === next.kind)) {
+    if (next?.delta !== undefined && (!stream.kind || (stream.kind === next.kind && stream.item === next.item))) {
       queue.shift();
       stream.kind = next.kind;
+      stream.item = next.item;
       stream.text += next.delta;
       continue;
     }
@@ -288,6 +290,7 @@ function step() {
     flush();
     if (next.delta !== undefined) {
       stream.kind = next.kind;
+      stream.item = next.item;
       stream.text = next.delta;
     } else next.run();
   }
@@ -308,8 +311,8 @@ function receive(logged, requestId) {
   const body = logged.event ?? {};
   if (body.source === "agent" && body.event) {
     const { type, payload } = body.event;
-    if (type === "assistant.delta") enqueue({ kind: "assistant", delta: payload.text ?? "" });
-    else if (type === "reasoning.summary.delta") enqueue({ kind: "reasoning", delta: payload.text ?? "" });
+    if (type === "assistant.delta") enqueue({ kind: "assistant", item: payload.item_id, delta: payload.text ?? "" });
+    else if (type === "reasoning.summary.delta") enqueue({ kind: "reasoning", item: `reasoning:${payload.model_call_index}`, delta: payload.text ?? "" });
     else if (type === "tool.call") note("tool", `${payload.tool} ${JSON.stringify(payload.arguments)}`);
     else if (type === "tool.result") note("tool", `${payload.tool} ${payload.status}: ${clip(typeof payload.result === "string" ? payload.result : payload.result?.text ?? "")}`);
     return false;
@@ -394,6 +397,7 @@ function reset() {
   stream = { posted: 0, shown: 0, text: "" };
   live = undefined;
   picker = null;
+  queued = [];
   const { model, thinking } = state;
   localStorage.removeItem(KEY);
   state = { ...load(), model, thinking };
@@ -433,13 +437,26 @@ function command(text) {
   return true;
 }
 
-async function ask(text) {
-  if (!text || busy || command(text)) return;
+async function steer(text) {
+  elements.prompt.value = "";
+  renderMenu();
+  note("user", text);
+  const model = current();
+  const response = await fetch(`sessions/${encodeURIComponent(state.session)}/turns`, { method: "POST", headers: headers({ "content-type": "application/json" }), body: JSON.stringify({ request_id: identifier("steer"), prompt: text, provider: harnessOf(model).id, model: model.id, steer: true }) }).catch(error => error);
+  if (response instanceof Error) return note("error", response.message);
+  if (response.ok) return note("tool", "steered into the running turn");
+  if (response.status === 409) return queued.push(text);
+  note("error", `${response.status} ${await response.text()}`);
+}
+
+async function ask(text, echoed = false) {
+  if (!text || command(text)) return;
+  if (busy) return void steer(text);
   state.session ??= identifier("web");
   const requestId = identifier("turn");
   state.open = requestId;
   elements.prompt.value = "";
-  add({ kind: "user", text });
+  if (!echoed) add({ kind: "user", text });
   setBusy(true);
   const model = current();
   try {
@@ -453,6 +470,8 @@ async function ask(text) {
         state.open = undefined;
         save();
         setBusy(false);
+        const next = queued.shift();
+        if (next) void ask(next, true);
       },
     });
   }
