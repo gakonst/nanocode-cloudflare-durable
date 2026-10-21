@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>nanocode on Cloudflare</title>
+    <meta name="description" content="nanocode agents made durable in Cloudflare Durable Objects with nanocode-ts." />
+    <link rel="icon" href="/favicon.svg" />
+    <link as="font" crossorigin="" href="/fonts/CommitMono-VF.woff2" rel="preload" type="font/woff2" />
+    <link rel="stylesheet" href="/style.css" />
+  </head>
+  <body>
+    <header class="header">
+      <nav aria-label="Site" class="navigation">
+        <a aria-current="page" href="/">01 Home</a>
+        <a href="/how-it-works">02 How it works</a>
+        <a href="https://nanocode.xyz" rel="noreferrer">03 nanocode</a>
+        <a href="https://github.com/gakonst/nanocode-ts" rel="noreferrer">04 nanocode-ts</a>
+        <a href="https://github.com/gakonst/nanocode-cloudflare-durable" rel="noreferrer">05 GitHub</a>
+      </nav>
+    </header>
+    <main class="main">
+      <div class="page">
+        <h1>nanocode on Cloudflare<span class="dot">.</span><br />Durable agents in Durable Objects.</h1>
+        <p class="lead">This agent runs in a Cloudflare Durable Object: the nanocode SDK compiled to WebAssembly, with its journal in the object's own SQLite. When the object resets mid-turn, its alarm starts it again, and the turn continues from the last checkpoint. Cloudflare AI Gateway serves its model requests.</p>
+        <section aria-label="Agent" class="chat" id="chat">
+          <div aria-live="polite" class="log" id="log"><p class="entry entry-tool">Ask a question to start a turn.</p></div>
+          <p aria-live="polite" class="typing" id="typing"></p>
+          <label class="row">
+            <span aria-hidden="true" class="chevron">#</span>
+            <input aria-label="Access token" class="input" id="token" placeholder="Access token" type="password" />
+          </label>
+          <form class="row" id="form">
+            <span aria-hidden="true" class="chevron">❯</span>
+            <textarea aria-label="Prompt" class="input" id="prompt" placeholder="Ask the agent" rows="1"></textarea>
+            <button class="send" id="send" type="submit"><kbd class="key">ENTER</kbd></button>
+          </form>
+          <div class="suggestions" id="suggestions">
+            <button class="suggestion" data-prompt="Charge me $42" type="button">Charge me $42</button>
+            <button class="suggestion" data-prompt="List your tools" type="button">List your tools</button>
+            <button class="suggestion" id="crash" type="button">Kill the next tool call</button>
+          </div>
+          <p class="status"><span id="status">claude-opus-5-5 · new session · idle</span><button class="suggestion" id="reset" type="button">New session</button></p>
+        </section>
+        <p><a href="/how-it-works">Read how it works →</a></p>
+      </div>
+    </main>
+    <script src="/app.js" type="module"></script>
+  </body>
+</html>
