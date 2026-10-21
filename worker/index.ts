@@ -6,17 +6,42 @@ interface Env extends NanocodeEnv {
   AI: Ai;
   AI_GATEWAY_ID: string;
   ACCESS_TOKEN_SHA256: string;
+  CHAT_PUBLIC: string;
+  PUBLIC_LIMIT: RateLimit;
 }
 
 const DIGEST = /^[0-9a-f]{64}$/;
 const ACCOUNT = "owner";
+const PUBLIC_ACCOUNT = "public";
+const PUBLIC_PROMPT_CHARACTERS = 2000;
+const PUBLIC_ROUTE = /^\/sessions\/[^/]+\/(?:turns(?:\/[^/]+(?:\/cancel)?)?|events|crash)$/;
 
-async function authenticate(request: Request, env: Env): Promise<string | null> {
+async function owner(request: Request, env: Env): Promise<boolean> {
   const header = request.headers.get("authorization") ?? "";
-  if (!DIGEST.test(env.ACCESS_TOKEN_SHA256) || !header.startsWith("Bearer ")) return null;
+  if (!DIGEST.test(env.ACCESS_TOKEN_SHA256) || !header.startsWith("Bearer ")) return false;
   const actual = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(header.slice("Bearer ".length)));
   const expected = Uint8Array.from(env.ACCESS_TOKEN_SHA256.match(/../g)!, byte => parseInt(byte, 16));
-  return crypto.subtle.timingSafeEqual(actual, expected) ? ACCOUNT : null;
+  return crypto.subtle.timingSafeEqual(actual, expected);
+}
+
+async function authenticate(request: Request, env: Env): Promise<string | null> {
+  if (await owner(request, env)) return ACCOUNT;
+  return env.CHAT_PUBLIC === "1" ? PUBLIC_ACCOUNT : null;
+}
+
+function refuse(error: string, status: number): Response {
+  return Response.json({ error }, { status });
+}
+
+async function admit(request: Request, env: Env): Promise<Response | undefined> {
+  const { pathname } = new URL(request.url);
+  if (pathname === "/health") return;
+  if (!PUBLIC_ROUTE.test(pathname)) return refuse("this route needs the access token", 403);
+  if (!(await env.PUBLIC_LIMIT.limit({ key: request.headers.get("cf-connecting-ip")! })).success) return refuse("too many requests, try again in a minute", 429);
+  if (request.method !== "POST" || !pathname.endsWith("/turns")) return;
+  const body = await request.clone().json().catch(() => undefined) as { prompt?: unknown; provider?: unknown } | undefined;
+  if (typeof body?.prompt === "string" && body.prompt.length > PUBLIC_PROMPT_CHARACTERS) return refuse(`prompts are limited to ${PUBLIC_PROMPT_CHARACTERS} characters`, 413);
+  if (body?.provider !== undefined && body.provider !== "claude") return refuse("this deployment serves Claude only", 403);
 }
 
 const nanocode = createNanocode<Env>({
@@ -28,4 +53,9 @@ const nanocode = createNanocode<Env>({
 
 export const { AgentSession } = nanocode;
 
-export default { fetch: nanocode.fetch } satisfies ExportedHandler<Env>;
+export default {
+  async fetch(request, env) {
+    const refused = env.CHAT_PUBLIC === "1" && !(await owner(request, env)) ? await admit(request, env) : undefined;
+    return refused ?? nanocode.fetch(request, env);
+  },
+} satisfies ExportedHandler<Env>;

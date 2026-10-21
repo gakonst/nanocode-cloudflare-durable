@@ -1,12 +1,12 @@
 const KEY = "nanocode-cloudflare-durable";
 const TOKEN = `${KEY}:token`;
-const MODEL = "claude-opus-5-5";
 const RECONNECT_MS = 1000;
 const RESULT_CHARACTERS = 160;
 const TYPING_DELAY_MS = 500;
 const CRASH_AFTER_MS = 1500;
 
 const elements = {
+  access: document.getElementById("access"),
   chat: document.getElementById("chat"),
   crash: document.getElementById("crash"),
   form: document.getElementById("form"),
@@ -22,6 +22,7 @@ const elements = {
 
 let state = load();
 let busy = false;
+let model;
 let typingTimer;
 let reply = { posted: 0, text: "" };
 
@@ -57,7 +58,7 @@ function render() {
     return turn;
   })));
   elements.log.scrollTo({ top: elements.log.scrollHeight });
-  elements.status.textContent = `${MODEL} · ${state.session ?? "new session"} · ${busy ? "running" : "idle"}`;
+  elements.status.textContent = `${model ?? "Claude"} · ${state.session ?? "new session"} · ${busy ? "running" : "idle"}`;
   for (const control of [elements.prompt, elements.send, elements.reset, ...elements.suggestions]) control.disabled = busy;
   elements.crash.disabled = !state.session;
 }
@@ -164,6 +165,14 @@ async function follow(response, requestId) {
   }
 }
 
+async function configure() {
+  const open = await fetch("/health").catch(() => undefined);
+  elements.access.hidden = open?.ok === true;
+  const health = open?.ok ? open : await fetch("/health", { headers: headers() }).catch(() => undefined);
+  if (health?.ok) model = (await health.json()).models.claude;
+  render();
+}
+
 function headers(extra = {}) {
   const token = elements.token.value;
   return { ...extra, ...(token ? { authorization: `Bearer ${token}` } : {}) };
@@ -231,6 +240,7 @@ function clip(text) {
 
 elements.token.value = localStorage.getItem(TOKEN) ?? "";
 elements.token.addEventListener("input", () => localStorage.setItem(TOKEN, elements.token.value));
+elements.token.addEventListener("change", () => void configure());
 elements.form.addEventListener("submit", event => {
   event.preventDefault();
   void ask(elements.prompt.value.trim());
@@ -253,6 +263,7 @@ elements.chat.addEventListener("click", event => {
 });
 
 render();
+void configure();
 if (state.open && state.session) {
   setBusy(true);
   void reconnect(state.open).finally(() => {
