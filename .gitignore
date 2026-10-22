@@ -9,5 +9,10 @@
 /.env.*
 /public/app.js
 /public/assets/
-/public/chat.css
-/public/syntax.js
+/public/app.css
+/public/how-it-works.css
+/public/how-it-works.js
+/public/zyzz-assets/
+/public/zyzz.css
+/public/zyzz.css.map
+/public/zyzz.js

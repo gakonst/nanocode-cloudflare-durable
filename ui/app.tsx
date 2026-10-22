@@ -1,8 +1,11 @@
+import "nanocode-ts/react/zyzz.css";
 import { createConfig, type Entry, type EntryKind, type LiveEvent, liveEvent, modelItems, serverEvents, thinkingItems } from "nanocode-ts/client";
-import { Chat, NanocodeProvider, type Picker, useConfig, useSend } from "nanocode-ts/react";
+import { Chat, NanocodeProvider, type Picker, styles, useConfig, useSend } from "nanocode-ts/react";
+import { Demos, Header, Lead, Main, origin, Page, styles as site, Title } from "nanocode-ts/react/site";
 import { useEffect, useState, useSyncExternalStore } from "react";
 import { createRoot } from "react-dom/client";
 import { PUBLIC_HARNESSES as HARNESSES } from "../worker/models.ts";
+import "./fonts.ts";
 
 type Model = (typeof HARNESSES)[number]["models"][number];
 
@@ -20,7 +23,7 @@ const COMMANDS = [
   { label: "/new", detail: "start a new session" },
 ];
 
-const highlight = () => import("./syntax.ts").then(module => module.highlight);
+const highlight = () => import("nanocode-ts/highlight").then(module => module.highlight);
 
 const listeners = new Set<() => void>();
 let state: State = load();
@@ -262,15 +265,14 @@ function App() {
 
   return (
     <Chat
-      actions={<button className="suggestion" disabled={busy} onClick={clear} type="button">New session</button>}
+      actions={<button disabled={busy} onClick={clear} type="button" {...styles.suggestion({ quiet: true })}>New session</button>}
       commands={COMMANDS}
       empty="Ask a question to start a turn, or type /model to choose a model."
       extras={access && (
-        <label className="row">
-          <span aria-hidden="true" className="chevron">#</span>
+        <label {...styles.row()}>
+          <span aria-hidden="true" {...styles.chevron()}>#</span>
           <input
             aria-label="Access token"
-            className="input"
             onBlur={() => void configure()}
             onChange={event => {
               setSecret(event.target.value);
@@ -280,6 +282,7 @@ function App() {
             placeholder="Access token"
             type="password"
             value={secret}
+            {...styles.input()}
           />
         </label>
       )}
@@ -294,8 +297,21 @@ function App() {
   );
 }
 
-createRoot(document.getElementById("chat")!).render(
-  <NanocodeProvider config={config} highlight={highlight}>
-    <App />
-  </NanocodeProvider>,
+document.body.className = site.body().className;
+
+createRoot(document.getElementById("root")!).render(
+  <>
+    <Header experiment={`${origin}/cloudflare/`} />
+    <Main>
+      <Page>
+        <Title subtitle="Durable agents in Durable Objects.">nanocode on Cloudflare</Title>
+        <Demos current="cloudflare" />
+        <Lead>This agent runs in a Cloudflare Durable Object: the nanocode SDK compiled to WebAssembly, with its journal in the object's own SQLite. When the object resets mid-turn, its alarm starts it again, and the turn continues from the last checkpoint. Cloudflare AI Gateway serves its model requests. Its source is <a href="https://github.com/gakonst/nanocode-cloudflare-durable">gakonst/nanocode-cloudflare-durable</a>.</Lead>
+        <NanocodeProvider config={config} highlight={highlight}>
+          <App />
+        </NanocodeProvider>
+        <p><a href="how-it-works">Read how it works →</a></p>
+      </Page>
+    </Main>
+  </>,
 );

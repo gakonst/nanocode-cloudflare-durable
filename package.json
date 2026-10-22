@@ -16,7 +16,8 @@
     "@pierre/highlights": "0.2.0",
     "nanocode-ts": "https://github.com/gakonst/nanocode-ts/releases/download/build-ce9f311/nanocode-ts-ce9f311.tgz",
     "react": "19.3.1",
-    "react-dom": "19.3.1"
+    "react-dom": "19.3.1",
+    "zyzz": "0.0.40"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "5.20261016.1",

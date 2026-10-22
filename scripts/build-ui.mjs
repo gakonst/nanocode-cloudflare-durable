@@ -1,20 +1,21 @@
 import { build } from "esbuild";
-import { copyFile, rm } from "node:fs/promises";
-import { createRequire } from "node:module";
+import { rm } from "node:fs/promises";
+import { zyzz } from "zyzz/esbuild";
 
-const require = createRequire(import.meta.url);
-await rm("public/assets", { force: true, recursive: true });
-await copyFile(require.resolve("nanocode-ts/react/styles.css"), "public/chat.css");
+for (const path of ["public/assets", "public/app.js", "public/app.css", "public/how-it-works.js", "public/how-it-works.css", "public/zyzz-assets", "public/zyzz.css", "public/zyzz.css.map", "public/zyzz.js"]) await rm(path, { force: true, recursive: true });
 await build({
+  assetNames: "assets/[name]-[hash]",
   bundle: true,
   chunkNames: "assets/[name]-[hash]",
   entryNames: "[name]",
-  entryPoints: { app: "ui/app.tsx", syntax: "ui/page.ts" },
+  entryPoints: { app: "ui/app.tsx", "how-it-works": "ui/how.tsx" },
   format: "esm",
   jsx: "automatic",
+  loader: { ".woff2": "file" },
   minify: true,
   outdir: "public",
   platform: "browser",
+  plugins: [zyzz()],
   splitting: true,
   target: "es2022",
 });
