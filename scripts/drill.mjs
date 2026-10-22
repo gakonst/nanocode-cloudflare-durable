@@ -24,7 +24,7 @@ const provider = async request => {
   const answer = result ? `The tool answered: ${text(result.content)}` : tool ? "tool_use charge" : "ok";
   requests.push({ messages: body.messages.length, tool_result: result ? text(result.content) : undefined, answer });
   const block = tool
-    ? [{ type: "tool_use", id: `toolu_${requests.length}`, name: "charge", input: {} }, { type: "input_json_delta", partial_json: JSON.stringify({ amount: 42, memo: "order 1001" }) }]
+    ? [{ type: "tool_use", id: `toolu_${requests.length}`, name: "exec", input: {} }, { type: "input_json_delta", partial_json: JSON.stringify({ code: 'text(await tools.charge({ amount: 42, memo: "order 1001" }));' }) }]
     : [{ type: "text", text: "" }, { type: "text_delta", text: answer }];
   return sse([
     ["message_start", { type: "message_start", message: { id: `message-${requests.length}`, type: "message", role: "assistant", model: body.model, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 8, output_tokens: 0 } } }],
