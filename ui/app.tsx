@@ -1,5 +1,6 @@
 import "nanocode-ts/react/zyzz.css";
-import { createConfig, type Entry, type EntryKind, type LiveEvent, liveEvent, modelItems, serverEvents, thinkingItems } from "nanocode-ts/client";
+import { createConfig, type Entry, modelItems, thinkingItems } from "nanocode-ts/client";
+import { cloudflare } from "nanocode-ts/cloudflare/transport";
 import { Chat, NanocodeProvider, type Picker, styles, useConfig, useSend } from "nanocode-ts/react";
 import { Demos, Header, Lead, Main, origin, Page, styles as site, Title } from "nanocode-ts/react/site";
 import { useEffect, useState, useSyncExternalStore } from "react";
@@ -13,9 +14,6 @@ type State = { entries: Entry[]; model?: string; thinking?: string; session?: st
 
 const KEY = "nanocode-cloudflare-durable";
 const TOKEN = `${KEY}:token`;
-const RECONNECT_MS = 1000;
-const CRASH_AFTER_MS = 1500;
-const WARM_MS = 10000;
 const MODELS: Model[] = HARNESSES.flatMap(harness => harness.models);
 const COMMANDS = [
   { label: "/model", detail: "choose harness, model and thinking for a new session" },
@@ -28,9 +26,6 @@ const highlight = () => import("nanocode-ts/highlight").then(module => module.hi
 const listeners = new Set<() => void>();
 let state: State = load();
 let version = 0;
-let warmed: string | undefined;
-let used = 0;
-const queued: string[] = [];
 let token = localStorage.getItem(TOKEN) ?? "";
 
 function load(): State {
@@ -48,11 +43,6 @@ function useStore() {
   return state;
 }
 
-function identifier(prefix: string) {
-  const bytes = crypto.getRandomValues(new Uint8Array(12));
-  return `${prefix}-${Array.from(bytes, byte => byte.toString(16).padStart(2, "0")).join("")}`;
-}
-
 function current(): Model {
   return MODELS.find(model => model.id === state.model) ?? MODELS[0]!;
 }
@@ -61,101 +51,23 @@ function harnessOf(model: Model) {
   return HARNESSES.find(harness => harness.models.includes(model))!;
 }
 
-function headers(extra: Record<string, string> = {}): Record<string, string> {
-  return { ...extra, ...(token ? { authorization: `Bearer ${token}` } : {}) };
-}
-
-type Sink = { push(event: LiveEvent): void; note(kind: EntryKind, text: string): void };
-
-function receive(logged: Parameters<typeof liveEvent>[0], requestId: string, sink: Sink): boolean {
-  const body = (logged.event ?? {}) as { source?: string; type?: string };
-  if (body.source === "agent") {
-    const event = liveEvent(logged);
-    if (event) sink.push(event);
-    return false;
-  }
-  if (logged.request_id !== requestId) return false;
-  if (body.type === "interrupted") sink.note("tool", "The session object reset. Its alarm started it again, and the turn continues from its checkpoint.");
-  if (body.type !== "retrying" && body.type !== "result") return false;
-  const event = liveEvent(logged);
-  if (event) sink.push(event);
-  return body.type === "result";
-}
-
-async function follow(response: Response, requestId: string, sink: Sink): Promise<boolean> {
-  if (!response.ok || !response.body) {
-    sink.note("error", `${response.status} ${await response.text()}`);
-    return true;
-  }
-  let settled = false;
-  try {
-    for await (const message of serverEvents(response.body)) {
-      if (message.id) {
-        state.cursor = Number(message.id);
-        save();
-      }
-      if (message.data && receive(JSON.parse(message.data), requestId, sink)) {
-        settled = true;
-        break;
-      }
-    }
-  } catch {
-    sink.note("tool", "The stream dropped. Reconnecting from the last event.");
-    return false;
-  }
-  if (settled) void response.body.cancel().catch(() => undefined);
-  return settled;
-}
-
-async function reconnect(requestId: string, sink: Sink) {
-  for (;;) {
-    const response = await fetch(`sessions/${encodeURIComponent(state.session!)}/events?after=${state.cursor ?? 0}`, { headers: headers({ accept: "text/event-stream" }) }).catch(() => undefined);
-    if (response && await follow(response, requestId, sink)) return;
-    await new Promise(resolve => setTimeout(resolve, RECONNECT_MS));
-  }
-}
+const transport = cloudflare({
+  headers: (): Record<string, string> => token ? { authorization: `Bearer ${token}` } : {},
+  model: () => ({ provider: harnessOf(current()).id, model: current().id, thinking: state.thinking ?? current().effort }),
+  session: {
+    load: () => ({ id: state.session, cursor: state.cursor, open: state.open }),
+    save: session => {
+      state.session = session.id;
+      state.cursor = session.cursor;
+      state.open = session.open;
+      save();
+    },
+  },
+});
 
 const config = createConfig({
   persist: { load: () => state.entries, save: entries => { state.entries = [...entries]; save(); } },
-  transport: {
-    async send({ prompt, push, note }) {
-      state.session ??= warmed ?? identifier("web");
-      used = performance.now();
-      const requestId = identifier("turn");
-      state.open = requestId;
-      save();
-      const model = current();
-      try {
-        const response = await fetch(`sessions/${encodeURIComponent(state.session)}/turns?after=${state.cursor ?? 0}`, { method: "POST", headers: headers({ accept: "text/event-stream", "content-type": "application/json" }), body: JSON.stringify({ request_id: requestId, prompt, provider: harnessOf(model).id, model: model.id, thinking: state.thinking ?? model.effort }) });
-        if (!(await follow(response, requestId, { push, note }))) await reconnect(requestId, { push, note });
-      } finally {
-        state.open = undefined;
-        used = performance.now();
-        save();
-        const next = queued.shift();
-        if (next) config.run(() => void config.send(next));
-      }
-    },
-    async steer({ prompt }) {
-      const model = current();
-      const response = await fetch(`sessions/${encodeURIComponent(state.session!)}/turns`, { method: "POST", headers: headers({ "content-type": "application/json" }), body: JSON.stringify({ request_id: identifier("steer"), prompt, provider: harnessOf(model).id, model: model.id, steer: true }) });
-      if (response.ok) return true;
-      if (response.status === 409) {
-        queued.push(prompt);
-        return false;
-      }
-      throw new Error(`${response.status} ${await response.text()}`);
-    },
-    async resume({ push, note }) {
-      if (!state.open || !state.session) return;
-      try {
-        await reconnect(state.open, { push, note });
-      } finally {
-        state.open = undefined;
-        save();
-      }
-    },
-  },
+  transport,
 });
 
 function App() {
@@ -169,7 +81,7 @@ function App() {
   const configure = async () => {
     const open = await fetch("health").catch(() => undefined);
     setAccess(open?.ok !== true);
-    const health = open?.ok ? open : await fetch("health", { headers: headers() }).catch(() => undefined);
+    const health = await transport.health();
     if (health?.ok && !MODELS.some(entry => entry.id === state.model)) {
       const configured = (await health.json() as { models: { claude: string } }).models.claude;
       const model = MODELS.find(entry => entry.id === configured) ?? MODELS[0];
@@ -207,9 +119,7 @@ function App() {
   };
 
   const clear = () => {
-    queued.length = 0;
-    warmed = undefined;
-    used = 0;
+    transport.forget();
     const { model, thinking } = state;
     localStorage.removeItem(KEY);
     state = { ...load(), model, thinking };
@@ -247,16 +157,12 @@ function App() {
   };
 
   const warm = (text: string) => {
-    if (busy || !text || text.startsWith("/") || (used && performance.now() - used < WARM_MS)) return;
-    used = performance.now();
-    const session = state.session ?? (warmed ??= identifier("web"));
-    const model = current();
-    void fetch(`sessions/${encodeURIComponent(session)}/warm`, { method: "POST", headers: headers({ "content-type": "application/json" }), body: JSON.stringify({ provider: harnessOf(model).id, model: model.id }) }).catch(() => undefined);
+    if (!busy && text && !text.startsWith("/")) transport.warm();
   };
 
   const crash = async () => {
     if (!state.session) return chat.note("error", "Start a session before arming a crash.");
-    const response = await fetch(`sessions/${encodeURIComponent(state.session)}/crash`, { method: "POST", headers: headers({ "content-type": "application/json" }), body: JSON.stringify({ after_ms: CRASH_AFTER_MS }) });
+    const response = await transport.crash();
     if (response.ok) chat.note("tool", "Armed: the next tool call resets its Durable Object 1.5 s in.");
     else chat.note("error", `${response.status} ${await response.text()}`);
   };

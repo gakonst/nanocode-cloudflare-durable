@@ -26,8 +26,5 @@
     "esbuild": "0.28.2",
     "typescript": "6.0.2",
     "wrangler": "4.151.1"
-  },
-  "exports": {
-    ".": "./src/index.ts"
   }
 }

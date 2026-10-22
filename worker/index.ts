@@ -1,6 +1,4 @@
-import { createNanocode, type NanocodeEnv } from "../src/index";
-import { aiGateway } from "./gateway";
-import { client, PublicLimit } from "./limit";
+import { aiGateway, client, createNanocode, type NanocodeEnv, PublicLimit } from "nanocode-ts/cloudflare";
 import { PUBLIC_MODELS } from "./models";
 import { charge } from "./tools";
 
@@ -56,9 +54,6 @@ const nanocode = createNanocode<Env>({
   egress: env => aiGateway(env.AI, env.AI_GATEWAY_ID, env.OPENAI_SERVICE_TIER),
   tools: charge,
   chaos: true,
-  subagents: false,
-  streamToolInput: true,
-  codeMode: {},
 });
 
 export const { AgentSession } = nanocode;

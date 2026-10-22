@@ -1,5 +1,5 @@
-import type { HostTool } from "../src/index";
-import type { HostToolCall } from "../src/contracts";
+import type { HostTool } from "nanocode-ts";
+import type { HostToolCall } from "nanocode-ts/cloudflare";
 
 export const CHARGE_CONFIRM_MS = 3000;
 

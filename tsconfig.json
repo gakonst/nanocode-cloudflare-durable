@@ -6,9 +6,16 @@
     "strict": true,
     "noEmit": true,
     "allowImportingTsExtensions": true,
-    "types": ["@cloudflare/workers-types"],
-    "lib": ["ES2022", "ESNext.Disposable"],
+    "types": [
+      "@cloudflare/workers-types"
+    ],
+    "lib": [
+      "ES2022",
+      "ESNext.Disposable"
+    ],
     "skipLibCheck": true
   },
-  "include": ["src/**/*.ts", "worker/**/*.ts"]
+  "include": [
+    "worker/**/*.ts"
+  ]
 }
