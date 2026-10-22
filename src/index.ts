@@ -43,6 +43,7 @@ export type NanocodeOptions<E extends NanocodeEnv> = {
   subagents?: boolean;
   streamToolInput?: boolean;
   codeMode?: { loader(env: E): WorkerLoader; fetch?(authority: SessionAuthority, env: E): typeof fetch };
+  instructions?: string;
 };
 
 type TurnTiming = { started: number; admitted_at?: number; admission_ms?: number; pump_wait_ms?: number; runtime_open_ms?: number; runtime_reused?: boolean; run_started?: number; run_ms?: number; recovered?: boolean; checkpoints: TimingSnapshot; runtime?: TimingSnapshot };
@@ -565,7 +566,7 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
           const local = options.codeMode && !enabled && !this.handsMode(scope, descriptor) ? new LocalHand({ evaluate: workerLoader(options.codeMode.loader(this.env)), fetch: options.codeMode.fetch?.(authority, this.env) ?? offline }) : undefined;
           try {
             const created = await this.instance(scope, true);
-            await created.open({ scope, session_id: sessionId, provider: descriptor.provider ?? "claude", model: descriptor.model ?? (descriptor.provider === "codex" ? undefined : this.env.CLAUDE_MODEL), subscription: descriptor.subscription, endpoint: descriptor.provider === "codex" ? (descriptor.subscription ? "https://chatgpt.com/backend-api/codex" : "https://api.openai.com/v1") : `https://api.anthropic.com/v1/messages${descriptor.subscription ? "?beta=true" : ""}`, ...(descriptor.provider === "codex" && WORKERS_AI_MODELS.has(descriptor.model ?? "") ? { gateway: "workers_ai" as const, cloudflare_account_id: this.env.WORKERS_AI_ACCOUNT_ID } : {}), remote: enabled, code_mode: local !== undefined, executor: descriptor.executor_id, ...(options.subagents === undefined ? {} : { subagents: options.subagents }), hands: this.handsMode(scope, descriptor), event_coalesce_ms: duration(this.env.EVENT_COALESCE_MS, "EVENT_COALESCE_MS"), stream_tool_input: options.streamToolInput, tools: options.tools?.definitions }, {
+            await created.open({ scope, session_id: sessionId, provider: descriptor.provider ?? "claude", model: descriptor.model ?? (descriptor.provider === "codex" ? undefined : this.env.CLAUDE_MODEL), subscription: descriptor.subscription, endpoint: descriptor.provider === "codex" ? (descriptor.subscription ? "https://chatgpt.com/backend-api/codex" : "https://api.openai.com/v1") : `https://api.anthropic.com/v1/messages${descriptor.subscription ? "?beta=true" : ""}`, ...(descriptor.provider === "codex" && WORKERS_AI_MODELS.has(descriptor.model ?? "") ? { gateway: "workers_ai" as const, cloudflare_account_id: this.env.WORKERS_AI_ACCOUNT_ID } : {}), remote: enabled, code_mode: local !== undefined, executor: descriptor.executor_id, ...(options.subagents === undefined ? {} : { subagents: options.subagents }), ...(options.instructions === undefined ? {} : { instructions: options.instructions }), hands: this.handsMode(scope, descriptor), event_coalesce_ms: duration(this.env.EVENT_COALESCE_MS, "EVENT_COALESCE_MS"), stream_tool_input: options.streamToolInput, tools: options.tools?.definitions }, {
           tools: options.tools && {
             call: async (name, input, signal) => {
               if (this.dispatchBlocked(scope)) throw new Error("request authority stopped");
