@@ -57,6 +57,7 @@ const nanocode = createNanocode<Env>({
   tools: charge,
   chaos: true,
   subagents: false,
+  streamToolInput: true,
 });
 
 export const { AgentSession } = nanocode;
