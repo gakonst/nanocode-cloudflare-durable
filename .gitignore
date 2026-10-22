@@ -3,14 +3,11 @@
 /dist/
 /.wrangler/
 /output/
-/public/client.js
-/public/ui.js
-/public/ui.css
-/public/models.js
 /.dev.vars
 /.dev.vars.*
 /.env
 /.env.*
-
+/public/app.js
+/public/assets/
+/public/chat.css
 /public/syntax.js
-/public/syntax/

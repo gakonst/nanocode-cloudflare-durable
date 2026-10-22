@@ -1,0 +1,301 @@
+import { createConfig, type Entry, type EntryKind, type LiveEvent, liveEvent, modelItems, serverEvents, thinkingItems } from "nanocode-ts/client";
+import { Chat, NanocodeProvider, type Picker, useConfig, useSend } from "nanocode-ts/react";
+import { useEffect, useState, useSyncExternalStore } from "react";
+import { createRoot } from "react-dom/client";
+import { PUBLIC_HARNESSES as HARNESSES } from "../worker/models.ts";
+
+type Model = (typeof HARNESSES)[number]["models"][number];
+
+type State = { entries: Entry[]; model?: string; thinking?: string; session?: string; cursor?: number; open?: string };
+
+const KEY = "nanocode-cloudflare-durable";
+const TOKEN = `${KEY}:token`;
+const RECONNECT_MS = 1000;
+const CRASH_AFTER_MS = 1500;
+const WARM_MS = 10000;
+const MODELS: Model[] = HARNESSES.flatMap(harness => harness.models);
+const COMMANDS = [
+  { label: "/model", detail: "choose harness, model and thinking for a new session" },
+  { label: "/effort", detail: "choose the thinking of the next turns" },
+  { label: "/new", detail: "start a new session" },
+];
+
+const highlight = () => import("./syntax.ts").then(module => module.highlight);
+
+const listeners = new Set<() => void>();
+let state: State = load();
+let version = 0;
+let warmed: string | undefined;
+let used = 0;
+const queued: string[] = [];
+let token = localStorage.getItem(TOKEN) ?? "";
+
+function load(): State {
+  return { entries: [], ...JSON.parse(localStorage.getItem(KEY) ?? "{}") };
+}
+
+function save() {
+  localStorage.setItem(KEY, JSON.stringify(state));
+  version++;
+  for (const listener of listeners) listener();
+}
+
+function useStore() {
+  useSyncExternalStore(listener => { listeners.add(listener); return () => listeners.delete(listener); }, () => version);
+  return state;
+}
+
+function identifier(prefix: string) {
+  const bytes = crypto.getRandomValues(new Uint8Array(12));
+  return `${prefix}-${Array.from(bytes, byte => byte.toString(16).padStart(2, "0")).join("")}`;
+}
+
+function current(): Model {
+  return MODELS.find(model => model.id === state.model) ?? MODELS[0]!;
+}
+
+function harnessOf(model: Model) {
+  return HARNESSES.find(harness => harness.models.includes(model))!;
+}
+
+function headers(extra: Record<string, string> = {}): Record<string, string> {
+  return { ...extra, ...(token ? { authorization: `Bearer ${token}` } : {}) };
+}
+
+type Sink = { push(event: LiveEvent): void; note(kind: EntryKind, text: string): void };
+
+function receive(logged: Parameters<typeof liveEvent>[0], requestId: string, sink: Sink): boolean {
+  const body = (logged.event ?? {}) as { source?: string; type?: string };
+  if (body.source === "agent") {
+    const event = liveEvent(logged);
+    if (event) sink.push(event);
+    return false;
+  }
+  if (logged.request_id !== requestId) return false;
+  if (body.type === "interrupted") sink.note("tool", "The session object reset. Its alarm started it again, and the turn continues from its checkpoint.");
+  if (body.type !== "retrying" && body.type !== "result") return false;
+  const event = liveEvent(logged);
+  if (event) sink.push(event);
+  return body.type === "result";
+}
+
+async function follow(response: Response, requestId: string, sink: Sink): Promise<boolean> {
+  if (!response.ok || !response.body) {
+    sink.note("error", `${response.status} ${await response.text()}`);
+    return true;
+  }
+  let settled = false;
+  try {
+    for await (const message of serverEvents(response.body)) {
+      if (message.id) {
+        state.cursor = Number(message.id);
+        save();
+      }
+      if (message.data && receive(JSON.parse(message.data), requestId, sink)) {
+        settled = true;
+        break;
+      }
+    }
+  } catch {
+    sink.note("tool", "The stream dropped. Reconnecting from the last event.");
+    return false;
+  }
+  if (settled) void response.body.cancel().catch(() => undefined);
+  return settled;
+}
+
+async function reconnect(requestId: string, sink: Sink) {
+  for (;;) {
+    const response = await fetch(`sessions/${encodeURIComponent(state.session!)}/events?after=${state.cursor ?? 0}`, { headers: headers({ accept: "text/event-stream" }) }).catch(() => undefined);
+    if (response && await follow(response, requestId, sink)) return;
+    await new Promise(resolve => setTimeout(resolve, RECONNECT_MS));
+  }
+}
+
+const config = createConfig({
+  persist: { load: () => state.entries, save: entries => { state.entries = [...entries]; save(); } },
+  transport: {
+    async send({ prompt, push, note }) {
+      state.session ??= warmed ?? identifier("web");
+      used = performance.now();
+      const requestId = identifier("turn");
+      state.open = requestId;
+      save();
+      const model = current();
+      try {
+        const response = await fetch(`sessions/${encodeURIComponent(state.session)}/turns?after=${state.cursor ?? 0}`, { method: "POST", headers: headers({ accept: "text/event-stream", "content-type": "application/json" }), body: JSON.stringify({ request_id: requestId, prompt, provider: harnessOf(model).id, model: model.id, thinking: state.thinking ?? model.effort }) });
+        if (!(await follow(response, requestId, { push, note }))) await reconnect(requestId, { push, note });
+      } finally {
+        state.open = undefined;
+        used = performance.now();
+        save();
+        const next = queued.shift();
+        if (next) config.run(() => void config.send(next));
+      }
+    },
+    async steer({ prompt }) {
+      const model = current();
+      const response = await fetch(`sessions/${encodeURIComponent(state.session!)}/turns`, { method: "POST", headers: headers({ "content-type": "application/json" }), body: JSON.stringify({ request_id: identifier("steer"), prompt, provider: harnessOf(model).id, model: model.id, steer: true }) });
+      if (response.ok) return true;
+      if (response.status === 409) {
+        queued.push(prompt);
+        return false;
+      }
+      throw new Error(`${response.status} ${await response.text()}`);
+    },
+    async resume({ push, note }) {
+      if (!state.open || !state.session) return;
+      try {
+        await reconnect(state.open, { push, note });
+      } finally {
+        state.open = undefined;
+        save();
+      }
+    },
+  },
+});
+
+function App() {
+  const store = useStore();
+  const chat = useConfig();
+  const { send, isPending: busy } = useSend();
+  const [picker, setPicker] = useState<Picker | null>(null);
+  const [access, setAccess] = useState(false);
+  const [secret, setSecret] = useState(token);
+
+  const configure = async () => {
+    const open = await fetch("health").catch(() => undefined);
+    setAccess(open?.ok !== true);
+    const health = open?.ok ? open : await fetch("health", { headers: headers() }).catch(() => undefined);
+    if (health?.ok && !MODELS.some(entry => entry.id === state.model)) {
+      const configured = (await health.json() as { models: { claude: string } }).models.claude;
+      const model = MODELS.find(entry => entry.id === configured) ?? MODELS[0];
+      if (model) {
+        state.model = model.id;
+        if (!model.efforts.includes(state.thinking as Model["effort"])) state.thinking = model.efforts.includes("low" as Model["effort"]) ? "low" : model.effort;
+        save();
+      }
+    }
+  };
+
+  useEffect(() => {
+    void configure();
+    void chat.resume();
+  }, []);
+
+  const pickThinking = (id: string) => {
+    const model = MODELS.find(entry => entry.id === id);
+    setPicker({ title: `Thinking · ${id}`, items: () => thinkingItems(model, id === current().id ? state.thinking : undefined), onChoose: item => { setPicker(null); think(id, item.label); } });
+  };
+
+  const pick = (model: string) => {
+    if (state.session && model !== current().id) {
+      setPicker(null);
+      return chat.note("tool", "the model is fixed for this session; use /new before choosing another model");
+    }
+    pickThinking(model);
+  };
+
+  const think = (model: string, level: string) => {
+    state.model = model;
+    state.thinking = level;
+    save();
+    chat.note("tool", `using ${model} · thinking ${level}`);
+  };
+
+  const clear = () => {
+    queued.length = 0;
+    warmed = undefined;
+    used = 0;
+    const { model, thinking } = state;
+    localStorage.removeItem(KEY);
+    state = { ...load(), model, thinking };
+    chat.clear();
+    save();
+  };
+
+  const command = (text: string) => {
+    const [name, ...words] = text.split(/\s+/);
+    const argument = words.join(" ").toLowerCase();
+    if (name === "/new") {
+      clear();
+      chat.note("tool", "new session");
+      return true;
+    }
+    if (name === "/model") {
+      if (!argument) {
+        setPicker({ title: "Model", filter: true, items: query => modelItems(HARNESSES, current().id, query), onChoose: item => pick(item.label) });
+        return true;
+      }
+      const match = MODELS.find(model => argument.split(" ").every(word => `${model.id} ${model.name}`.toLowerCase().includes(word)));
+      if (match) pick(match.id);
+      else chat.note("error", `no model matches "${argument}"; choose one of ${MODELS.map(model => model.id).join(", ")}`);
+      return true;
+    }
+    if (name !== "/effort") return false;
+    const model = current();
+    if (!argument) {
+      pickThinking(model.id);
+      return true;
+    }
+    if (model.efforts.includes(argument as Model["effort"])) think(model.id, argument);
+    else chat.note("error", `${model.id} takes ${model.efforts.join("/")} thinking, not ${argument}`);
+    return true;
+  };
+
+  const warm = (text: string) => {
+    if (busy || !text || text.startsWith("/") || (used && performance.now() - used < WARM_MS)) return;
+    used = performance.now();
+    const session = state.session ?? (warmed ??= identifier("web"));
+    const model = current();
+    void fetch(`sessions/${encodeURIComponent(session)}/warm`, { method: "POST", headers: headers({ "content-type": "application/json" }), body: JSON.stringify({ provider: harnessOf(model).id, model: model.id }) }).catch(() => undefined);
+  };
+
+  const crash = async () => {
+    if (!state.session) return chat.note("error", "Start a session before arming a crash.");
+    const response = await fetch(`sessions/${encodeURIComponent(state.session)}/crash`, { method: "POST", headers: headers({ "content-type": "application/json" }), body: JSON.stringify({ after_ms: CRASH_AFTER_MS }) });
+    if (response.ok) chat.note("tool", "Armed: the next tool call resets its Durable Object 1.5 s in.");
+    else chat.note("error", `${response.status} ${await response.text()}`);
+  };
+
+  const model = current();
+
+  return (
+    <Chat
+      actions={<button className="suggestion" disabled={busy} onClick={clear} type="button">New session</button>}
+      commands={COMMANDS}
+      empty="Ask a question to start a turn, or type /model to choose a model."
+      extras={access && (
+        <label className="row">
+          <span aria-hidden="true" className="chevron">#</span>
+          <input
+            aria-label="Access token"
+            className="input"
+            onBlur={() => void configure()}
+            onChange={event => {
+              setSecret(event.target.value);
+              token = event.target.value;
+              localStorage.setItem(TOKEN, token);
+            }}
+            placeholder="Access token"
+            type="password"
+            value={secret}
+          />
+        </label>
+      )}
+      link={{ href: "https://nanocode.xyz/", label: "nanocode.xyz →" }}
+      onInput={warm}
+      onPickerClose={() => setPicker(null)}
+      onSubmit={text => { if (!command(text)) void send(text); }}
+      picker={picker}
+      status={`${harnessOf(model).label} · ${model.label} · ${store.thinking ?? model.effort} · ${store.session ?? "new session"} · ${busy ? "running" : "idle"}`}
+      suggestions={["Charge me $42", "List your tools", { label: "Kill the next tool call", onClick: () => void crash(), disabled: !store.session }]}
+    />
+  );
+}
+
+createRoot(document.getElementById("chat")!).render(
+  <NanocodeProvider config={config} highlight={highlight}>
+    <App />
+  </NanocodeProvider>,
+);

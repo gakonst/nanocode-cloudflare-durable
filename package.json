@@ -3,7 +3,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "build": "node scripts/build-syntax.mjs && npm run check",
+    "build": "node scripts/build-ui.mjs && npm run check",
     "check": "tsc --noEmit && tsc --project tsconfig.ui.json",
     "dev": "wrangler dev",
     "dry-run": "wrangler deploy --dry-run --outdir output/deploy",
@@ -14,10 +14,14 @@
   },
   "dependencies": {
     "@pierre/highlights": "0.2.0",
-    "nanocode-ts": "https://github.com/gakonst/nanocode-ts/releases/download/build-ce9f311/nanocode-ts-ce9f311.tgz"
+    "nanocode-ts": "https://github.com/gakonst/nanocode-ts/releases/download/build-ce9f311/nanocode-ts-ce9f311.tgz",
+    "react": "19.3.1",
+    "react-dom": "19.3.1"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "5.20261016.1",
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
     "esbuild": "0.28.2",
     "typescript": "6.0.2",
     "wrangler": "4.151.1"
