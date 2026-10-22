@@ -6,7 +6,7 @@ await build({
   bundle: true,
   chunkNames: "syntax/[name]-[hash]",
   entryNames: "syntax",
-  entryPoints: ["ui/render.ts"],
+  entryPoints: ["ui/syntax.ts"],
   format: "esm",
   minify: true,
   outdir: "public",

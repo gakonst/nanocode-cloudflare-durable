@@ -1,11 +1,10 @@
-import { liveEvent, modelItems as models, serverEvents, thinkingItems as levels, Transcript } from "./client.js";
+import { Chat } from "./ui.js";
+import { liveEvent, modelItems as models, serverEvents, thinkingItems as levels } from "./client.js";
 import { harnesses as HARNESSES } from "./models.js";
-import { reply } from "./syntax.js";
 
 const KEY = "nanocode-cloudflare-durable";
 const TOKEN = `${KEY}:token`;
 const RECONNECT_MS = 1000;
-const TYPING_DELAY_MS = 500;
 const CRASH_AFTER_MS = 1500;
 const WARM_MS = 10000;
 const MODELS = HARNESSES.flatMap(harness => harness.models);
@@ -15,39 +14,41 @@ const COMMANDS = [
   { label: "/new", detail: "start a new session" },
 ];
 
-const elements = {
-  access: document.getElementById("access"),
-  chat: document.getElementById("chat"),
-  crash: document.getElementById("crash"),
-  log: document.getElementById("log"),
-  picker: document.getElementById("picker"),
-  prompt: document.getElementById("prompt"),
-  reset: document.getElementById("reset"),
-  send: document.getElementById("send"),
-  status: document.getElementById("status"),
-  suggestions: [...document.querySelectorAll("[data-prompt]")],
-  token: document.getElementById("token"),
-  typing: document.getElementById("typing"),
-};
-
 let state = load();
-let busy = false;
-let typing = false;
-let typingTimer;
-let picker = null;
-let highlight = 0;
 let warmed;
 let used = 0;
 let queued = [];
-let live;
-const transcript = new Transcript({
-  add,
-  live: entry => {
-    live = entry ?? undefined;
-    render();
+
+const access = document.createElement("label");
+access.className = "row";
+access.innerHTML = '<span aria-hidden="true" class="chevron">#</span><input aria-label="Access token" class="input" placeholder="Access token" type="password" />';
+const token = access.querySelector("input");
+
+const reset = document.createElement("button");
+reset.className = "suggestion";
+reset.type = "button";
+reset.textContent = "New session";
+
+const chat = new Chat(document.getElementById("chat"), {
+  submit: text => void ask(text),
+  input: warm,
+  commands: COMMANDS,
+  entries: state.entries,
+  save: entries => {
+    state.entries = [...entries];
+    save();
   },
-  reducedMotion: () => matchMedia("(prefers-reduced-motion: reduce)").matches,
+  highlight: () => import("./syntax.js").then(module => module.highlight),
+  empty: "Ask a question to start a turn, or type /model to choose a model.",
+  suggestions: [
+    "Charge me $42",
+    "List your tools",
+    { label: "Kill the next tool call", run: () => void crash(), enabled: () => Boolean(state.session) },
+  ],
+  link: { href: "https://nanocode.xyz/", label: "nanocode.xyz →" },
 });
+chat.extras.append(access);
+chat.actions.append(reset);
 
 function load() {
   const saved = JSON.parse(localStorage.getItem(KEY) ?? "{}");
@@ -72,184 +73,54 @@ function harnessOf(model) {
 }
 
 function render() {
-  const shown = live ? [...state.entries, live] : state.entries;
-  elements.log.replaceChildren(...(shown.length === 0 ? [paragraph("entry entry-tool", "Ask a question to start a turn, or type /model to choose a model.")] : shown.map((entry, index) => {
-    const previous = shown[index - 1];
-    const label = entry.kind === "user" ? "you" : !previous || previous.kind === "user" ? "agent" : undefined;
-    const turn = document.createElement("div");
-    turn.className = "turn";
-    if (label) {
-      const speaker = paragraph(`speaker speaker-${label}`, ` ${label}`);
-      const dot = document.createElement("span");
-      dot.ariaHidden = "true";
-      dot.textContent = "●";
-      speaker.prepend(dot);
-      turn.append(speaker);
-    }
-    const body = entry.kind === "assistant" ? reply(entry.text) : paragraph("", entry.kind === "reasoning" ? entry.text.replace(/\*\*(.+?)\*\*/g, "$1") : entry.text);
-    body.className = `entry entry-${entry.kind}${entry === live ? " entry-live" : ""}`;
-    turn.append(body);
-    return turn;
-  })));
-  elements.log.scrollTo({ top: elements.log.scrollHeight });
-  elements.typing.className = typing ? "typing typing-visible" : "typing";
-  if (typing) {
-    const speaker = document.createElement("span");
-    speaker.className = "speaker speaker-agent";
-    speaker.textContent = "agent";
-    elements.typing.replaceChildren(speaker, live?.kind === "reasoning" ? " is thinking" : " is typing");
-  } else elements.typing.replaceChildren();
   const model = current();
-  elements.status.textContent = `${harnessOf(model).label} · ${model.label} · ${state.thinking ?? model.effort} · ${state.session ?? "new session"} · ${busy ? "running" : "idle"}`;
-  renderMenu();
-  for (const control of [elements.reset, ...elements.suggestions]) control.disabled = busy;
-  elements.crash.disabled = !state.session;
-}
-
-function menuItems() {
-  if (picker?.kind === "model") return modelItems(elements.prompt.value);
-  if (picker?.kind === "thinking") return thinkingItems(picker.model);
-  const query = elements.prompt.value;
-  if (!/^\/\S*$/.test(query)) return [];
-  return COMMANDS.filter(entry => entry.label.startsWith(query)).map(entry => ({ kind: "choice", ...entry }));
-}
-
-function modelItems(query) {
-  return models(HARNESSES, current().id, query);
-}
-
-function thinkingItems(id) {
-  return levels(MODELS.find(entry => entry.id === id), id === current().id ? state.thinking : undefined);
-}
-
-function renderMenu() {
-  const items = menuItems();
-  const choices = items.filter(item => item.kind === "choice");
-  highlight = Math.min(highlight, Math.max(0, choices.length - 1));
-  const open = picker !== null || items.length > 0;
-  elements.picker.hidden = !open;
-  elements.prompt.placeholder = picker?.kind === "model" ? "type to filter" : busy ? "Steer the running turn" : "Ask the agent, or type / for commands";
-  if (!open) return elements.picker.replaceChildren();
-  const width = Math.max(0, ...choices.map(item => item.label.length));
-  const children = [];
-  if (picker) children.push(paragraph("picker-title", picker.kind === "model" ? "Model" : `Thinking · ${picker.model}`));
-  if (picker?.kind === "model") {
-    const filter = paragraph("picker-muted", "filter: ");
-    filter.append(span("picker-query", elements.prompt.value), span("picker-caret", "▏"));
-    children.push(filter);
-    if (choices.length === 0) children.push(paragraph("picker-muted", "  no matches"));
-  }
-  let position = -1;
-  for (const item of items) {
-    if (item.kind === "header") {
-      children.push(paragraph("picker-header", item.label));
-      continue;
-    }
-    position += 1;
-    const index = position;
-    const button = document.createElement("button");
-    button.type = "button";
-    button.className = "picker-choice";
-    button.role = "option";
-    button.ariaSelected = String(index === highlight);
-    button.style.gridTemplateColumns = `2ch ${width}ch 2ch auto`;
-    button.append(span("picker-marker", index === highlight ? "›" : ""), span("picker-label", item.label), span("picker-marker", item.current ? "✓" : ""), span("picker-detail", item.detail ?? ""));
-    button.addEventListener("mousemove", () => {
-      if (highlight === index) return;
-      highlight = index;
-      renderMenu();
-    });
-    button.addEventListener("click", () => choose(item));
-    children.push(button);
-  }
-  if (picker) children.push(paragraph("picker-muted", picker.kind === "model" ? "type to filter · enter select · esc cancel" : "enter select · esc cancel"));
-  elements.picker.ariaLabel = picker?.kind === "model" ? "Model" : picker ? "Thinking" : "Commands";
-  elements.picker.replaceChildren(...children);
-}
-
-function span(className, text) {
-  const element = document.createElement("span");
-  element.className = className;
-  element.textContent = text;
-  return element;
-}
-
-function open(next) {
-  elements.prompt.value = "";
-  picker = next;
-  const items = next.kind === "model" ? modelItems("") : thinkingItems(next.model);
-  highlight = Math.max(0, items.filter(item => item.kind === "choice").findIndex(item => item.current));
-  renderMenu();
-}
-
-function close() {
-  picker = null;
-  elements.prompt.value = "";
-  renderMenu();
-}
-
-function pick(model) {
-  if (state.session && model !== current().id) {
-    close();
-    note("tool", "the model is fixed for this session; use /new before choosing another model");
-    return;
-  }
-  open({ kind: "thinking", model });
-}
-
-function think(model, level) {
-  close();
-  state.model = model;
-  state.thinking = level;
-  save();
-  note("tool", `using ${model} · thinking ${level}`);
-}
-
-function choose(item) {
-  if (picker?.kind === "model") pick(item.label);
-  else if (picker?.kind === "thinking") think(picker.model, item.label);
-  else command(item.label);
-}
-
-function paragraph(className, text) {
-  const element = document.createElement("p");
-  element.className = className;
-  element.textContent = text;
-  return element;
-}
-
-function add(entry) {
-  state.entries.push(entry);
-  save();
-  render();
+  chat.status = `${harnessOf(model).label} · ${model.label} · ${state.thinking ?? model.effort} · ${state.session ?? "new session"} · ${chat.busy ? "running" : "idle"}`;
+  reset.disabled = chat.busy;
+  chat.refresh();
 }
 
 function setBusy(value) {
-  busy = value;
-  typing = false;
-  clearTimeout(typingTimer);
-  if (value) typingTimer = setTimeout(() => {
-    typing = true;
-    render();
-  }, TYPING_DELAY_MS);
+  chat.busy = value;
   render();
 }
 
 function note(kind, text) {
-  transcript.run(() => add({ kind, text }));
+  chat.note(kind, text);
+}
+
+function openModels() {
+  chat.pick({ title: "Model", filter: true, items: query => models(HARNESSES, current().id, query), choose: item => pick(item.label) });
+}
+
+function openThinking(id) {
+  const model = MODELS.find(entry => entry.id === id);
+  chat.pick({ title: `Thinking · ${id}`, items: () => levels(model, id === current().id ? state.thinking : undefined), choose: item => think(id, item.label) });
+}
+
+function pick(model) {
+  if (state.session && model !== current().id) return note("tool", "the model is fixed for this session; use /new before choosing another model");
+  openThinking(model);
+}
+
+function think(model, level) {
+  state.model = model;
+  state.thinking = level;
+  save();
+  render();
+  note("tool", `using ${model} · thinking ${level}`);
 }
 
 function receive(logged, requestId) {
   const body = logged.event ?? {};
   if (body.source === "agent") {
     const event = liveEvent(logged);
-    if (event) transcript.push(event);
+    if (event) chat.push(event);
     return false;
   }
   if (logged.request_id !== requestId) return false;
   if (body.type === "interrupted") note("tool", "The session object reset. Its alarm started it again, and the turn continues from its checkpoint.");
   if (body.type !== "retrying" && body.type !== "result") return false;
-  transcript.push(liveEvent(logged));
+  chat.push(liveEvent(logged));
   return body.type === "result";
 }
 
@@ -280,7 +151,7 @@ async function follow(response, requestId) {
 
 async function configure() {
   const open = await fetch("health").catch(() => undefined);
-  elements.access.hidden = open?.ok === true;
+  access.hidden = open?.ok === true;
   const health = open?.ok ? open : await fetch("health", { headers: headers() }).catch(() => undefined);
   if (health?.ok && !MODELS.some(entry => entry.id === state.model)) {
     const configured = (await health.json()).models.claude;
@@ -295,8 +166,7 @@ async function configure() {
 }
 
 function headers(extra = {}) {
-  const token = elements.token.value;
-  return { ...extra, ...(token ? { authorization: `Bearer ${token}` } : {}) };
+  return { ...extra, ...(token.value ? { authorization: `Bearer ${token.value}` } : {}) };
 }
 
 async function reconnect(requestId) {
@@ -307,16 +177,14 @@ async function reconnect(requestId) {
   }
 }
 
-function reset() {
-  transcript.reset();
-  live = undefined;
-  picker = null;
+function clear() {
   queued = [];
   warmed = undefined;
   used = 0;
   const { model, thinking } = state;
   localStorage.removeItem(KEY);
   state = { ...load(), model, thinking };
+  chat.clear();
   save();
   render();
 }
@@ -325,18 +193,16 @@ function command(text) {
   const [name, ...words] = text.split(/\s+/);
   const argument = words.join(" ").toLowerCase();
   if (name === "/new") {
-    elements.prompt.value = "";
-    reset();
+    clear();
     note("tool", "new session");
     return true;
   }
   if (name === "/model") {
     if (!argument) {
-      open({ kind: "model" });
+      openModels();
       return true;
     }
     const match = MODELS.find(model => argument.split(" ").every(word => `${model.id} ${model.name}`.toLowerCase().includes(word)));
-    elements.prompt.value = "";
     if (match) pick(match.id);
     else note("error", `no model matches "${argument}"; choose one of ${MODELS.map(model => model.id).join(", ")}`);
     return true;
@@ -344,18 +210,15 @@ function command(text) {
   if (name !== "/effort") return false;
   const model = current();
   if (!argument) {
-    open({ kind: "thinking", model: model.id });
+    openThinking(model.id);
     return true;
   }
-  elements.prompt.value = "";
   if (model.efforts.includes(argument)) think(model.id, argument);
   else note("error", `${model.id} takes ${model.efforts.join("/")} thinking, not ${argument}`);
   return true;
 }
 
 async function steer(text) {
-  elements.prompt.value = "";
-  renderMenu();
   note("user", text);
   const model = current();
   const response = await fetch(`sessions/${encodeURIComponent(state.session)}/turns`, { method: "POST", headers: headers({ "content-type": "application/json" }), body: JSON.stringify({ request_id: identifier("steer"), prompt: text, provider: harnessOf(model).id, model: model.id, steer: true }) }).catch(error => error);
@@ -367,12 +230,11 @@ async function steer(text) {
 
 async function ask(text, echoed = false) {
   if (!text || command(text)) return;
-  if (busy) return void steer(text);
+  if (chat.busy) return void steer(text);
   state.session ??= warmed ?? identifier("web");
   used = performance.now();
   const requestId = identifier("turn");
   state.open = requestId;
-  elements.prompt.value = "";
   if (!echoed) note("user", text);
   setBusy(true);
   const model = current();
@@ -382,7 +244,7 @@ async function ask(text, echoed = false) {
   } catch (error) {
     note("error", error instanceof Error ? error.message : String(error));
   } finally {
-    transcript.run(() => {
+    chat.run(() => {
       state.open = undefined;
       used = performance.now();
       save();
@@ -393,6 +255,14 @@ async function ask(text, echoed = false) {
   }
 }
 
+function warm(text) {
+  if (chat.busy || !text || text.startsWith("/") || (used && performance.now() - used < WARM_MS)) return;
+  used = performance.now();
+  const session = state.session ?? (warmed ??= identifier("web"));
+  const model = current();
+  void fetch(`sessions/${encodeURIComponent(session)}/warm`, { method: "POST", headers: headers({ "content-type": "application/json" }), body: JSON.stringify({ provider: harnessOf(model).id, model: model.id }) }).catch(() => undefined);
+}
+
 async function crash() {
   if (!state.session) return note("error", "Start a session before arming a crash.");
   const response = await fetch(`sessions/${encodeURIComponent(state.session)}/crash`, { method: "POST", headers: headers({ "content-type": "application/json" }), body: JSON.stringify({ after_ms: CRASH_AFTER_MS }) });
@@ -400,57 +270,16 @@ async function crash() {
   else note("error", `${response.status} ${await response.text()}`);
 }
 
-
-elements.token.value = localStorage.getItem(TOKEN) ?? "";
-elements.token.addEventListener("input", () => localStorage.setItem(TOKEN, elements.token.value));
-elements.token.addEventListener("change", () => void configure());
-elements.send.addEventListener("click", () => void ask(elements.prompt.value.trim()));
-elements.prompt.addEventListener("input", () => {
-  if (picker?.kind === "model") highlight = 0;
-  renderMenu();
-  if (busy || elements.prompt.value.startsWith("/") || (used && performance.now() - used < WARM_MS)) return;
-  used = performance.now();
-  const session = state.session ?? (warmed ??= identifier("web"));
-  const model = current();
-  void fetch(`sessions/${encodeURIComponent(session)}/warm`, { method: "POST", headers: headers({ "content-type": "application/json" }), body: JSON.stringify({ provider: harnessOf(model).id, model: model.id }) }).catch(() => undefined);
-});
-elements.prompt.addEventListener("keydown", event => {
-  const choices = menuItems().filter(item => item.kind === "choice");
-  if (picker || choices.length > 0) {
-    if (event.key === "ArrowDown" || event.key === "ArrowUp") {
-      event.preventDefault();
-      highlight = Math.min(Math.max(0, highlight + (event.key === "ArrowDown" ? 1 : -1)), Math.max(0, choices.length - 1));
-      renderMenu();
-      return;
-    }
-    if (event.key === "Escape") {
-      event.preventDefault();
-      close();
-      return;
-    }
-    if ((event.key === "Enter" && !event.shiftKey) || (event.key === "Tab" && !picker)) {
-      event.preventDefault();
-      if (choices[highlight]) choose(choices[highlight]);
-      return;
-    }
-  }
-  if (event.key !== "Enter" || event.shiftKey) return;
-  event.preventDefault();
-  void ask(elements.prompt.value.trim());
-});
-for (const suggestion of elements.suggestions) suggestion.addEventListener("click", () => void ask(suggestion.dataset.prompt));
-elements.crash.addEventListener("click", () => void crash());
-elements.reset.addEventListener("click", () => reset());
-elements.chat.addEventListener("click", event => {
-  if (event.target.closest("a, button, input, textarea") || getSelection()?.toString()) return;
-  elements.prompt.focus();
-});
+token.value = localStorage.getItem(TOKEN) ?? "";
+token.addEventListener("input", () => localStorage.setItem(TOKEN, token.value));
+token.addEventListener("change", () => void configure());
+reset.addEventListener("click", () => clear());
 
 render();
 void configure();
 if (state.open && state.session) {
   setBusy(true);
-  void reconnect(state.open).finally(() => transcript.run(() => {
+  void reconnect(state.open).finally(() => chat.run(() => {
     state.open = undefined;
     save();
     setBusy(false);

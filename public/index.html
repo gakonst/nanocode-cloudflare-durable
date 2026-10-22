@@ -28,6 +28,7 @@
     <link rel="icon" href="favicon.svg" />
     <link as="font" crossorigin="" href="fonts/CommitMono-VF.woff2" rel="preload" type="font/woff2" />
     <link rel="stylesheet" href="style.css" />
+    <link rel="stylesheet" href="ui.css" />
   </head>
   <body>
     <header class="header">
@@ -54,26 +55,7 @@
         <h1>nanocode on Cloudflare<span class="dot">.</span><br />Durable agents in Durable Objects.</h1>
         <p class="demos">nanocode on <span class="toggle"><a aria-current="page" aria-label="nanocode on Cloudflare" class="demo" href="https://nanocode.xyz/cloudflare/"><svg aria-hidden="true" class="logo" viewBox="0 3 24 18"><path d="M16.5088 16.8447c.1475-.5068.0908-.9707-.1553-1.3154-.2246-.3164-.6045-.499-1.0615-.5205l-8.6592-.1123a.1559.1559 0 0 1-.1333-.0713c-.0283-.042-.0351-.0986-.021-.1553.0278-.084.1123-.1484.2036-.1562l8.7359-.1123c1.0351-.0489 2.1601-.8868 2.5537-1.9136l.499-1.3013c.0215-.0561.0293-.1128.0147-.168-.5625-2.5463-2.835-4.4453-5.5499-4.4453-2.5039 0-4.6284 1.6177-5.3876 3.8614-.4927-.3658-1.1187-.5625-1.794-.499-1.2026.119-2.1665 1.083-2.2861 2.2856-.0283.31-.0069.6128.0635.894C1.5683 13.171 0 14.7754 0 16.752c0 .1748.0142.3515.0352.5273.0141.083.0844.1475.1689.1475h15.9814c.0909 0 .1758-.0645.2032-.1553l.12-.4268zm2.7568-5.5634c-.0771 0-.1611 0-.2383.0112-.0566 0-.1054.0415-.127.0976l-.3378 1.1744c-.1475.5068-.0918.9707.1543 1.3164.2256.3164.6055.498 1.0625.5195l1.8437.1133c.0557 0 .1055.0263.1329.0703.0283.043.0351.1074.0214.1562-.0283.084-.1132.1485-.204.1553l-1.921.1123c-1.041.0488-2.1582.8867-2.5527 1.914l-.1406.3585c-.0283.0713.0215.1416.0986.1416h6.5977c.0771 0 .1474-.0489.169-.126.1122-.4082.1757-.837.1757-1.2803 0-2.6025-2.125-4.727-4.7344-4.727" /></svg>Cloudflare</a><a aria-label="nanocode on Tempo" class="demo" href="https://nanocode.xyz/machines/"><svg aria-hidden="true" class="logo" viewBox="-2.13 -1.75 23.28 23.28"><path d="M6.71995 19.786H1.38045L6.32925 4.48482H0L1.38045 0H19.0138L17.6333 4.48482H11.6427L6.71995 19.786Z" /></svg>Tempo</a><a aria-label="nanocode on Vercel" class="demo" href="https://nanocode.xyz/vercel"><svg aria-hidden="true" class="logo" viewBox="0 0 24 24"><path d="m12 1.608 12 20.784H0Z" /></svg>Vercel</a></span></p>
         <p class="lead">This agent runs in a Cloudflare Durable Object: the nanocode SDK compiled to WebAssembly, with its journal in the object's own SQLite. When the object resets mid-turn, its alarm starts it again, and the turn continues from the last checkpoint. Cloudflare AI Gateway serves its model requests. Its source is <a href="https://github.com/gakonst/nanocode-cloudflare-durable">gakonst/nanocode-cloudflare-durable</a>.</p>
-        <section aria-label="Agent" class="chat" id="chat">
-          <div aria-live="polite" class="log" id="log"><p class="entry entry-tool">Ask a question to start a turn, or type /model to choose a model.</p></div>
-          <p aria-live="polite" class="typing" id="typing"></p>
-          <label class="row" id="access">
-            <span aria-hidden="true" class="chevron">#</span>
-            <input aria-label="Access token" class="input" id="token" placeholder="Access token" type="password" />
-          </label>
-          <div class="picker" hidden id="picker" role="listbox"></div>
-          <div class="row">
-            <span aria-hidden="true" class="chevron">❯</span>
-            <textarea aria-label="Prompt" class="input" id="prompt" placeholder="Ask the agent, or type / for commands" rows="1"></textarea>
-            <button class="send" id="send" type="button"><kbd class="key">ENTER</kbd></button>
-          </div>
-          <div class="suggestions" id="suggestions">
-            <button class="suggestion" data-prompt="Charge me $42" type="button">Charge me $42</button>
-            <button class="suggestion" data-prompt="List your tools" type="button">List your tools</button>
-            <button class="suggestion" id="crash" type="button">Kill the next tool call</button>
-          </div>
-          <p class="status"><span id="status">Claude · new session · idle</span><button class="suggestion" id="reset" type="button">New session</button><a class="site" href="https://nanocode.xyz/" rel="noreferrer" target="_blank">nanocode.xyz →</a></p>
-        </section>
+        <div id="chat"></div>
         <p><a href="how-it-works">Read how it works →</a></p>
       </div>
     </main>
