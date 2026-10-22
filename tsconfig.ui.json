@@ -7,8 +7,16 @@
     "noEmit": true,
     "allowImportingTsExtensions": true,
     "types": [],
-    "lib": ["ES2022", "DOM", "DOM.Iterable"],
-    "skipLibCheck": true
+    "lib": [
+      "ES2022",
+      "DOM",
+      "DOM.Iterable"
+    ],
+    "skipLibCheck": true,
+    "jsx": "react-jsx"
   },
-  "include": ["ui/**/*.ts"]
+  "include": [
+    "ui/**/*.ts",
+    "ui/**/*.tsx"
+  ]
 }
