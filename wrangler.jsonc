@@ -5,6 +5,7 @@
   "assets": { "directory": "./public" },
   "build": { "command": "node scripts/assets.mjs && node scripts/build-syntax.mjs" },
   "ai": { "binding": "AI" },
+  "worker_loaders": [{ "binding": "LOADER" }],
   "durable_objects": {
     "bindings": [
       { "name": "SESSIONS", "class_name": "AgentSession" },

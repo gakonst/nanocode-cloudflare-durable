@@ -1,3 +1,4 @@
+import type { WorkerLoader as CellLoader } from "nanocode-ts/cloudflare";
 import { createNanocode, type NanocodeEnv } from "../src/index";
 import { aiGateway } from "./gateway";
 import { client, PublicLimit } from "./limit";
@@ -11,6 +12,7 @@ interface Env extends NanocodeEnv {
   ACCESS_TOKEN_SHA256: string;
   CHAT_PUBLIC: string;
   PUBLIC_LIMITS: DurableObjectNamespace<PublicLimit>;
+  LOADER: CellLoader;
 }
 
 const DIGEST = /^[0-9a-f]{64}$/;
@@ -58,6 +60,7 @@ const nanocode = createNanocode<Env>({
   chaos: true,
   subagents: false,
   streamToolInput: true,
+  codeMode: { loader: env => env.LOADER },
 });
 
 export const { AgentSession } = nanocode;
