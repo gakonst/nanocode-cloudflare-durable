@@ -1,6 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
 import { AgentRuntime, EventHub, HostFailure, LocalHand, RECENT_MODEL_LIMIT, RemoteExecutor, RemoteRefusal, Timings, sessionUuid, timingDifference, type HostTool, type LoggedEvent, type LogPage, type ModelProvider, type TimingSnapshot, type TurnView } from "nanocode-ts";
-import { workerLoader, type WorkerLoader } from "nanocode-ts/cloudflare";
+import { quickjs } from "nanocode-ts/quickjs";
+import quickjsWasm from "nanocode-ts/quickjs.wasm";
 import wasm from "nanocode-ts/nanocode_wasm.wasm";
 import { CheckpointStore, Metadata, SQLITE_VALUE_LIMIT_BYTES } from "./store";
 import { ExecutorRejection, connectExecutor } from "./remote";
@@ -42,7 +43,7 @@ export type NanocodeOptions<E extends NanocodeEnv> = {
   chaos?: boolean;
   subagents?: boolean;
   streamToolInput?: boolean;
-  codeMode?: { loader(env: E): WorkerLoader; fetch?(authority: SessionAuthority, env: E): typeof fetch };
+  codeMode?: { fetch?(authority: SessionAuthority, env: E): typeof fetch };
   instructions?: string;
 };
 
@@ -64,6 +65,7 @@ function duration(value: string, name: string): number {
 const handName = (value: unknown): value is string => typeof value === "string" && EXECUTOR_ID.test(value);
 const TOO_LARGE = `request bodies are limited to ${SQLITE_VALUE_LIMIT_BYTES} bytes`;
 const decoder = new TextDecoder();
+const cells = quickjs({ wasm: quickjsWasm });
 const offline: typeof fetch = async () => { throw new Error("this host gives Code Mode scripts no network access"); };
 
 async function bodyText(request: Request): Promise<string | undefined> {
@@ -563,7 +565,7 @@ export function createNanocode<E extends NanocodeEnv>(options: NanocodeOptions<E
             ? connectExecutor(options.egress(this.env), authority, this.handLimits()).then(value => remote = value, error => { remoteFailed = true; remoteError = error; throw error; }).finally(() => this.scopeTimings(scope).record("remote.connect", performance.now() - connectStarted))
             : undefined;
           void connecting?.catch(() => {});
-          const local = options.codeMode && !enabled && !this.handsMode(scope, descriptor) ? new LocalHand({ evaluate: workerLoader(options.codeMode.loader(this.env)), fetch: options.codeMode.fetch?.(authority, this.env) ?? offline }) : undefined;
+          const local = options.codeMode && !enabled && !this.handsMode(scope, descriptor) ? new LocalHand({ evaluate: cells, fetch: options.codeMode.fetch?.(authority, this.env) ?? offline }) : undefined;
           try {
             const created = await this.instance(scope, true);
             await created.open({ scope, session_id: sessionId, provider: descriptor.provider ?? "claude", model: descriptor.model ?? (descriptor.provider === "codex" ? undefined : this.env.CLAUDE_MODEL), subscription: descriptor.subscription, endpoint: descriptor.provider === "codex" ? (descriptor.subscription ? "https://chatgpt.com/backend-api/codex" : "https://api.openai.com/v1") : `https://api.anthropic.com/v1/messages${descriptor.subscription ? "?beta=true" : ""}`, ...(descriptor.provider === "codex" && WORKERS_AI_MODELS.has(descriptor.model ?? "") ? { gateway: "workers_ai" as const, cloudflare_account_id: this.env.WORKERS_AI_ACCOUNT_ID } : {}), remote: enabled, code_mode: local !== undefined, executor: descriptor.executor_id, ...(options.subagents === undefined ? {} : { subagents: options.subagents }), ...(options.instructions === undefined ? {} : { instructions: options.instructions }), hands: this.handsMode(scope, descriptor), event_coalesce_ms: duration(this.env.EVENT_COALESCE_MS, "EVENT_COALESCE_MS"), stream_tool_input: options.streamToolInput, tools: options.tools?.definitions }, {
