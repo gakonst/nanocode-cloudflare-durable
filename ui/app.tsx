@@ -1,7 +1,7 @@
 import "nanocode-ts/react/zyzz.css";
-import { createConfig, type Entry, modelItems, thinkingItems } from "nanocode-ts/client";
+import { createConfig, modelItems, thinkingItems } from "nanocode-ts/client";
 import { cloudflare } from "nanocode-ts/cloudflare/transport";
-import { Chat, NanocodeProvider, type Picker, styles, useConfig, useSend } from "nanocode-ts/react";
+import { Chat, NanocodeProvider, type Picker, styles, useConfig, useConversations, useSend } from "nanocode-ts/react";
 import { Demos, Header, Lead, Main, origin, Page, styles as site, Title } from "nanocode-ts/react/site";
 import { useEffect, useState, useSyncExternalStore } from "react";
 import { createRoot } from "react-dom/client";
@@ -10,7 +10,7 @@ import "./fonts.ts";
 
 type Model = (typeof HARNESSES)[number]["models"][number];
 
-type State = { entries: Entry[]; model?: string; thinking?: string; session?: string; cursor?: number; open?: string };
+type State = { model?: string; thinking?: string };
 
 const KEY = "nanocode-cloudflare-durable";
 const TOKEN = `${KEY}:token`;
@@ -29,7 +29,7 @@ let version = 0;
 let token = localStorage.getItem(TOKEN) ?? "";
 
 function load(): State {
-  return { entries: [], ...JSON.parse(localStorage.getItem(KEY) ?? "{}") };
+  return { ...JSON.parse(localStorage.getItem(KEY) ?? "{}") };
 }
 
 function save() {
@@ -54,26 +54,17 @@ function harnessOf(model: Model) {
 const transport = cloudflare({
   headers: (): Record<string, string> => token ? { authorization: `Bearer ${token}` } : {},
   model: () => ({ provider: harnessOf(current()).id, model: current().id, thinking: state.thinking ?? current().effort }),
-  session: {
-    load: () => ({ id: state.session, cursor: state.cursor, open: state.open }),
-    save: session => {
-      state.session = session.id;
-      state.cursor = session.cursor;
-      state.open = session.open;
-      save();
-    },
-  },
+  // The chat's history keeps each conversation's session; a change only re-renders the status line.
+  session: { load: () => ({}), save: () => save() },
 });
 
-const config = createConfig({
-  persist: { load: () => state.entries, save: entries => { state.entries = [...entries]; save(); } },
-  transport,
-});
+const config = createConfig({ history: { key: KEY }, transport });
 
 function App() {
   const store = useStore();
   const chat = useConfig();
   const { send, isPending: busy } = useSend();
+  const { current: conversation } = useConversations();
   const [picker, setPicker] = useState<Picker | null>(null);
   const [access, setAccess] = useState(false);
   const [secret, setSecret] = useState(token);
@@ -95,8 +86,11 @@ function App() {
 
   useEffect(() => {
     void configure();
-    void chat.resume();
   }, []);
+
+  useEffect(() => {
+    void chat.resume();
+  }, [conversation]);
 
   const pickThinking = (id: string) => {
     const model = MODELS.find(entry => entry.id === id);
@@ -104,7 +98,7 @@ function App() {
   };
 
   const pick = (model: string) => {
-    if (state.session && model !== current().id) {
+    if (transport.session().id && model !== current().id) {
       setPicker(null);
       return chat.note("tool", "the model is fixed for this session; use /new before choosing another model");
     }
@@ -119,10 +113,6 @@ function App() {
   };
 
   const clear = () => {
-    transport.forget();
-    const { model, thinking } = state;
-    localStorage.removeItem(KEY);
-    state = { ...load(), model, thinking };
     chat.clear();
     save();
   };
@@ -161,7 +151,7 @@ function App() {
   };
 
   const crash = async () => {
-    if (!state.session) return chat.note("error", "Start a session before arming a crash.");
+    if (!transport.session().id) return chat.note("error", "Start a session before arming a crash.");
     const response = await transport.crash();
     if (response.ok) chat.note("tool", "Armed: the next tool call resets its Durable Object 1.5 s in.");
     else chat.note("error", `${response.status} ${await response.text()}`);
@@ -197,8 +187,8 @@ function App() {
       onPickerClose={() => setPicker(null)}
       onSubmit={text => { if (!command(text)) void send(text); }}
       picker={picker}
-      status={`${harnessOf(model).label} · ${model.label} · ${store.thinking ?? model.effort} · ${store.session ?? "new session"} · ${busy ? "running" : "idle"}`}
-      suggestions={["Charge me $42", "List your tools", { label: "Kill the next tool call", onClick: () => void crash(), disabled: !store.session }]}
+      status={`${harnessOf(model).label} · ${model.label} · ${store.thinking ?? model.effort} · ${transport.session().id ?? "new session"} · ${busy ? "running" : "idle"}`}
+      suggestions={["Charge me $42", "List your tools", { label: "Kill the next tool call", onClick: () => void crash(), disabled: !transport.session().id }]}
     />
   );
 }
