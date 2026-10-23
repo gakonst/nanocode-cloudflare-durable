@@ -1,7 +1,8 @@
 import "nanocode-ts/react/zyzz.css";
 import { createConfig, modelItems, thinkingItems } from "nanocode-ts/client";
 import { cloudflare } from "nanocode-ts/cloudflare/transport";
-import { Chat, NanocodeProvider, type Picker, styles, useConfig, useConversations, useSend } from "nanocode-ts/react";
+import { Chat, NanocodeProvider, type Picker, useConfig, useConversations, useSend } from "nanocode-ts/react";
+import { skin, styles } from "nanocode-ts/react/skin";
 import { Demos, Header, Lead, Main, origin, Page, styles as site, Title } from "nanocode-ts/react/site";
 import { useEffect, useState, useSyncExternalStore } from "react";
 import { createRoot } from "react-dom/client";
@@ -203,7 +204,7 @@ createRoot(document.getElementById("root")!).render(
         <Title subtitle="Durable agents in Durable Objects.">nanocode on Cloudflare</Title>
         <Demos current="cloudflare" />
         <Lead>This agent runs in a Cloudflare Durable Object: the nanocode SDK compiled to WebAssembly, with its journal in the object's own SQLite. When the object resets mid-turn, its alarm starts it again, and the turn continues from the last checkpoint. Cloudflare AI Gateway serves its model requests. Its source is <a href="https://github.com/gakonst/nanocode-cloudflare-durable">gakonst/nanocode-cloudflare-durable</a>.</Lead>
-        <NanocodeProvider config={config} highlight={highlight}>
+        <NanocodeProvider config={config} highlight={highlight} skin={skin}>
           <App />
         </NanocodeProvider>
         <p><a href="how-it-works">Read how it works →</a></p>
