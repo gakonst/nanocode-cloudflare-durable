@@ -34,7 +34,7 @@ export const keeper = handKeeper({
   fetch: pay,
   listed: async session => ((await (await fetch(local("sessions/" + encodeURIComponent(session) + "/hands"))).json()) as { hands?: string[] }).hands?.includes("browser") ?? false,
   mcpServers: Mcp.servers.map(server => ({ name: server.name, url: server.url })),
-  module: () => module ??= WebAssembly.compileStreaming(fetch(wasmUrl)),
+  module: () => module ??= WebAssembly.compileStreaming(fetch(new URL(wasmUrl, import.meta.url))),
   onStatus: hand => set({ hand }),
   url: session => local("sessions/" + encodeURIComponent(session) + "/hands/browser").replace(/^http/, "ws"),
   workspace: async session => {
