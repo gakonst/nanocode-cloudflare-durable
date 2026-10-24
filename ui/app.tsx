@@ -224,6 +224,7 @@ createRoot(document.getElementById("root")!).render(
         <NanocodeProvider config={config} highlight={highlight} skin={skin}>
           <App />
         </NanocodeProvider>
+        <p>Also as a <a href="chatgpt">ChatGPT-style</a> and a <a href="claude">Claude-style</a> app.</p>
         <p><a href="how-it-works">Read how it works →</a></p>
       </Page>
     </Main>
