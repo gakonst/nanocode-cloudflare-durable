@@ -9,9 +9,13 @@ export function WalletButton(props: { className?: string }) {
   return (
     <span className="nc-wallet">
       <button className={props.className} disabled={wallet.busy} onClick={() => void login()} type="button">{wallet.busy ? "Connecting…" : "Connect Tempo Wallet"}</button>
-      {wallet.device && <a className="nc-wallet-code" href={wallet.device.verificationUriFull ?? wallet.device.verificationUri} onClick={event => setHint(guard(event))} rel="noreferrer" target="_blank">Approve code {wallet.device.userCode}</a>}
-      {hint && <span className="nc-wallet-error">⌘-click the code (Ctrl-click on Windows) to approve it in a normal tab, or open it on your phone.</span>}
-      {wallet.error && <span className="nc-wallet-error">{wallet.error}</span>}
+      {(wallet.device || hint || wallet.error) && (
+        <span className="nc-wallet-pop">
+          {wallet.device && <a className="nc-wallet-code" href={wallet.device.verificationUriFull ?? wallet.device.verificationUri} onClick={event => setHint(guard(event))} rel="noreferrer" target="_blank">Approve code {wallet.device.userCode}</a>}
+          {hint && <span className="nc-wallet-hint">⌘-click the code (Ctrl-click on Windows) to approve it in a normal tab, or open it on your phone.</span>}
+          {wallet.error && <span className="nc-wallet-error">{wallet.error}</span>}
+        </span>
+      )}
     </span>
   );
 }

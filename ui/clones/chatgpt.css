@@ -330,3 +330,10 @@ a { color: inherit; }
 [data-xframe] .gpt-hero { padding-bottom: 0; }
 [data-xframe] .gpt-hero h1 { font-size: 24px; margin-bottom: 16px; }
 [data-xframe] .nc-prompt:nth-child(n+3) { display: none; }
+.nc-wallet-pop { align-items: center; display: inline-flex; gap: 8px; }
+.nc-wallet-hint { color: var(--muted); font-size: 12px; }
+
+@media (max-width: 767px) {
+  .nc-wallet { position: relative; }
+  .nc-wallet-pop { align-items: flex-start; background: var(--menu); border-radius: 12px; box-shadow: var(--shadow); flex-direction: column; gap: 6px; padding: 10px 12px; position: absolute; right: 0; top: calc(100% + 6px); width: min(280px, 80vw); z-index: 20; }
+}
