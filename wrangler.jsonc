@@ -9,13 +9,15 @@
     "bindings": [
       { "name": "SESSIONS", "class_name": "AgentSession" },
       { "name": "PUBLIC_LIMITS", "class_name": "PublicLimit" },
-      { "name": "HAND_RELAY", "class_name": "HandRelay" }
+      { "name": "HAND_RELAY", "class_name": "HandRelay" },
+      { "name": "WALLETS", "class_name": "Wallet" }
     ]
   },
   "migrations": [
     { "tag": "v1", "new_sqlite_classes": ["AgentSession"] },
     { "tag": "v2", "new_sqlite_classes": ["PublicLimit"] },
-    { "tag": "v3", "new_sqlite_classes": ["HandRelay"] }
+    { "tag": "v3", "new_sqlite_classes": ["HandRelay"] },
+    { "tag": "v4", "new_sqlite_classes": ["Wallet"] }
   ],
   "vars": {
     "AI_GATEWAY_ID": "default",

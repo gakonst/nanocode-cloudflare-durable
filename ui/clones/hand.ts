@@ -1,6 +1,6 @@
 import { handKeeper, type HandStatus } from "nanocode-ts";
 import { Bash } from "nanocode-ts/bash";
-import { Mcp, Payment, Payments, Wallet } from "nanocode-ts/machines";
+import { Keyring, Mcp, Payment, Payments, Wallet } from "nanocode-ts/machines";
 import wasmUrl from "nanocode-ts/nanocode_wasm.wasm";
 import { useSyncExternalStore } from "react";
 
@@ -24,6 +24,8 @@ function set(next: Partial<State>) {
 
 const local = (path: string) => new URL(path, location.href).href;
 
+const visited = (path: string) => local(path + "?" + new URLSearchParams({ visitor: Keyring.visitor() }));
+
 export const pay: typeof fetch = (input, init) => {
   const url = String(input instanceof Request ? input.url : input);
   const body = init?.body instanceof Uint8Array && Mcp.server(url) ? decoder.decode(init.body) : init?.body;
@@ -32,11 +34,11 @@ export const pay: typeof fetch = (input, init) => {
 
 export const keeper = handKeeper({
   fetch: pay,
-  listed: async session => ((await (await fetch(local("sessions/" + encodeURIComponent(session) + "/hands"))).json()) as { hands?: string[] }).hands?.includes("browser") ?? false,
+  listed: async session => ((await (await fetch(local("sessions/" + encodeURIComponent(session) + "/hands"), { headers: Keyring.visitorHeaders() })).json()) as { hands?: string[] }).hands?.includes("browser") ?? false,
   mcpServers: Mcp.servers.map(server => ({ name: server.name, url: server.url })),
   module: () => module ??= WebAssembly.compileStreaming(fetch(new URL(wasmUrl, import.meta.url))),
   onStatus: hand => set({ hand }),
-  url: session => local("sessions/" + encodeURIComponent(session) + "/hands/browser").replace(/^http/, "ws"),
+  url: session => visited("sessions/" + encodeURIComponent(session) + "/hands/browser").replace(/^http/, "ws"),
   workspace: async session => {
     let shell = shells.get(session);
     if (!shell) shells.set(session, shell = Bash.create({ cwd: "/workspace", fetch: pay, github: { archive: (owner, repo, ref) => local("api/github/" + owner + "/" + repo + "/" + ref) } }));
@@ -54,6 +56,11 @@ Wallet.onPrompt(device => set({ device }));
 
 const saved = Wallet.restore();
 if (saved) void Wallet.published(saved).then(onChain => onChain && use(saved), () => {});
+
+export function adopt(connected: Wallet.Wallet | undefined) {
+  if (!connected && Wallet.restore()) return;
+  if (state.connected?.keyAddress !== connected?.keyAddress) use(connected);
+}
 
 export async function login() {
   set({ busy: true, error: undefined });

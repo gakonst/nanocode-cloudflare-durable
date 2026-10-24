@@ -1,5 +1,6 @@
 import { createConfig, type ToolCell as Cell, type TurnBlock } from "nanocode-ts/client";
 import { cloudflare } from "nanocode-ts/cloudflare/transport";
+import { Keyring } from "nanocode-ts/machines";
 import { Code, useConfig, useConversations, useSend } from "nanocode-ts/react";
 import { type KeyboardEvent, useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore } from "react";
 import { PUBLIC_HARNESSES } from "../../worker/models.ts";
@@ -36,7 +37,7 @@ export function createClone(key: string, harness: "claude" | "codex") {
 
   const headers = (): Record<string, string> => {
     const token = localStorage.getItem(TOKEN);
-    return token ? { authorization: "Bearer " + token } : {};
+    return { ...Keyring.visitorHeaders(), ...(token ? { authorization: "Bearer " + token } : {}) };
   };
 
   const current = (): Model => {

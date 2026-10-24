@@ -1,9 +1,10 @@
-import { aiGateway, client, createNanocode, HandRelay, type NanocodeEnv, PublicLimit, relay as handRelay } from "nanocode-ts/cloudflare";
+import { aiGateway, client, createNanocode, HandRelay, PublicLimit, relay as handRelay } from "nanocode-ts/cloudflare";
+import { createWallets, type MachinesEnv, visitor, VISITOR } from "nanocode-ts/machines/cloudflare";
 import { PUBLIC_MODELS } from "./models";
 import { charge } from "./tools";
 import { BASH_CODE_MODE_INSTRUCTIONS } from "nanocode-ts/bash";
 
-interface Env extends NanocodeEnv {
+interface Env extends MachinesEnv {
   AI: Ai;
   AI_GATEWAY_ID: string;
   OPENAI_SERVICE_TIER: string;
@@ -17,7 +18,7 @@ const DIGEST = /^[0-9a-f]{64}$/;
 const ACCOUNT = "owner";
 const PUBLIC_ACCOUNT = "public";
 const PUBLIC_PROMPT_CHARACTERS = 2000;
-const PUBLIC_ROUTE = /^\/sessions\/[^/]+\/(?:turns(?:\/[^/]+(?:\/cancel)?)?|events|crash|warm|hands(?:\/browser)?)$/;
+const PUBLIC_ROUTE = /^\/(?:sessions\/[^/]+\/(?:turns(?:\/[^/]+(?:\/cancel)?)?|events|crash|warm|hands(?:\/browser)?)|v1\/(?:keys|me)|api\/device\/(?:register|token))$/;
 
 async function owner(request: Request, env: Env): Promise<boolean> {
   const header = request.headers.get("authorization") ?? "";
@@ -27,9 +28,19 @@ async function owner(request: Request, env: Env): Promise<boolean> {
   return crypto.subtle.timingSafeEqual(actual, expected);
 }
 
+async function account(request: Request, env: Env): Promise<string | null> {
+  if (await owner(request, env)) return ACCOUNT;
+  return env.CHAT_PUBLIC === "1" ? visitor(request) : null;
+}
+
+async function visiting(request: Request): Promise<string | null> {
+  const query = new URL(request.url).searchParams.get("visitor");
+  return await visitor(request) ?? (query ? await visitor(new Request(request.url, { headers: { [VISITOR]: query } })) : null);
+}
+
 async function authenticate(request: Request, env: Env): Promise<string | null> {
   if (await owner(request, env)) return ACCOUNT;
-  return env.CHAT_PUBLIC === "1" ? PUBLIC_ACCOUNT : null;
+  return env.CHAT_PUBLIC === "1" ? await visiting(request) ?? PUBLIC_ACCOUNT : null;
 }
 
 function refuse(error: string, status: number): Response {
@@ -74,15 +85,19 @@ async function admit(request: Request, env: Env): Promise<Response | undefined> 
   if (body?.thinking !== undefined && !allowed.efforts.includes(String(body.thinking))) return refuse(`${model} takes ${allowed.efforts.join(", ")}`, 403);
 }
 
+const wallets = createWallets<Env>({ account });
+
 const nanocode = createNanocode<Env>({
   authenticate,
   egress: env => aiGateway(env.AI, env.AI_GATEWAY_ID, env.OPENAI_SERVICE_TIER),
   tools: charge,
   chaos: true,
   instructions: INSTRUCTIONS + "\n\nWhen the browser tab is attached, a cell there has these globals, not tools: " + BASH_CODE_MODE_INSTRUCTIONS,
+  ...wallets.nanocode,
 });
 
 export const { AgentSession } = nanocode;
+export const { Wallet } = wallets;
 export { HandRelay, PublicLimit };
 
 export default {
@@ -93,6 +108,6 @@ export default {
     if (request.method === "POST" && (pathname === "/api/device/register" || pathname === "/api/device/token")) return relay(request, pathname);
     if (request.method === "GET" && pathname.startsWith("/api/github/")) return archive(pathname);
     const refused = env.CHAT_PUBLIC === "1" && !(await owner(request, env)) ? await admit(request, env) : undefined;
-    return refused ?? nanocode.fetch(request, env);
+    return refused ?? await wallets.fetch(request, env) ?? nanocode.fetch(request, env);
   },
 } satisfies ExportedHandler<Env>;
