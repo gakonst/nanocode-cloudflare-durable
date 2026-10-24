@@ -1,5 +1,5 @@
 import { Wallet } from "nanocode-ts/machines";
-import { login, logout, useWallet } from "./hand.ts";
+import { login, logout, setTab, useWallet, where } from "./hand.ts";
 
 export function WalletButton(props: { className?: string }) {
   const wallet = useWallet();
@@ -14,9 +14,8 @@ export function WalletButton(props: { className?: string }) {
 }
 
 export function HandBadge(props: { className?: string }) {
-  const { hand } = useWallet();
-  const label = hand.state === "attached" ? "Code runs in this tab" : hand.state === "connecting" ? "Attaching this tab…" : "Code runs on Cloudflare";
-  return <span className={props.className} data-state={hand.state} title="The agent is durable in a Durable Object; its Code Mode cells run in this browser tab with your wallet.">{label}</span>;
+  const { hand, tab } = useWallet();
+  return <button className={props.className} data-state={tab ? hand.state : "server"} onClick={() => setTab(!tab)} title={tab ? "Code Mode cells run in this browser tab with your wallet: Python, native WebAssembly and a fetch that pays MPP services. Click to run them on Cloudflare again." : "Code Mode cells run in the Durable Object beside the agent. Click to run them in this tab instead, for Python, native WebAssembly and a fetch that pays MPP services from your wallet."} type="button">{where(hand, tab)}</button>;
 }
 
 export function Cloudflare(props: { className?: string }) {

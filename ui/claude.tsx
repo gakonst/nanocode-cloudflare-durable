@@ -99,7 +99,7 @@ function Composer(props: { onSend(): void }) {
 }
 
 function Footer() {
-  return <p className="cl-foot"><Cloudflare className="nc-brand" /> · Claude-style demo · durable agent in a Durable Object, code in this tab · <HandBadge className="nc-hand" /> · built with <a href="https://github.com/gakonst/nanocode-ts" rel="noreferrer" target="_blank">nanocode-ts</a></p>;
+  return <p className="cl-foot"><Cloudflare className="nc-brand" /> · Claude-style demo · durable agent in a Durable Object · <HandBadge className="nc-hand" /> · built with <a href="https://github.com/gakonst/nanocode-ts" rel="noreferrer" target="_blank">nanocode-ts</a></p>;
 }
 
 function Prompts(props: { onSend(): void }) {
