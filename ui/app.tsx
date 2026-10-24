@@ -10,7 +10,7 @@ import { useEffect, useState, useSyncExternalStore } from "react";
 import { createRoot } from "react-dom/client";
 import { PUBLIC_HARNESSES as HARNESSES } from "../worker/models.ts";
 import "./fonts.ts";
-import { adopt, keeper, prompts, useWallet } from "./clones/hand.ts";
+import { adopt, attach, prompts, setTab, useWallet } from "./clones/hand.ts";
 
 type Model = (typeof HARNESSES)[number]["models"][number];
 
@@ -23,6 +23,7 @@ const COMMANDS = [
   { label: "/model", detail: "choose harness, model and thinking for a new session" },
   { label: "/effort", detail: "choose the thinking of the next turns" },
   { label: "/new", detail: "start a new session" },
+  { label: "/tab", detail: "run Code Mode cells in this tab, or on Cloudflare again" },
 ];
 
 const highlight = () => import("nanocode-ts/highlight").then(module => module.highlight);
@@ -60,7 +61,7 @@ const headers = (): Record<string, string> => ({ ...Keyring.visitorHeaders(), ..
 const keyring = Keyring.keyring({ url: "v1/keys", headers });
 
 const transport = cloudflare({
-  hand: session => (token ? Promise.resolve(undefined) : keeper.attach(session)),
+  hand: session => (token ? Promise.resolve(undefined) : attach(session)),
   headers,
   model: () => ({ provider: harnessOf(current()).id, model: current().id, thinking: state.thinking ?? current().effort }),
   // The chat's history keeps each conversation's session; a change only re-renders the status line.
@@ -138,6 +139,12 @@ function App() {
       chat.note("tool", "new session");
       return true;
     }
+    if (name === "/tab") {
+      const tab = argument ? argument !== "off" : !wallet.tab;
+      setTab(tab);
+      chat.note("tool", tab ? "Code Mode cells run in this tab from the next turn: Python, native WebAssembly and a fetch that pays MPP services from your wallet. /tab again runs them on Cloudflare." : "Code Mode cells run on Cloudflare, in the Durable Object beside the agent. /tab runs them in this tab.");
+      return true;
+    }
     if (name === "/model") {
       if (!argument) {
         setPicker({ title: "Model", filter: true, items: query => modelItems(HARNESSES, current().id, query), onChoose: item => pick(item.label) });
@@ -174,7 +181,10 @@ function App() {
 
   return (
     <Chat
-      actions={<button disabled={busy} onClick={clear} type="button" {...styles.suggestion({ quiet: true })}>New session</button>}
+      actions={<>
+        <button disabled={busy} onClick={clear} type="button" {...styles.suggestion({ quiet: true })}>New session</button>
+        <button onClick={() => setTab(!wallet.tab)} title="Where Code Mode cells run: in the Durable Object, or in this tab with Python, native WebAssembly and a fetch paid from your wallet" type="button" {...styles.suggestion({ quiet: true })}>{wallet.tab ? "Run code on Cloudflare" : "Run code in this tab"}</button>
+      </>}
       after={walletCards(unlock)}
       commands={[...COMMANDS, ...unlock.commands]}
       empty="Ask a question to start a turn, or type /model to choose a model."
@@ -205,7 +215,7 @@ function App() {
       onPickerClose={() => setPicker(null)}
       onSubmit={text => { if (unlock.handles(text)) void unlock.command(text); else if (!command(text)) void send(text); }}
       picker={picker}
-      status={`${harnessOf(model).label} · ${model.label} · ${store.thinking ?? model.effort} · ${transport.session().id ?? "new session"} · ${wallet.hand.state === "attached" ? "cells in this tab" : "cells on Cloudflare"} · ${busy ? "running" : "idle"}`}
+      status={`${harnessOf(model).label} · ${model.label} · ${store.thinking ?? model.effort} · ${transport.session().id ?? "new session"} · ${!wallet.tab ? "cells on Cloudflare" : wallet.hand.state === "attached" ? "cells in this tab" : "cells in this tab from the next turn"} · ${busy ? "running" : "idle"}`}
       suggestions={[...prompts.map(prompt => ({ label: prompt, onClick: () => void send(prompt), disabled: busy })), { label: "Kill the next tool call", onClick: () => void crash(), disabled: !transport.session().id }]}
     />
   );
@@ -220,7 +230,7 @@ createRoot(document.getElementById("root")!).render(
       <Page>
         <Title subtitle="Durable agents in Durable Objects.">nanocode on Cloudflare</Title>
         <Demos current="cloudflare" />
-        <Lead>This agent runs in a Cloudflare Durable Object: the nanocode SDK compiled to WebAssembly, with its journal in the object's own SQLite. Its Code Mode cells run in this tab, attached to the session as a hand: bash on files here, WebAssembly and Python, and a fetch that pays MPP services, Mercator and the Tempo gateway, from your Tempo Wallet. When the object resets mid-turn, its alarm starts it again, and the turn continues from the last checkpoint. Cloudflare AI Gateway serves its model requests. Its source is <a href="https://github.com/gakonst/nanocode-cloudflare-durable">gakonst/nanocode-cloudflare-durable</a>.</Lead>
+        <Lead>This agent runs in a Cloudflare Durable Object: the nanocode SDK compiled to WebAssembly, with its journal in the object's own SQLite. Its Code Mode cells run beside it in the object: bash on a workspace kept in the same SQLite, git clone, WASI programs, and Mercator and the Tempo gateway paid from your Tempo Wallet. Type /tab to run them in this tab instead, attached to the session as a hand, with Python, native WebAssembly and a fetch that pays any MPP service. When the object resets mid-turn, its alarm starts it again, and the turn continues from the last checkpoint. Cloudflare AI Gateway serves its model requests. Its source is <a href="https://github.com/gakonst/nanocode-cloudflare-durable">gakonst/nanocode-cloudflare-durable</a>.</Lead>
         <NanocodeProvider config={config} highlight={highlight} skin={skin}>
           <App />
         </NanocodeProvider>
