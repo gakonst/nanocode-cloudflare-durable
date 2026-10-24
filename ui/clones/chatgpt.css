@@ -305,3 +305,21 @@ a { color: inherit; }
 .nc-prompts { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; margin: 12px auto 0; max-width: 720px; }
 .nc-prompt { background: transparent; border: 1px solid var(--border); border-radius: 999px; color: inherit; cursor: pointer; font: inherit; font-size: 13px; padding: 7px 12px; }
 .nc-prompt:hover, .nc-wallet-button:hover { background: rgba(127,127,127,.12); }
+
+.gpt [data-nc="attachments"] { display: flex; flex-wrap: wrap; gap: 8px; }
+.gpt [data-nc="attachment"] { align-items: center; background: var(--bubble); border: 1px solid color-mix(in srgb, var(--text) 12%, transparent); border-radius: 12px; display: inline-flex; font-size: 13px; gap: 8px; max-width: 260px; padding: 6px 10px; white-space: nowrap; }
+.gpt [data-nc="attachment"][data-status="failed"] { border-color: #e5484d; }
+.gpt [data-nc="attachmentThumb"], .gpt [data-nc="attachmentThumb"] img { border-radius: 8px; display: block; height: 36px; margin: 0; object-fit: cover; width: 36px; }
+.gpt [data-nc="attachmentThumb"] [data-nc="image"][data-loading] { font-size: 0; }
+.gpt [data-nc="attachmentName"] { overflow: hidden; text-overflow: ellipsis; }
+.gpt [data-nc="attachmentSize"] { color: var(--faint); }
+.gpt [data-nc="attachmentRemove"] { background: none; border: 0; color: var(--faint); cursor: pointer; font-size: 16px; line-height: 1; padding: 0 2px; }
+.gpt [data-nc="attachmentRemove"]:hover { color: var(--text); }
+.gpt [data-nc="image"][data-source="workspace"] { border-radius: 8px; max-width: 100%; }
+
+.gpt-composer { flex-wrap: wrap; }
+.gpt-composer > [data-nc="attachments"] { flex-basis: 100%; padding: 4px 0 6px; }
+.gpt-composer[data-dragging="true"] { outline: 2px dashed var(--faint); }
+.gpt-attach { align-items: center; background: none; border: 0; border-radius: 50%; color: var(--text); cursor: pointer; display: flex; flex: none; height: 36px; justify-content: center; margin-left: -10px; width: 36px; }
+.gpt-attach:hover { background: var(--bubble); }
+.gpt-bubble > [data-nc="attachments"] { margin-top: 8px; }

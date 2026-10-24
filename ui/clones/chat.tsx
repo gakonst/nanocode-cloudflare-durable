@@ -1,7 +1,7 @@
 import { createConfig, type ToolCell as Cell, type TurnBlock } from "nanocode-ts/client";
 import { cloudflare } from "nanocode-ts/cloudflare/transport";
 import { Keyring } from "nanocode-ts/machines";
-import { Code, useConfig, useConversations, useSend } from "nanocode-ts/react";
+import { Code, useAttachments, useConfig, useConversations, useSend } from "nanocode-ts/react";
 import { type KeyboardEvent, useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore } from "react";
 import { PUBLIC_HARNESSES } from "../../worker/models.ts";
 import { attach, prewarm } from "./hand.ts";
@@ -126,6 +126,7 @@ export function useStick(dependency: unknown) {
 
 export function useComposer(options: { onSend?(): void; warm(): void }) {
   const { cancel, canCancel, isPending: busy, send } = useSend();
+  const attachments = useAttachments();
   const [prompt, setPrompt] = useState("");
   const input = useRef<HTMLTextAreaElement>(null);
 
@@ -138,10 +139,12 @@ export function useComposer(options: { onSend?(): void; warm(): void }) {
 
   const submit = () => {
     const text = prompt.trim();
-    if (!text) return;
+    const attached = attachments.ready;
+    if ((!text && !attached.length) || attachments.uploading) return;
     setPrompt("");
+    attachments.clear();
     options.onSend?.();
-    void send(text);
+    void send(text, attached);
   };
 
   const textarea = {
@@ -153,6 +156,7 @@ export function useComposer(options: { onSend?(): void; warm(): void }) {
         prewarm(event.target.value);
       }
     },
+    onPaste: attachments.onPaste,
     onKeyDown: (event: KeyboardEvent<HTMLTextAreaElement>) => {
       if (event.nativeEvent.isComposing || event.key !== "Enter" || event.shiftKey) return;
       event.preventDefault();
@@ -163,7 +167,7 @@ export function useComposer(options: { onSend?(): void; warm(): void }) {
     value: prompt,
   };
 
-  return { busy, cancel, canCancel, empty: !prompt.trim(), focus: () => input.current?.focus(), submit, textarea };
+  return { attachments, busy, cancel, canCancel, empty: !prompt.trim() && !attachments.ready.length, focus: () => input.current?.focus(), submit, textarea };
 }
 
 export function useResume() {
