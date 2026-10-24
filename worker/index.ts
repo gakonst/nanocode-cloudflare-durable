@@ -8,6 +8,7 @@ interface Env extends MachinesEnv {
   AI: Ai;
   AI_GATEWAY_ID: string;
   OPENAI_SERVICE_TIER: string;
+  MODEL_FIRST_BYTE_MS?: string;
   ACCESS_TOKEN_SHA256: string;
   CHAT_PUBLIC: string;
   PUBLIC_LIMITS: DurableObjectNamespace<PublicLimit>;
@@ -91,7 +92,7 @@ const wallets = createWallets<Env>({ account });
 
 const nanocode = createNanocode<Env>({
   authenticate,
-  egress: env => aiGateway(env.AI, env.AI_GATEWAY_ID, env.OPENAI_SERVICE_TIER),
+  egress: env => aiGateway(env.AI, env.AI_GATEWAY_ID, env.OPENAI_SERVICE_TIER, Number(env.MODEL_FIRST_BYTE_MS) || undefined),
   tools: charge,
   chaos: true,
   instructions: INSTRUCTIONS,
