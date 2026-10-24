@@ -4,7 +4,6 @@ import { Keyring } from "nanocode-ts/machines";
 import { Code, useAttachments, useConfig, useConversations, useSend } from "nanocode-ts/react";
 import { type KeyboardEvent, useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore } from "react";
 import { PUBLIC_HARNESSES } from "../../worker/models.ts";
-import { attach, prewarm, setTab, tabFiles, useWallet } from "./hand.ts";
 
 export type Model = (typeof PUBLIC_HARNESSES)[number]["models"][number];
 
@@ -46,8 +45,7 @@ export function createClone(key: string, harness: "claude" | "codex") {
     return models.find(model => model.id === id) ?? models[0]!;
   };
 
-  const transport = tabFiles(cloudflare({
-    hand: session => (localStorage.getItem(TOKEN) ? Promise.resolve(undefined) : attach(session)),
+  const transport = cloudflare({
     headers,
     model: () => {
       const model = current();
@@ -60,7 +58,7 @@ export function createClone(key: string, harness: "claude" | "codex") {
 
       return { model: model.id, provider: harness, thinking: (model.efforts as readonly string[]).includes("low") ? "low" : model.effort };
     },
-  }));
+  });
 
   const config = createConfig({ history: { key }, transport });
 
@@ -127,7 +125,6 @@ export function useStick(dependency: unknown) {
 export function useComposer(options: { onSend?(): void; warm(): void }) {
   const { cancel, canCancel, isPending: busy, send } = useSend();
   const attachments = useAttachments();
-  const { tab } = useWallet();
   const [prompt, setPrompt] = useState("");
   const input = useRef<HTMLTextAreaElement>(null);
 
@@ -142,12 +139,6 @@ export function useComposer(options: { onSend?(): void; warm(): void }) {
     const text = prompt.trim();
     const attached = attachments.ready;
     if ((!text && !attached.length) || attachments.uploading) return;
-    const command = /^\/tab(?:\s+(on|off))?$/i.exec(text);
-    if (command && !attached.length) {
-      setPrompt("");
-      setTab(command[1] ? command[1].toLowerCase() === "on" : !tab);
-      return;
-    }
     setPrompt("");
     attachments.clear();
     options.onSend?.();
@@ -158,10 +149,7 @@ export function useComposer(options: { onSend?(): void; warm(): void }) {
     "aria-label": "Message",
     onChange: (event: { target: { value: string } }) => {
       setPrompt(event.target.value);
-      if (!busy && event.target.value) {
-        options.warm();
-        prewarm(event.target.value);
-      }
+      if (!busy && event.target.value) options.warm();
     },
     onPaste: attachments.onPaste,
     onKeyDown: (event: KeyboardEvent<HTMLTextAreaElement>) => {
