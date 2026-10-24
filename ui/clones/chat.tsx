@@ -4,7 +4,7 @@ import { Keyring } from "nanocode-ts/machines";
 import { Code, useAttachments, useConfig, useConversations, useSend } from "nanocode-ts/react";
 import { type KeyboardEvent, useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore } from "react";
 import { PUBLIC_HARNESSES } from "../../worker/models.ts";
-import { attach, prewarm } from "./hand.ts";
+import { attach, prewarm, setTab, useWallet } from "./hand.ts";
 
 export type Model = (typeof PUBLIC_HARNESSES)[number]["models"][number];
 
@@ -127,6 +127,7 @@ export function useStick(dependency: unknown) {
 export function useComposer(options: { onSend?(): void; warm(): void }) {
   const { cancel, canCancel, isPending: busy, send } = useSend();
   const attachments = useAttachments();
+  const { tab } = useWallet();
   const [prompt, setPrompt] = useState("");
   const input = useRef<HTMLTextAreaElement>(null);
 
@@ -141,6 +142,12 @@ export function useComposer(options: { onSend?(): void; warm(): void }) {
     const text = prompt.trim();
     const attached = attachments.ready;
     if ((!text && !attached.length) || attachments.uploading) return;
+    const command = /^\/tab(?:\s+(on|off))?$/i.exec(text);
+    if (command && !attached.length) {
+      setPrompt("");
+      setTab(command[1] ? command[1].toLowerCase() === "on" : !tab);
+      return;
+    }
     setPrompt("");
     attachments.clear();
     options.onSend?.();
