@@ -1,4 +1,4 @@
-import { aiGateway, client, createNanocode, type NanocodeEnv, PublicLimit } from "nanocode-ts/cloudflare";
+import { aiGateway, client, createNanocode, HandRelay, type NanocodeEnv, PublicLimit, relay as handRelay } from "nanocode-ts/cloudflare";
 import { PUBLIC_MODELS } from "./models";
 import { charge } from "./tools";
 
@@ -9,6 +9,7 @@ interface Env extends NanocodeEnv {
   ACCESS_TOKEN_SHA256: string;
   CHAT_PUBLIC: string;
   PUBLIC_LIMITS: DurableObjectNamespace<PublicLimit>;
+  HAND_RELAY: DurableObjectNamespace<HandRelay>;
 }
 
 const DIGEST = /^[0-9a-f]{64}$/;
@@ -81,11 +82,13 @@ const nanocode = createNanocode<Env>({
 });
 
 export const { AgentSession } = nanocode;
-export { PublicLimit };
+export { HandRelay, PublicLimit };
 
 export default {
   async fetch(request, env) {
     const { pathname } = new URL(request.url);
+    const relayed = handRelay(request, env.HAND_RELAY);
+    if (relayed) return relayed;
     if (request.method === "POST" && (pathname === "/api/device/register" || pathname === "/api/device/token")) return relay(request, pathname);
     if (request.method === "GET" && pathname.startsWith("/api/github/")) return archive(pathname);
     const refused = env.CHAT_PUBLIC === "1" && !(await owner(request, env)) ? await admit(request, env) : undefined;

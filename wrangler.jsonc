@@ -8,12 +8,14 @@
   "durable_objects": {
     "bindings": [
       { "name": "SESSIONS", "class_name": "AgentSession" },
-      { "name": "PUBLIC_LIMITS", "class_name": "PublicLimit" }
+      { "name": "PUBLIC_LIMITS", "class_name": "PublicLimit" },
+      { "name": "HAND_RELAY", "class_name": "HandRelay" }
     ]
   },
   "migrations": [
     { "tag": "v1", "new_sqlite_classes": ["AgentSession"] },
-    { "tag": "v2", "new_sqlite_classes": ["PublicLimit"] }
+    { "tag": "v2", "new_sqlite_classes": ["PublicLimit"] },
+    { "tag": "v3", "new_sqlite_classes": ["HandRelay"] }
   ],
   "vars": {
     "AI_GATEWAY_ID": "default",
