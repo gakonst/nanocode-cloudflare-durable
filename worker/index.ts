@@ -1,6 +1,7 @@
 import { aiGateway, client, createNanocode, HandRelay, type NanocodeEnv, PublicLimit, relay as handRelay } from "nanocode-ts/cloudflare";
 import { PUBLIC_MODELS } from "./models";
 import { charge } from "./tools";
+import { BASH_CODE_MODE_INSTRUCTIONS } from "nanocode-ts/bash";
 
 interface Env extends NanocodeEnv {
   AI: Ai;
@@ -78,7 +79,7 @@ const nanocode = createNanocode<Env>({
   egress: env => aiGateway(env.AI, env.AI_GATEWAY_ID, env.OPENAI_SERVICE_TIER),
   tools: charge,
   chaos: true,
-  instructions: INSTRUCTIONS,
+  instructions: INSTRUCTIONS + "\n\nWhen the browser tab is attached, a cell there has these globals, not tools: " + BASH_CODE_MODE_INSTRUCTIONS,
 });
 
 export const { AgentSession } = nanocode;
