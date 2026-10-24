@@ -4,7 +4,7 @@ import { Keyring } from "nanocode-ts/machines";
 import { Code, useAttachments, useConfig, useConversations, useSend } from "nanocode-ts/react";
 import { type KeyboardEvent, useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore } from "react";
 import { PUBLIC_HARNESSES } from "../../worker/models.ts";
-import { attach, prewarm, setTab, useWallet } from "./hand.ts";
+import { attach, prewarm, setTab, tabFiles, useWallet } from "./hand.ts";
 
 export type Model = (typeof PUBLIC_HARNESSES)[number]["models"][number];
 
@@ -46,7 +46,7 @@ export function createClone(key: string, harness: "claude" | "codex") {
     return models.find(model => model.id === id) ?? models[0]!;
   };
 
-  const transport = cloudflare({
+  const transport = tabFiles(cloudflare({
     hand: session => (localStorage.getItem(TOKEN) ? Promise.resolve(undefined) : attach(session)),
     headers,
     model: () => {
@@ -60,7 +60,7 @@ export function createClone(key: string, harness: "claude" | "codex") {
 
       return { model: model.id, provider: harness, thinking: (model.efforts as readonly string[]).includes("low") ? "low" : model.effort };
     },
-  });
+  }));
 
   const config = createConfig({ history: { key }, transport });
 
