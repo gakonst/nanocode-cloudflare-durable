@@ -41,6 +41,7 @@ function load() {
       fetch: pay,
       listed: async session => ((await (await fetch(local("sessions/" + encodeURIComponent(session) + "/hands"), { headers: Keyring.visitorHeaders() })).json()) as { hands?: string[] }).hands?.includes("browser") ?? false,
       mcpServers: Mcp.servers.map(server => ({ name: server.name, url: server.url })),
+      mcp: { core: Mcp.core },
       module: () => module ??= compileModule(new URL(wasmUrl, import.meta.url).href),
       onStatus: hand => set({ hand }),
       url: session => visited("sessions/" + encodeURIComponent(session) + "/hands/browser").replace(/^http/, "ws"),

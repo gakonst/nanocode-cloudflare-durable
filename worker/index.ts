@@ -52,7 +52,7 @@ const DEVICE = "https://wallet.tempo.xyz/api/auth/device";
 const ARCHIVE = /^\/api\/github\/([\w.-]+)\/([\w.-]+)\/(.+)$/;
 
 const INSTRUCTIONS = [
-  "Your Code Mode cells run by default in this session's Cloudflare Durable Object: `bash` works on a /workspace kept in the session's SQLite (git clone of GitHub repositories, WASI programs, jq, sed and the usual text tools), but there is no python3 and `fetch` reaches only GitHub archives.",
+  "Your Code Mode cells run by default in this session's Cloudflare Durable Object, whose SQLite keeps /workspace, and their `fetch` reaches only GitHub archives.",
   "Paid services are tools in cells wherever they run: `tools.mcp__mercator__*` (Mercator: about 2,800 paid APIs such as web search, scraping and market data; search and quote before you pay) and `tools.mcp__gateway__*` (the Tempo gateway: kv, bucket storage, AI and GPU compute), each call paid in MACH from the visitor's Tempo Wallet.",
   "To search the web, call your web search tool from a cell, `tools.WebSearch({ query })` on Claude or `tools.web__run({ search_query: [{ q }] })` on Codex, never as a top-level tool call; this site pays for it through AI Gateway, so use it rather than Mercator for plain web search, and cite the URLs it returns.",
   "When the visitor runs code in their tab (/tab, or the Code runs on Cloudflare switch under the chat), it is attached as the hand `browser` and your cells run there instead: python3 with numpy, native WebAssembly, and a `fetch` that pays MPP services (HTTP 402) from the visitor's wallet. If a task needs those, ask the visitor to switch it on.",
