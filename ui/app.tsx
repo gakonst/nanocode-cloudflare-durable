@@ -1,6 +1,8 @@
 import "nanocode-ts/react/zyzz.css";
 import { createConfig, modelItems, thinkingItems } from "nanocode-ts/client";
 import { cloudflare } from "nanocode-ts/cloudflare/transport";
+import { Keyring } from "nanocode-ts/machines";
+import { Prompts, Unlock, useUnlock, walletCards } from "nanocode-ts/machines/react";
 import { Chat, NanocodeProvider, type Picker, useConfig, useConversations, useSend } from "nanocode-ts/react";
 import { skin, styles } from "nanocode-ts/react/skin";
 import { Demos, Header, Lead, Main, origin, Page, styles as site, Title } from "nanocode-ts/react/site";
@@ -8,7 +10,7 @@ import { useEffect, useState, useSyncExternalStore } from "react";
 import { createRoot } from "react-dom/client";
 import { PUBLIC_HARNESSES as HARNESSES } from "../worker/models.ts";
 import "./fonts.ts";
-import { keeper, login, logout, prompts, useWallet } from "./clones/hand.ts";
+import { adopt, keeper, prompts, useWallet } from "./clones/hand.ts";
 
 type Model = (typeof HARNESSES)[number]["models"][number];
 
@@ -53,9 +55,13 @@ function harnessOf(model: Model) {
   return HARNESSES.find(harness => harness.models.includes(model))!;
 }
 
+const headers = (): Record<string, string> => ({ ...Keyring.visitorHeaders(), ...(token ? { authorization: `Bearer ${token}` } : {}) });
+
+const keyring = Keyring.keyring({ url: "v1/keys", headers });
+
 const transport = cloudflare({
   hand: session => (token ? Promise.resolve(undefined) : keeper.attach(session)),
-  headers: (): Record<string, string> => token ? { authorization: `Bearer ${token}` } : {},
+  headers,
   model: () => ({ provider: harnessOf(current()).id, model: current().id, thinking: state.thinking ?? current().effort }),
   // The chat's history keeps each conversation's session; a change only re-renders the status line.
   session: { load: () => ({}), save: () => save() },
@@ -72,6 +78,9 @@ function App() {
   const [picker, setPicker] = useState<Picker | null>(null);
   const [access, setAccess] = useState(false);
   const [secret, setSecret] = useState(token);
+  const unlock = useUnlock(keyring);
+
+  useEffect(() => adopt(unlock.connected), [unlock.connected]);
 
   const configure = async () => {
     const open = await fetch("health").catch(() => undefined);
@@ -166,9 +175,13 @@ function App() {
   return (
     <Chat
       actions={<button disabled={busy} onClick={clear} type="button" {...styles.suggestion({ quiet: true })}>New session</button>}
-      commands={COMMANDS}
+      after={walletCards(unlock)}
+      commands={[...COMMANDS, ...unlock.commands]}
       empty="Ask a question to start a turn, or type /model to choose a model."
-      extras={access && (
+      extras={<>
+        <Unlock machine={unlock} />
+        <Prompts machine={unlock} />
+        {access && (
         <label {...styles.row()}>
           <span aria-hidden="true" {...styles.chevron()}>#</span>
           <input
@@ -185,14 +198,15 @@ function App() {
             {...styles.input()}
           />
         </label>
-      )}
+        )}
+      </>}
       link={{ href: "https://nanocode.xyz/", label: "nanocode.xyz →" }}
       onInput={warm}
       onPickerClose={() => setPicker(null)}
-      onSubmit={text => { if (!command(text)) void send(text); }}
+      onSubmit={text => { if (unlock.handles(text)) void unlock.command(text); else if (!command(text)) void send(text); }}
       picker={picker}
       status={`${harnessOf(model).label} · ${model.label} · ${store.thinking ?? model.effort} · ${transport.session().id ?? "new session"} · ${wallet.hand.state === "attached" ? "cells in this tab" : "cells on Cloudflare"} · ${busy ? "running" : "idle"}`}
-      suggestions={[...prompts.map(prompt => ({ label: prompt, onClick: () => void send(prompt), disabled: busy })), wallet.device ? { label: "Approve code " + wallet.device.userCode + " in Tempo Wallet", onClick: () => void window.open(wallet.device!.verificationUriFull ?? wallet.device!.verificationUri, "_blank") } : wallet.connected ? { label: "Log out " + wallet.connected.address.slice(0, 6), onClick: () => void logout() } : { label: wallet.busy ? "Connecting" : "Connect Tempo Wallet", onClick: () => void login(), disabled: wallet.busy }, { label: "Kill the next tool call", onClick: () => void crash(), disabled: !transport.session().id }]}
+      suggestions={[...prompts.map(prompt => ({ label: prompt, onClick: () => void send(prompt), disabled: busy })), { label: "Kill the next tool call", onClick: () => void crash(), disabled: !transport.session().id }]}
     />
   );
 }
@@ -210,6 +224,7 @@ createRoot(document.getElementById("root")!).render(
         <NanocodeProvider config={config} highlight={highlight} skin={skin}>
           <App />
         </NanocodeProvider>
+        <p>Also as a <a href="chatgpt">ChatGPT-style</a> and a <a href="claude">Claude-style</a> app.</p>
         <p><a href="how-it-works">Read how it works →</a></p>
       </Page>
     </Main>
