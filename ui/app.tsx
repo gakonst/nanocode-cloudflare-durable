@@ -10,7 +10,7 @@ import { useEffect, useState, useSyncExternalStore } from "react";
 import { createRoot } from "react-dom/client";
 import { PUBLIC_HARNESSES as HARNESSES } from "../worker/models.ts";
 import "./fonts.ts";
-import { adopt, attach, prewarm, prompts, setTab, useWallet } from "./clones/hand.ts";
+import { adopt, attach, prewarm, prompts, setTab, tabFiles, useWallet } from "./clones/hand.ts";
 
 type Model = (typeof HARNESSES)[number]["models"][number];
 
@@ -60,13 +60,13 @@ const headers = (): Record<string, string> => ({ ...Keyring.visitorHeaders(), ..
 
 const keyring = Keyring.keyring({ url: "v1/keys", headers });
 
-const transport = cloudflare({
+const transport = tabFiles(cloudflare({
   hand: session => (token ? Promise.resolve(undefined) : attach(session)),
   headers,
   model: () => ({ provider: harnessOf(current()).id, model: current().id, thinking: state.thinking ?? current().effort }),
   // The chat's history keeps each conversation's session; a change only re-renders the status line.
   session: { load: () => ({}), save: () => save() },
-});
+}));
 
 const config = createConfig({ history: { key: KEY }, transport });
 

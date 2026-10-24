@@ -88,7 +88,7 @@ function Tools(props: { block: Extract<Block, { kind: "tools" }> }) {
     <div className="gpt-tools" data-open={shown} data-running={running}>
       <button aria-expanded={shown} className="gpt-tools-head" onClick={() => setOpen(!shown)} type="button">
         <span>{label}</span>
-        <span className="gpt-tools-names">{props.block.cells.map(cell => cell.title || cell.name).filter(name => name !== "code").join(" · ")}</span>
+        <span className="gpt-tools-names">{[...new Set(props.block.cells.map(cell => (cell.title || cell.name).replace(/ · (?:wait|terminate)$/, "")).filter(name => name !== "code"))].join(", ")}</span>
         <Chevron />
       </button>
       {shown && <div className="gpt-tools-body">{props.block.cells.map(cell => <ToolCell cell={cell} key={cell.call_id} live={props.block.live} />)}</div>}
