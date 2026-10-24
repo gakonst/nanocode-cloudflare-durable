@@ -133,5 +133,5 @@ export const prompts = [
   "Clone wevm/viem and list its five largest source files",
   "Run a WebAssembly add function",
   "Store a note in the Tempo gateway's KV and read it back",
-  "Search the web with Mercator for today's Tempo news",
+  "Search the web with Mercator for today's Tempo news, spending at most $0.05",
 ];
