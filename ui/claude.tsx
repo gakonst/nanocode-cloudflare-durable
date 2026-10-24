@@ -146,9 +146,9 @@ function App() {
       <div className="cl-scrim" onClick={sidebar.toggle} />
       <main className="cl-main">
         <header className="cl-top">
-          <WalletButton className="nc-wallet-button" />
           <button aria-label="Open sidebar" className="cl-icon cl-open" onClick={sidebar.toggle} type="button"><Sidebar /></button>
           <span className="cl-title">{thread.length ? title || "New chat" : ""}</span>
+          <WalletButton className="nc-wallet-button" />
           <button aria-label="New chat" className="cl-icon cl-top-new" disabled={!threads.canCreate} onClick={newChat} type="button"><Plus /></button>
         </header>
         {thread.length === 0 ? (
