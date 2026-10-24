@@ -1,8 +1,9 @@
-import { aiGateway, client, createNanocode, HandRelay, PublicLimit, relay as handRelay } from "nanocode-ts/cloudflare";
+import { aiGateway, client, createNanocode, PublicLimit } from "nanocode-ts/cloudflare";
 import { createWallets, type MachinesEnv, visitor, VISITOR } from "nanocode-ts/machines/cloudflare";
 import { PUBLIC_MODELS } from "./models";
 import { charge } from "./tools";
-import { BASH_CODE_MODE_INSTRUCTIONS } from "nanocode-ts/bash";
+import type { PythonReply } from "nanocode-ts/bash";
+import { Python } from "./python";
 
 interface Env extends MachinesEnv {
   AI: Ai;
@@ -12,14 +13,14 @@ interface Env extends MachinesEnv {
   ACCESS_TOKEN_SHA256: string;
   CHAT_PUBLIC: string;
   PUBLIC_LIMITS: DurableObjectNamespace<PublicLimit>;
-  HAND_RELAY: DurableObjectNamespace<HandRelay>;
+  PYTHON: DurableObjectNamespace<Python>;
 }
 
 const DIGEST = /^[0-9a-f]{64}$/;
 const ACCOUNT = "owner";
 const PUBLIC_ACCOUNT = "public";
 const PUBLIC_PROMPT_CHARACTERS = 2000;
-const PUBLIC_ROUTE = /^\/(?:sessions\/[^/]+\/(?:turns(?:\/[^/]+(?:\/cancel)?)?|events|crash|warm|hands(?:\/browser)?|files(?:\/.+)?)|v1\/(?:keys|me)|api\/device\/(?:register|token))$/;
+const PUBLIC_ROUTE = /^\/(?:sessions\/[^/]+\/(?:turns(?:\/[^/]+(?:\/cancel)?)?|events|crash|warm|files(?:\/.+)?)|v1\/(?:keys|me)|api\/device\/(?:register|token))$/;
 
 async function owner(request: Request, env: Env): Promise<boolean> {
   const header = request.headers.get("authorization") ?? "";
@@ -52,11 +53,10 @@ const DEVICE = "https://wallet.tempo.xyz/api/auth/device";
 const ARCHIVE = /^\/api\/github\/([\w.-]+)\/([\w.-]+)\/(.+)$/;
 
 const INSTRUCTIONS = [
-  "Your Code Mode cells run by default in this session's Cloudflare Durable Object, whose SQLite keeps /workspace, and their `fetch` reaches only GitHub archives.",
-  "Paid services are tools in cells wherever they run: `tools.mcp__mercator__*` (Mercator: about 2,800 paid APIs such as web search, scraping and market data; search and quote before you pay) and `tools.mcp__gateway__*` (the Tempo gateway: kv, bucket storage, AI and GPU compute), each call paid in MACH from the visitor's Tempo Wallet.",
+  "Your Code Mode cells run in this session's Cloudflare Durable Object, whose SQLite keeps /workspace. Everything runs there: bash, git clone, WebAssembly (the cells' `WebAssembly` and `wasm`, and WASI programs), python3 with numpy and matplotlib (run in a Cloudflare container), and a `fetch` (and bash `curl`) that pays MPP services (HTTP 402) from the visitor's Tempo Wallet.",
+  "Paid services are also tools in cells: `tools.mcp__mercator__*` (Mercator: about 2,800 paid APIs such as web search, scraping and market data; search and quote before you pay) and `tools.mcp__gateway__*` (the Tempo gateway: kv, bucket storage, AI and GPU compute), each call paid in MACH from the visitor's Tempo Wallet. Draw charts with python3, not with paid gateway compute unless the visitor asks for compute.",
   "To search the web, call your web search tool from a cell, `tools.WebSearch({ query })` on Claude or `tools.web__run({ search_query: [{ q }] })` on Codex, never as a top-level tool call; this site pays for it through AI Gateway, so use it rather than Mercator for plain web search, and cite the URLs it returns.",
-  "Cells on Cloudflare have no python3 and no native WebAssembly. When the visitor runs code in their tab, it is attached as the hand `browser` and your cells run there instead: python3 with numpy, native WebAssembly, and a `fetch` that pays MPP services (HTTP 402) from the visitor's wallet. If a task needs those and the hand is not attached, ask the visitor to type /tab, or to click the switch under the chat that reads Code runs on Cloudflare so it reads Code runs in this tab, and then send the request again.",
-  "The visitor sees files you save under /workspace: to show an image a cell wrote (an SVG or PNG chart, a diagram), embed it in your answer as ![what it shows](workspace:/workspace/path/to/file.svg), never as a sandbox: link or a data URL. Files the visitor attaches are saved under /workspace/uploads and listed as Attached: lines at the end of their message; images among them are also shown to you.",
+  "The visitor sees files you save under /workspace: to show an image a cell wrote (a matplotlib chart saved with savefig('/workspace/chart.png'), an SVG diagram), embed it in your answer as ![what it shows](workspace:/workspace/path/to/file.svg), never as a sandbox: link or a data URL. Files the visitor attaches are saved under /workspace/uploads and listed as Attached: lines at the end of their message; images among them are also shown to you.",
   "If a result says tempo_wallet_required, ask the visitor to click Connect Tempo Wallet, then try again. Keep answers short.",
 ].join(" ");
 
@@ -88,7 +88,7 @@ async function admit(request: Request, env: Env): Promise<Response | undefined> 
   if (body?.thinking !== undefined && !allowed.efforts.includes(String(body.thinking))) return refuse(`${model} takes ${allowed.efforts.join(", ")}`, 403);
 }
 
-const wallets = createWallets<Env>({ account });
+const wallets = createWallets<Env>({ account, scripts: true });
 
 const nanocode = createNanocode<Env>({
   authenticate,
@@ -96,19 +96,17 @@ const nanocode = createNanocode<Env>({
   tools: charge,
   chaos: true,
   instructions: INSTRUCTIONS,
-  handInstructions: "Cells in the browser tab have these globals, not tools: " + BASH_CODE_MODE_INSTRUCTIONS,
+  workspace: { python: (authority, env) => async request => await env.PYTHON.get(env.PYTHON.idFromName(authority.account_id)).run(request) as PythonReply },
   ...wallets.nanocode,
 });
 
 export const { AgentSession } = nanocode;
 export const { Wallet } = wallets;
-export { HandRelay, PublicLimit };
+export { PublicLimit, Python };
 
 export default {
   async fetch(request, env) {
     const { pathname } = new URL(request.url);
-    const relayed = handRelay(request, env.HAND_RELAY);
-    if (relayed) return relayed;
     if (request.method === "POST" && (pathname === "/api/device/register" || pathname === "/api/device/token")) return relay(request, pathname);
     if (request.method === "GET" && pathname.startsWith("/api/github/")) return archive(pathname);
     const refused = env.CHAT_PUBLIC === "1" && !(await owner(request, env)) ? await admit(request, env) : undefined;

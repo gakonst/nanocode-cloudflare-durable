@@ -9,7 +9,7 @@
     "bindings": [
       { "name": "SESSIONS", "class_name": "AgentSession" },
       { "name": "PUBLIC_LIMITS", "class_name": "PublicLimit" },
-      { "name": "HAND_RELAY", "class_name": "HandRelay" },
+      { "name": "PYTHON", "class_name": "Python" },
       { "name": "WALLETS", "class_name": "Wallet" }
     ]
   },
@@ -17,7 +17,11 @@
     { "tag": "v1", "new_sqlite_classes": ["AgentSession"] },
     { "tag": "v2", "new_sqlite_classes": ["PublicLimit"] },
     { "tag": "v3", "new_sqlite_classes": ["HandRelay"] },
-    { "tag": "v4", "new_sqlite_classes": ["Wallet"] }
+    { "tag": "v4", "new_sqlite_classes": ["Wallet"] },
+    { "tag": "v5", "new_sqlite_classes": ["Python"], "deleted_classes": ["HandRelay"] }
+  ],
+  "containers": [
+    { "class_name": "Python", "image": "./python/Dockerfile", "instance_type": "standard-1", "max_instances": 50 }
   ],
   "vars": {
     "AI_GATEWAY_ID": "default",

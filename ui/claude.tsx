@@ -4,8 +4,8 @@ import { useState } from "react";
 import { createRoot } from "react-dom/client";
 import "./clones/claude.css";
 import { type Block, createClone, CopyCode, greeting, grouped, highlight, seconds, useComposer, useDismiss, useResume, useSidebar, useStick } from "./clones/chat.tsx";
-import { prompts } from "./clones/hand.ts";
-import { Cloudflare, HandBadge, WalletButton } from "./clones/wallet.tsx";
+import { prompts } from "./clones/prompts.ts";
+import { Cloudflare, WalletButton } from "./clones/wallet.tsx";
 import { ArrowUp, Check, Chevron, Plus, Sidebar, Stop, Trash } from "./clones/icons.tsx";
 
 const clone = createClone("nanocode-cloudflare-durable:claude", "claude");
@@ -104,7 +104,7 @@ function Composer(props: { onSend(): void }) {
 }
 
 function Footer() {
-  return <p className="cl-foot"><Cloudflare className="nc-brand" /><span className="nc-about"> · Claude-style demo · durable agent in a Durable Object</span> · <HandBadge className="nc-hand" /><span className="nc-about"> · built with <a href="https://github.com/gakonst/nanocode-ts" rel="noreferrer" target="_blank">nanocode-ts</a></span><span className="nc-site"> · <a href="https://nanocode.xyz/" rel="noreferrer" target="_blank">nanocode.xyz →</a></span></p>;
+  return <p className="cl-foot"><Cloudflare className="nc-brand" /><span className="nc-about"> · Claude-style demo · durable agent in a Durable Object</span><span className="nc-about"> · built with <a href="https://github.com/gakonst/nanocode-ts" rel="noreferrer" target="_blank">nanocode-ts</a></span><span className="nc-site"> · <a href="https://nanocode.xyz/" rel="noreferrer" target="_blank">nanocode.xyz →</a></span></p>;
 }
 
 function Prompts(props: { onSend(): void }) {
