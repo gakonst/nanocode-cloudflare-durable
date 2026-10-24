@@ -1,5 +1,5 @@
 import type { TurnBlock } from "nanocode-ts/client";
-import { Markdown, NanocodeProvider, useSend, type Skin, ToolCell, useActivity, useConversations, useTurns } from "nanocode-ts/react";
+import { AttachmentList, Markdown, NanocodeProvider, useSend, type Skin, ToolCell, useActivity, useConversations, useTurns } from "nanocode-ts/react";
 import { useState } from "react";
 import { createRoot } from "react-dom/client";
 import "./clones/claude.css";
@@ -86,9 +86,14 @@ function Composer(props: { onSend(): void }) {
   const composer = useComposer({ onSend: props.onSend, warm: () => clone.transport.warm() });
 
   return (
-    <div className="cl-composer">
+    <div className="cl-composer" data-dragging={composer.attachments.dragging} {...composer.attachments.drop}>
+      <AttachmentList items={composer.attachments.items} onRemove={composer.attachments.remove} />
       <textarea placeholder={composer.busy ? "Add to the response…" : "How can I help you today?"} {...composer.textarea} />
       <div className="cl-composer-row">
+        {composer.attachments.enabled && <>
+          <input {...composer.attachments.input} />
+          <button aria-label="Attach files" className="cl-attach" onClick={composer.attachments.open} title="Attach files" type="button"><Plus /></button>
+        </>}
         <ModelMenu />
         {composer.canCancel && composer.empty
           ? <button aria-label="Stop" className="cl-send" onClick={() => void composer.cancel()} type="button"><Stop /></button>
@@ -159,7 +164,7 @@ function App() {
               <div className="cl-thread">
                 {thread.map((turn, index) => (
                   <section className="cl-turn" key={turn.id}>
-                    {turn.prompt && <div className="cl-user"><span aria-hidden="true" className="cl-avatar">Y</span><div>{turn.prompt.text}</div></div>}
+                    {turn.prompt && <div className="cl-user"><span aria-hidden="true" className="cl-avatar">Y</span><div>{turn.prompt.text}{turn.prompt.attachments?.length ? <AttachmentList items={turn.prompt.attachments} /> : null}</div></div>}
                     <div className="cl-assistant">
                       {grouped(turn.blocks).map((block, position) => <BlockView block={block} key={position} />)}
                       {index === thread.length - 1 && <span aria-label={busy ? "Responding" : undefined} className="cl-spark cl-status" data-busy={busy} data-streaming={streaming}>✻</span>}
