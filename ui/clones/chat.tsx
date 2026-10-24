@@ -3,6 +3,7 @@ import { cloudflare } from "nanocode-ts/cloudflare/transport";
 import { Code, useConfig, useConversations, useSend } from "nanocode-ts/react";
 import { type KeyboardEvent, useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore } from "react";
 import { PUBLIC_HARNESSES } from "../../worker/models.ts";
+import { keeper } from "./hand.ts";
 
 export type Model = (typeof PUBLIC_HARNESSES)[number]["models"][number];
 
@@ -45,6 +46,7 @@ export function createClone(key: string, harness: "claude" | "codex") {
   };
 
   const transport = cloudflare({
+    hand: session => (localStorage.getItem(TOKEN) ? Promise.resolve(undefined) : keeper.attach(session)),
     headers,
     model: () => {
       const model = current();

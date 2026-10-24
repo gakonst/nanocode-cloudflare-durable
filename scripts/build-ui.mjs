@@ -11,7 +11,7 @@ await build({
   entryPoints: { app: "ui/app.tsx", chatgpt: "ui/chatgpt.tsx", claude: "ui/claude.tsx", "how-it-works": "ui/how.tsx" },
   format: "esm",
   jsx: "automatic",
-  loader: { ".woff2": "file" },
+  loader: { ".wasm": "file", ".woff2": "file" },
   minify: true,
   outdir: "public",
   platform: "browser",

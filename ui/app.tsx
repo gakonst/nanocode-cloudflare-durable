@@ -8,6 +8,7 @@ import { useEffect, useState, useSyncExternalStore } from "react";
 import { createRoot } from "react-dom/client";
 import { PUBLIC_HARNESSES as HARNESSES } from "../worker/models.ts";
 import "./fonts.ts";
+import { keeper, login, logout, prompts, useWallet } from "./clones/hand.ts";
 
 type Model = (typeof HARNESSES)[number]["models"][number];
 
@@ -53,6 +54,7 @@ function harnessOf(model: Model) {
 }
 
 const transport = cloudflare({
+  hand: session => (token ? Promise.resolve(undefined) : keeper.attach(session)),
   headers: (): Record<string, string> => token ? { authorization: `Bearer ${token}` } : {},
   model: () => ({ provider: harnessOf(current()).id, model: current().id, thinking: state.thinking ?? current().effort }),
   // The chat's history keeps each conversation's session; a change only re-renders the status line.
@@ -65,6 +67,7 @@ function App() {
   const store = useStore();
   const chat = useConfig();
   const { send, isPending: busy } = useSend();
+  const wallet = useWallet();
   const { current: conversation } = useConversations();
   const [picker, setPicker] = useState<Picker | null>(null);
   const [access, setAccess] = useState(false);
@@ -188,8 +191,8 @@ function App() {
       onPickerClose={() => setPicker(null)}
       onSubmit={text => { if (!command(text)) void send(text); }}
       picker={picker}
-      status={`${harnessOf(model).label} · ${model.label} · ${store.thinking ?? model.effort} · ${transport.session().id ?? "new session"} · ${busy ? "running" : "idle"}`}
-      suggestions={["Charge me $42", "List your tools", { label: "Kill the next tool call", onClick: () => void crash(), disabled: !transport.session().id }]}
+      status={`${harnessOf(model).label} · ${model.label} · ${store.thinking ?? model.effort} · ${transport.session().id ?? "new session"} · ${wallet.hand.state === "attached" ? "cells in this tab" : "cells on Cloudflare"} · ${busy ? "running" : "idle"}`}
+      suggestions={[...prompts.map(prompt => ({ label: prompt, onClick: () => void send(prompt), disabled: busy })), wallet.device ? { label: "Approve code " + wallet.device.userCode + " in Tempo Wallet", onClick: () => void window.open(wallet.device!.verificationUriFull ?? wallet.device!.verificationUri, "_blank") } : wallet.connected ? { label: "Log out " + wallet.connected.address.slice(0, 6), onClick: () => void logout() } : { label: wallet.busy ? "Connecting" : "Connect Tempo Wallet", onClick: () => void login(), disabled: wallet.busy }, { label: "Kill the next tool call", onClick: () => void crash(), disabled: !transport.session().id }]}
     />
   );
 }
@@ -203,7 +206,7 @@ createRoot(document.getElementById("root")!).render(
       <Page>
         <Title subtitle="Durable agents in Durable Objects.">nanocode on Cloudflare</Title>
         <Demos current="cloudflare" />
-        <Lead>This agent runs in a Cloudflare Durable Object: the nanocode SDK compiled to WebAssembly, with its journal in the object's own SQLite. When the object resets mid-turn, its alarm starts it again, and the turn continues from the last checkpoint. Cloudflare AI Gateway serves its model requests. Its source is <a href="https://github.com/gakonst/nanocode-cloudflare-durable">gakonst/nanocode-cloudflare-durable</a>.</Lead>
+        <Lead>This agent runs in a Cloudflare Durable Object: the nanocode SDK compiled to WebAssembly, with its journal in the object's own SQLite. Its Code Mode cells run in this tab, attached to the session as a hand: bash on files here, WebAssembly and Python, and a fetch that pays MPP services, Mercator and the Tempo gateway, from your Tempo Wallet. When the object resets mid-turn, its alarm starts it again, and the turn continues from the last checkpoint. Cloudflare AI Gateway serves its model requests. Its source is <a href="https://github.com/gakonst/nanocode-cloudflare-durable">gakonst/nanocode-cloudflare-durable</a>.</Lead>
         <NanocodeProvider config={config} highlight={highlight} skin={skin}>
           <App />
         </NanocodeProvider>
