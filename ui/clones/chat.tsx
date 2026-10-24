@@ -4,7 +4,7 @@ import { Keyring } from "nanocode-ts/machines";
 import { Code, useConfig, useConversations, useSend } from "nanocode-ts/react";
 import { type KeyboardEvent, useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore } from "react";
 import { PUBLIC_HARNESSES } from "../../worker/models.ts";
-import { attach } from "./hand.ts";
+import { attach, prewarm } from "./hand.ts";
 
 export type Model = (typeof PUBLIC_HARNESSES)[number]["models"][number];
 
@@ -148,7 +148,10 @@ export function useComposer(options: { onSend?(): void; warm(): void }) {
     "aria-label": "Message",
     onChange: (event: { target: { value: string } }) => {
       setPrompt(event.target.value);
-      if (!busy && event.target.value) options.warm();
+      if (!busy && event.target.value) {
+        options.warm();
+        prewarm(event.target.value);
+      }
     },
     onKeyDown: (event: KeyboardEvent<HTMLTextAreaElement>) => {
       if (event.nativeEvent.isComposing || event.key !== "Enter" || event.shiftKey) return;

@@ -6,6 +6,7 @@ import { useSyncExternalStore } from "react";
 Wallet.configure({ name: "nanocode on Cloudflare", relay: "api/device/", websiteUrl: "https://nanocode.xyz/cloudflare/" });
 
 const TAB = "nanocode-cloudflare-durable:tab";
+const TOKEN = "nanocode-cloudflare-durable:token";
 const decoder = new TextDecoder();
 const locked = Payment.locked(Mcp.servers);
 
@@ -30,17 +31,17 @@ export const pay: typeof fetch = (input, init) => {
   return (payments?.fetch ?? locked)(input, body === init?.body ? init : { ...init, body });
 };
 
-let keeper: Promise<{ attach(session: string): Promise<string | undefined>; close(): void }> | undefined;
+let keeper: Promise<{ attach(session: string): Promise<string | undefined>; close(): void; prewarm(): Promise<unknown> }> | undefined;
 
 function load() {
-  return keeper ??= Promise.all([import("nanocode-ts"), import("nanocode-ts/bash")]).then(([{ handKeeper }, { Bash }]) => {
+  return keeper ??= Promise.all([import("nanocode-ts"), import("nanocode-ts/bash")]).then(([{ compileModule, handKeeper }, { Bash }]) => {
     const shells = new Map<string, ReturnType<typeof Bash.create>>();
     let module: Promise<WebAssembly.Module> | undefined;
     return handKeeper({
       fetch: pay,
       listed: async session => ((await (await fetch(local("sessions/" + encodeURIComponent(session) + "/hands"), { headers: Keyring.visitorHeaders() })).json()) as { hands?: string[] }).hands?.includes("browser") ?? false,
       mcpServers: Mcp.servers.map(server => ({ name: server.name, url: server.url })),
-      module: () => module ??= WebAssembly.compileStreaming(fetch(new URL(wasmUrl, import.meta.url))),
+      module: () => module ??= compileModule(new URL(wasmUrl, import.meta.url).href),
       onStatus: hand => set({ hand }),
       url: session => visited("sessions/" + encodeURIComponent(session) + "/hands/browser").replace(/^http/, "ws"),
       workspace: async session => {
@@ -62,12 +63,27 @@ export function setTab(tab: boolean) {
   if (tab) localStorage.setItem(TAB, "1");
   else localStorage.removeItem(TAB);
   set({ tab });
-  if (tab) void load();
+  if (tab) warmTab();
   else {
     void keeper?.then(current => current.close());
     set({ hand: { state: "closed" } });
   }
 }
+
+function warmTab() {
+  if (state.tab && !localStorage.getItem(TOKEN)) void load().then(current => current.prewarm());
+}
+
+export function prewarm(text: string) {
+  if (!state.tab || localStorage.getItem(TOKEN)) return;
+  void import("nanocode-ts/bash").then(bash => {
+    const packages = bash.pythonHint(text);
+    if (packages) void bash.preloadPython({}, packages);
+  });
+}
+
+if (typeof requestIdleCallback === "function") requestIdleCallback(warmTab, { timeout: 1500 });
+else setTimeout(warmTab, 500);
 
 export function where(hand: State["hand"], tab: boolean) {
   if (!tab) return "Code runs on Cloudflare";
