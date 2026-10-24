@@ -276,7 +276,7 @@ a { color: inherit; }
 
 .cl-send:disabled { cursor: default; opacity: 0.45; }
 
-.cl-foot { color: var(--faint); font-size: 12px; margin: 8px 0 0; text-align: center; }
+.cl-foot { color: var(--faint); font-size: 12px; margin: 8px 0 0; text-align: center; line-height: 18px; text-wrap: balance; }
 
 .cl-hero .cl-foot { margin-top: 18px; }
 
@@ -308,7 +308,8 @@ a { color: inherit; }
 .nc-wallet-button { background: transparent; border: 1px solid var(--border); border-radius: 999px; color: inherit; cursor: pointer; font: inherit; font-size: 13px; padding: 6px 12px; }
 .nc-wallet-code { font-size: 12px; }
 .nc-wallet-error { color: #d33; font-size: 12px; max-width: 280px; }
-.nc-brand { align-items: center; color: inherit; display: inline-flex; gap: 4px; }
+.nc-brand { color: inherit; white-space: nowrap; }
+.nc-brand svg { display: inline-block; margin-right: 4px; vertical-align: -2px; }
 .nc-prompts { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; margin: 12px auto 0; max-width: 720px; }
 .nc-prompt { background: transparent; border: 1px solid var(--border); border-radius: 999px; color: inherit; cursor: pointer; font: inherit; font-size: 13px; padding: 7px 12px; }
 .nc-prompt:hover, .nc-wallet-button:hover { background: rgba(127,127,127,.12); }
