@@ -10,7 +10,7 @@ import { useEffect, useState, useSyncExternalStore } from "react";
 import { createRoot } from "react-dom/client";
 import { PUBLIC_HARNESSES as HARNESSES } from "../worker/models.ts";
 import "./fonts.ts";
-import { adopt, attach, prompts, setTab, useWallet } from "./clones/hand.ts";
+import { adopt, attach, prewarm, prompts, setTab, useWallet } from "./clones/hand.ts";
 
 type Model = (typeof HARNESSES)[number]["models"][number];
 
@@ -167,7 +167,9 @@ function App() {
   };
 
   const warm = (text: string) => {
-    if (!busy && text && !text.startsWith("/")) transport.warm();
+    if (busy || !text || text.startsWith("/")) return;
+    transport.warm();
+    prewarm(text);
   };
 
   const crash = async () => {
