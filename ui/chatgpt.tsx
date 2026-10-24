@@ -123,7 +123,7 @@ function Composer(props: { onSend(): void }) {
 }
 
 function Footer() {
-  return <p className="gpt-foot"><Cloudflare className="nc-brand" /> · ChatGPT-style demo · durable agent in a Durable Object · <HandBadge className="nc-hand" /> · built with <a href="https://github.com/gakonst/nanocode-ts" rel="noreferrer" target="_blank">nanocode-ts</a></p>;
+  return <p className="gpt-foot"><Cloudflare className="nc-brand" /><span className="nc-about"> · ChatGPT-style demo · durable agent in a Durable Object</span> · <HandBadge className="nc-hand" /><span className="nc-about"> · built with <a href="https://github.com/gakonst/nanocode-ts" rel="noreferrer" target="_blank">nanocode-ts</a></span><span className="nc-site"> · <a href="https://nanocode.xyz/" rel="noreferrer" target="_blank">nanocode.xyz →</a></span></p>;
 }
 
 function Prompts(props: { onSend(): void }) {

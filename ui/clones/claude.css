@@ -328,3 +328,10 @@ a { color: inherit; }
 .cl-composer[data-dragging="true"] { outline: 2px dashed var(--faint); }
 .cl-attach { align-items: center; background: none; border: 1px solid color-mix(in srgb, var(--text) 15%, transparent); border-radius: 10px; color: var(--text); cursor: pointer; display: flex; height: 32px; justify-content: center; margin-right: auto; width: 32px; }
 .cl-user [data-nc="attachments"] { margin-top: 8px; }
+
+.nc-site { display: none; }
+[data-xframe] .nc-site { display: inline; }
+[data-xframe] .nc-about { display: none; }
+[data-xframe] .cl-hero { padding-bottom: 0; }
+[data-xframe] .cl-hero h1 { font-size: 24px; margin-bottom: 16px; }
+[data-xframe] .nc-prompt:nth-child(n+3) { display: none; }

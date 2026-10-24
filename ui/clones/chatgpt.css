@@ -323,3 +323,10 @@ a { color: inherit; }
 .gpt-attach { align-items: center; background: none; border: 0; border-radius: 50%; color: var(--text); cursor: pointer; display: flex; flex: none; height: 36px; justify-content: center; margin-left: -10px; width: 36px; }
 .gpt-attach:hover { background: var(--bubble); }
 .gpt-bubble > [data-nc="attachments"] { margin-top: 8px; }
+
+.nc-site { display: none; }
+[data-xframe] .nc-site { display: inline; }
+[data-xframe] .nc-about { display: none; }
+[data-xframe] .gpt-hero { padding-bottom: 0; }
+[data-xframe] .gpt-hero h1 { font-size: 24px; margin-bottom: 16px; }
+[data-xframe] .nc-prompt:nth-child(n+3) { display: none; }
