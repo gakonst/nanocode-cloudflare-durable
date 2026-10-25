@@ -109,7 +109,8 @@ function Footer() {
 
 function Prompts(props: { onSend(): void }) {
   const { send } = useSend();
-  return <div className="nc-prompts">{prompts.map(prompt => <button className="nc-prompt" key={prompt} onClick={() => { props.onSend(); void send(prompt); }} type="button">{prompt}</button>)}</div>;
+  const warm = () => clone.transport.warm();
+  return <div className="nc-prompts">{prompts.map(prompt => <button className="nc-prompt" key={prompt} onClick={() => { props.onSend(); void send(prompt); }} onFocus={warm} onPointerEnter={warm} type="button">{prompt}</button>)}</div>;
 }
 
 function App() {
