@@ -14,6 +14,7 @@ LOCK = threading.Lock()
 ALLOWED = ("/workspace", "/tmp", "/home/user")
 LIMIT = 4 * 1024 * 1024
 REPLY_BYTES = 6 * 1024 * 1024
+LARGE_BYTES = 6 * 1024 * 1024
 HOME_KEEP = (".local", ".cache")
 STATE = {"mirror": None, "stamps": {}}
 
@@ -118,7 +119,7 @@ def wipe():
     STATE["stamps"] = {}
 
 
-def place(files, dirs):
+def place(files, dirs, append=False):
     for path in sorted(dirs):
         if allowed(path):
             os.makedirs(path, exist_ok=True)
@@ -132,7 +133,7 @@ def place(files, dirs):
             own(parent)
         if os.path.isdir(path) and not os.path.islink(path):
             shutil.rmtree(path)
-        with open(path, "wb") as handle:
+        with open(path, "ab" if append else "wb") as handle:
             handle.write(base64.b64decode(data))
         own(path)
         STATE["stamps"][path] = stamp(path)
@@ -156,7 +157,7 @@ def prune(roots, wanted, dirs):
 
 
 def changed_files(roots, before):
-    dirs, files, more = [], [], []
+    dirs, files, more, large = [], [], [], []
     seen = set()
     budget = [REPLY_BYTES]
 
@@ -176,6 +177,11 @@ def changed_files(roots, before):
             files.append([path, None])
             STATE["stamps"][path] = now
             return
+        if now[0] > LARGE_BYTES:
+            files.append([path, None])
+            large.append([path, now[0]])
+            STATE["stamps"][path] = now
+            return
         if budget[0] <= 0:
             files.append([path, None])
             more.append(path)
@@ -188,14 +194,23 @@ def changed_files(roots, before):
 
     for root in roots:
         visit(root)
-    return dirs, files, more
+    return dirs, files, more, large
 
 
-def fetch(paths):
-    files, more = [], []
+def fetch(paths, span=None):
+    files, more, large = [], [], []
     budget = REPLY_BYTES
     for path in paths:
         if not allowed(path) or not os.path.isfile(path):
+            continue
+        if span is not None:
+            with open(path, "rb") as handle:
+                handle.seek(span[0])
+                files.append([path, base64.b64encode(handle.read(span[1])).decode()])
+            STATE["stamps"][path] = stamp(path)
+            continue
+        if os.path.getsize(path) > LARGE_BYTES:
+            large.append([path, os.path.getsize(path)])
             continue
         if budget <= 0:
             more.append(path)
@@ -205,7 +220,7 @@ def fetch(paths):
         budget -= len(data)
         files.append([path, base64.b64encode(data).decode()])
         STATE["stamps"][path] = stamp(path)
-    return files, more
+    return files, more, large
 
 
 def argv(request):
@@ -253,9 +268,9 @@ def mirrored(request, roots):
             wipe()
             STATE["mirror"] = mirror
         if request.get("fetch") is not None:
-            files, more = fetch(request["fetch"])
-            return {**empty, "files": files, "more": more}
-        place(request["files"], request["dirs"])
+            files, more, large = fetch(request["fetch"], request.get("range"))
+            return {**empty, "files": files, "more": more, "large": large}
+        place(request["files"], request["dirs"], bool(request.get("append")))
         if request.get("sync"):
             return empty
         keep = request.get("keep") or []
@@ -273,8 +288,8 @@ def mirrored(request, roots):
             if os.path.isfile(root):
                 before[root] = stamp(root)
         status, out, err = execute(request, roots)
-        dirs, files, more = changed_files(roots, before)
-    return {**empty, "status": status, "stdout": text(out), "stderr": text(err), "dirs": dirs, "files": files, "more": more}
+        dirs, files, more, large = changed_files(roots, before)
+    return {**empty, "status": status, "stdout": text(out), "stderr": text(err), "dirs": dirs, "files": files, "more": more, "large": large}
 
 
 def run(request):
