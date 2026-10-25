@@ -1,4 +1,4 @@
-if (self !== top || /\bTwitter(Android| for iP)/.test(navigator.userAgent)) document.documentElement.setAttribute("data-xframe", "");
+if (self !== top) document.documentElement.setAttribute("data-xframe", "");
 
 {
   const define = (name, value) => {
