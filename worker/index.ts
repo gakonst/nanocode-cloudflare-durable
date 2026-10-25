@@ -52,16 +52,6 @@ function refuse(error: string, status: number): Response {
 const DEVICE = "https://wallet.tempo.xyz/api/auth/device";
 const ARCHIVE = /^\/api\/github\/([\w.-]+)\/([\w.-]+)\/(.+)$/;
 
-const INSTRUCTIONS = [
-  "Your Code Mode cells run in this session's Cloudflare Durable Object, whose SQLite keeps /workspace. Everything runs there: bash, git clone, WebAssembly (the cells' `WebAssembly` and `wasm`, and WASI programs), python3 with numpy and matplotlib (run in a Cloudflare container), and a `fetch` (and bash `curl`) that pays MPP services (HTTP 402) from the visitor's Tempo Wallet.",
-  "The Durable Object has 128 MB of memory, so download files with curl in bash (`curl -sL -o FILE URL`), not with `fetch` and `bash.writeFile` in a cell, which holds every byte in the cell's memory.",
-  "Paid services are also tools in cells: `tools.mcp__mercator__*` (Mercator: about 2,800 paid APIs such as web search, scraping and market data; search and quote before you pay) and `tools.mcp__gateway__*` (the Tempo gateway: kv, bucket storage, AI and GPU compute), each call paid in MACH from the visitor's Tempo Wallet. Draw charts with python3, not with paid gateway compute unless the visitor asks for compute.",
-  "To search the web, call your web search tool from a cell, `tools.WebSearch({ query })` on Claude or `tools.web__run({ search_query: [{ q }] })` on Codex, never as a top-level tool call; this site pays for it through AI Gateway, so use it rather than Mercator for plain web search, and cite the URLs it returns.",
-  "The visitor sees files you save under /workspace: to show an image a cell wrote (a matplotlib chart saved with savefig('/workspace/chart.png'), an SVG diagram), embed it in your answer as ![what it shows](workspace:/workspace/path/to/file.svg), never as a sandbox: link or a data URL. Files the visitor attaches are saved under /workspace/uploads and listed as Attached: lines at the end of their message; images among them are also shown to you.",
-  "When the visitor asks for subagents, or for several independent pieces of work at once, start one subagent per piece with `tools.spawn_agent({ role, task, output_contract: { kind: 'string' } })` (output_contract is required; use an object contract for structured results) from a cell (they run in parallel, each with its own tools), then collect their results with `tools.wait_agent({ agent_ids })`; do not do their work yourself inside one cell.",
-  "If a result says tempo_wallet_required, ask the visitor to click Connect Tempo Wallet, then try again. Keep answers short.",
-].join(" ");
-
 async function relay(request: Request, pathname: string): Promise<Response> {
   const response = await fetch(DEVICE + pathname.slice("/api/device".length), { body: await request.text(), headers: { accept: "application/json", "content-type": "application/json" }, method: "POST" });
   return new Response(response.body, { headers: { "cache-control": "no-store", "content-type": response.headers.get("content-type") ?? "application/json" }, status: response.status });
@@ -73,7 +63,6 @@ async function archive(pathname: string): Promise<Response> {
   const upstream = await fetch(`https://codeload.github.com/${match[1]}/${match[2]}/tar.gz/${match[3]}`, { headers: { "user-agent": "nanocode-cloudflare-durable" } });
   return new Response(upstream.body, { headers: { "cache-control": "public, max-age=300", "content-type": upstream.headers.get("content-type") ?? "application/x-gzip" }, status: upstream.status });
 }
-
 
 async function admit(request: Request, env: Env): Promise<Response | undefined> {
   const { pathname } = new URL(request.url);
@@ -97,7 +86,6 @@ const nanocode = createNanocode<Env>({
   egress: env => aiGateway(env.AI, env.AI_GATEWAY_ID, env.OPENAI_SERVICE_TIER, Number(env.MODEL_FIRST_BYTE_MS) || undefined),
   tools: charge,
   chaos: true,
-  instructions: INSTRUCTIONS,
   workspace: { python: (authority, env) => async request => await env.PYTHON.get(env.PYTHON.idFromName(authority.account_id)).run(request) as PythonReply },
   ...wallets.nanocode,
 });
