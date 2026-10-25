@@ -7,8 +7,9 @@ export const GATEWAY_KEY = "local-provider";
 
 const GATEWAY = `export default { fetch(request) { return fetch(request); } };`;
 
-function shim(entry) {
+function shim(entry, wallet) {
   return `import worker, { AgentSession as Session } from "./${entry}";
+${wallet ? `export { Wallet } from "./${entry}";` : ""}
 function gateway(upstream) {
   return {
     async run(request, options) {
@@ -82,8 +83,8 @@ export class AgentSession extends Session {
     super(ctx, local(env));
     this.waiting = waiting;
     this.sqlTotals = sql;
-    const persisted = this.store.persisted.bind(this.store);
-    this.store.persisted = scope => sql.uncounted(() => persisted(scope));
+    const persisted = this.store?.persisted?.bind(this.store);
+    if (persisted) this.store.persisted = scope => sql.uncounted(() => persisted(scope));
   }
   async fetch(request) {
     const response = await super.fetch(request);
@@ -95,6 +96,10 @@ export default { fetch(request, env, ctx) { return worker.fetch(request, local(e
 `;
 }
 
+const wallets = contents => /export\s*\{[^}]*\bWallet\b[^}]*\}/.test(contents);
+
+const entryOf = directory => `${directory}/${readdirSync(directory).find(file => file.endsWith(".js"))}`;
+
 function modules(directory) {
   const files = readdirSync(directory);
   const scripts = files.filter(file => file.endsWith(".js"));
@@ -102,7 +107,27 @@ function modules(directory) {
   const path = `${directory}/${scripts[0]}`;
   const contents = readFileSync(path, "utf8");
   const imports = [...contents.matchAll(/from\s+["']\.\/([^"']+\.wasm)["']/g)].map(match => match[1]);
-  return [{ type: "ESModule", path: `${directory}/local-shim.mjs`, contents: shim(scripts[0]) }, { type: "ESModule", path, contents }, ...[...new Set(imports)].map(file => ({ type: "CompiledWasm", path: `${directory}/${file}`, contents: readFileSync(process.env.NANOCODE_WASM_PATH ?? `${directory}/${file}`) }))];
+  return [{ type: "ESModule", path: `${directory}/local-shim.mjs`, contents: shim(scripts[0], wallets(contents)) }, { type: "ESModule", path, contents }, ...[...new Set(imports)].map(file => ({ type: "CompiledWasm", path: `${directory}/${file}`, contents: readFileSync(process.env.NANOCODE_WASM_PATH ?? `${directory}/${file}`) }))];
+}
+
+const MCP_HOSTS = new Set(["gateway.tempo-dev.workers.dev", "mercator.sh"]);
+
+async function offline(request) {
+  const url = new URL(request.url);
+  if (url.hostname === "cloudflare-dns.com" && MCP_HOSTS.has(url.searchParams.get("name"))) {
+    const type = url.searchParams.get("type") === "AAAA" ? 28 : 1;
+    return Response.json({ Status: 0, Answer: [{ name: url.searchParams.get("name"), type, TTL: 300, data: type === 1 ? "104.16.0.1" : "2606:4700::1" }] });
+  }
+  if (MCP_HOSTS.has(url.hostname) && url.pathname === "/mcp") {
+    if (request.method !== "POST") return new Response(null, { status: 405 });
+    const message = await request.json();
+    if (message.id === undefined) return new Response(null, { status: 202 });
+    const result = message.method === "initialize" ? { protocolVersion: message.params?.protocolVersion ?? "2025-06-18", capabilities: { tools: {} }, serverInfo: { name: "local", version: "0" } }
+      : message.method === "tools/list" ? { tools: [] }
+      : undefined;
+    return Response.json(result ? { jsonrpc: "2.0", id: message.id, result } : { jsonrpc: "2.0", id: message.id, error: { code: -32601, message: "method not found" } });
+  }
+  throw new Error("The Worker attempted direct outbound network access");
 }
 
 export function localOptions({ provider, agent = {}, workers = [], persistence, bundle = process.env.NANOCODE_BUNDLE_PATH ?? "output/deploy" } = {}) {
@@ -115,10 +140,10 @@ export function localOptions({ provider, agent = {}, workers = [], persistence, 
         name: "nanocode",
         modules: modules(bundle),
         compatibilityDate: "2026-10-16",
-        durableObjects: { SESSIONS: { className: "AgentSession", useSQLite: true } },
+        durableObjects: { SESSIONS: { className: "AgentSession", useSQLite: true }, ...(wallets(readFileSync(entryOf(bundle), "utf8")) ? { WALLETS: { className: "Wallet", useSQLite: true } } : {}) },
         serviceBindings: { GATEWAY_UPSTREAM: "gateway-upstream" },
         bindings: { AI_GATEWAY_ID: "local", ACCESS_TOKEN_SHA256: createHash("sha256").update(LOCAL_TOKEN).digest("hex"), MODEL_AUTH: "api_key", RECOVERY_DELAY_MS: "1000", EVENT_PAGE_SIZE: "128", EVENT_TAIL_BYTES: "4194304", EVENT_COALESCE_MS: "100", MODEL_SOCKET_LINGER_MS: "0", RUNTIME_MEMORY_BUDGET_BYTES: "67108864", EVENT_STREAM_KEEPALIVE_MS: "100", REMOTE_MAX_FRAME_BYTES: "1048576", REMOTE_TIMEOUT_MS: "30000", ...agent },
-        outboundService: async () => { throw new Error("The Worker attempted direct outbound network access"); },
+        outboundService: offline,
       },
       {
         name: "gateway-upstream",

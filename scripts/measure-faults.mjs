@@ -72,7 +72,7 @@ function parse(provider, input) {
   const prompt = index < 0 ? "" : text(items[index]);
   const outputs = items.slice(index + 1).filter(item => item.type === "function_call_output" || item.type === "custom_tool_call_output");
   const completion = completionStatus(items.slice(index + 1).filter(item => item.type === "message").map(text));
-  return { prompt, round: outputs.length, errors: 0, tool: suffix => suffix, completion, output: outputs.map(item => typeof item.output === "string" ? item.output : JSON.stringify(item.output)).join("\n") };
+  return { prompt, round: outputs.length, errors: 0, tool: suffix => suffix, completion, output: outputs.map(item => typeof item.output === "string" ? item.output : Array.isArray(item.output) ? item.output.map(part => part.text ?? JSON.stringify(part)).join("\n") : JSON.stringify(item.output)).join("\n") };
 }
 
 function respond(provider, input, block) {
@@ -115,7 +115,7 @@ const provider = globalThis.faultProvider = async request => {
   const slow = /\[slow:(\d+)\]/.exec(prompt);
   if (slow) await sleep(Number(slow[1]));
   const use = (name, value) => ({ type: "tool_use", id: `toolu_${calls.length}`, name: tool(name), input: value });
-  const block = completion ? { type: "text", text: `completion for ${turn}` }
+  let block = completion ? { type: "text", text: `completion for ${turn}` }
     : prompt.includes("[tool]") && round === 0 ? use("list_agents", kind === "claude" ? { include_completed: true } : {})
     : prompt.includes("[list]") && round === 0 ? use("list_agents", { include_completed: true })
     : prompt.includes("[wait]") && round === 0 ? use("wait_agent", { agent_ids: [1], timeout_ms: 1000 })
@@ -123,6 +123,8 @@ const provider = globalThis.faultProvider = async request => {
     : prompt.includes("[child]") && round === 0 ? use("submit_result", { output: "child-ok" })
     : prompt.includes("[exec]") && round === 0 ? { type: "tool_use", id: `toolu_${calls.length}`, name: "exec", input: { code: cells[turn] } }
     : { type: "text", text: `reply to ${turn}` };
+  const offered = kind === "claude" ? (input.tools ?? []).map(entry => entry.name) : [...(input.tools ?? []), ...(Array.isArray(input.input) ? input.input : []).filter(item => item.type === "additional_tools").flatMap(item => item.tools ?? [])].map(entry => entry.name);
+  if (block.type === "tool_use" && block.name !== "exec" && !offered.includes(block.name) && offered.includes("exec")) block = { type: "tool_use", id: block.id, name: "exec", input: { code: "text(JSON.stringify(await tools." + block.name + "(" + JSON.stringify(block.input) + ")));" } };
   const holdHere = !completion && ((prompt.includes("[hold]") && round === 0) || (prompt.includes("[hold-after-tool]") && round === 1));
   const key = `${turn}:${round}`;
   if (holdHere && !held.has(key)) {
@@ -599,6 +601,7 @@ const scenarios = {
     await submit(session, first, "plain");
     await settled(session, first);
     await sql(session.name, "ALTER TABLE turns DROP COLUMN retry");
+    await sql(session.name, "DELETE FROM nanocode_formats WHERE component = 'session_log'");
     const dropped = await sql(session.name, "SELECT COUNT(*) AS count FROM pragma_table_info('turns') WHERE name = 'retry'");
     check("retryColumn", dropped[0].count === 0, `${provider}: the turns table lost its retry column`, dropped);
     await mf.unsafeEvictDurableObject("nanocode", "AgentSession", { name: objectName(session.name) });
