@@ -5,7 +5,7 @@ export const CHARGE_CONFIRM_MS = 3000;
 
 const definition: HostTool = {
   name: "charge",
-  description: "Charges the user an amount in US dollars, with a memo. Every call moves money once more: call it only when the user asks for a charge, once per charge.",
+  description: "Charges the user an amount in US dollars, with a memo.",
   parameters: { type: "object", properties: { amount: { type: "number" }, memo: { type: "string" } }, required: ["amount", "memo"], additionalProperties: false },
 };
 
