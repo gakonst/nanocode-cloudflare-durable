@@ -5,11 +5,12 @@
   "workers_dev": false,
   "durable_objects": {
     "bindings": [
-      { "name": "PYTHON", "class_name": "Python" }
+      { "name": "PYTHON", "class_name": "Pyodide" }
     ]
   },
   "migrations": [
-    { "tag": "v1", "new_sqlite_classes": ["Python"] }
+    { "tag": "v1", "new_sqlite_classes": ["Python"] },
+    { "tag": "v2", "renamed_classes": [{ "from": "Python", "to": "Pyodide" }] }
   ],
   "limits": { "cpu_ms": 300000 },
   "observability": { "enabled": true }
