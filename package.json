@@ -14,7 +14,7 @@
   },
   "dependencies": {
     "@pierre/highlights": "0.2.0",
-    "nanocode-ts": "github:gakonst/nanocode-ts#9074879a2317927e329586f4ca0861cb707ca405",
+    "nanocode-ts": "github:gakonst/nanocode-ts#57086f9e366edf55adaefb75ce388a663221af66",
     "react": "19.3.1",
     "react-dom": "19.3.1",
     "zyzz": "0.0.40"
