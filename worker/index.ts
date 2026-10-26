@@ -1,9 +1,10 @@
+import { DurableObject } from "cloudflare:workers";
 import { aiGateway, client, createNanocode, PublicLimit } from "nanocode-ts/cloudflare";
 import { createWallets, type MachinesEnv, visitor, VISITOR } from "nanocode-ts/machines/cloudflare";
 import { PUBLIC_MODELS } from "./models";
 import { charge } from "./tools";
 import type { PythonReply } from "nanocode-ts/bash";
-import type { Python } from "nanocode-ts/cloudflare/python";
+import type { Python as Pyodide } from "nanocode-ts/cloudflare/python";
 
 interface Env extends MachinesEnv {
   AI: Ai;
@@ -13,7 +14,7 @@ interface Env extends MachinesEnv {
   ACCESS_TOKEN_SHA256: string;
   CHAT_PUBLIC: string;
   PUBLIC_LIMITS: DurableObjectNamespace<PublicLimit>;
-  PYTHON: DurableObjectNamespace<Python>;
+  PYTHON: DurableObjectNamespace<Pyodide>;
 }
 
 const DIGEST = /^[0-9a-f]{64}$/;
@@ -93,6 +94,8 @@ const nanocode = createNanocode<Env>({
 export const { AgentSession } = nanocode;
 export const { Wallet } = wallets;
 export { PublicLimit };
+
+export class Python extends DurableObject {}
 
 export default {
   async fetch(request, env) {
