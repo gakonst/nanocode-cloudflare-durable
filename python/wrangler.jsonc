@@ -1,0 +1,16 @@
+{
+  "name": "nanocode-python",
+  "main": "index.ts",
+  "compatibility_date": "2026-10-16",
+  "workers_dev": false,
+  "durable_objects": {
+    "bindings": [
+      { "name": "PYTHON", "class_name": "Python" }
+    ]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["Python"] }
+  ],
+  "limits": { "cpu_ms": 300000 },
+  "observability": { "enabled": true }
+}

@@ -3,7 +3,7 @@ import { createWallets, type MachinesEnv, visitor, VISITOR } from "nanocode-ts/m
 import { PUBLIC_MODELS } from "./models";
 import { charge } from "./tools";
 import type { PythonReply } from "nanocode-ts/bash";
-import { Python } from "./python";
+import type { Python } from "nanocode-ts/cloudflare/python";
 
 interface Env extends MachinesEnv {
   AI: Ai;
@@ -86,13 +86,13 @@ const nanocode = createNanocode<Env>({
   egress: env => aiGateway(env.AI, env.AI_GATEWAY_ID, env.OPENAI_SERVICE_TIER, Number(env.MODEL_FIRST_BYTE_MS) || undefined),
   tools: charge,
   chaos: true,
-  workspace: { python: (authority, env) => async request => await env.PYTHON.get(env.PYTHON.idFromName(authority.account_id)).run(request) as PythonReply },
+  workspace: { python: (authority, env) => async request => await env.PYTHON.get(env.PYTHON.idFromName(authority.account_id)).run(request) as unknown as PythonReply },
   ...wallets.nanocode,
 });
 
 export const { AgentSession } = nanocode;
 export const { Wallet } = wallets;
-export { PublicLimit, Python };
+export { PublicLimit };
 
 export default {
   async fetch(request, env) {
