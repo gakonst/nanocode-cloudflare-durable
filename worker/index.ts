@@ -1,5 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
-import { aiGateway, client, createNanocode, HandRelay, PublicLimit, relay as relayHand } from "nanocode-ts/cloudflare";
+import { aiGateway, bearerToken, client, createNanocode, HandRelay, PublicLimit, relay as relayHand } from "nanocode-ts/cloudflare";
 import { createWallets, type MachinesEnv, visitor, VISITOR } from "nanocode-ts/machines/cloudflare";
 import { PUBLIC_MODELS } from "./models";
 import { charge } from "./tools";
@@ -70,7 +70,7 @@ async function admit(request: Request, env: Env): Promise<Response | undefined> 
   const { pathname } = new URL(request.url);
   if (pathname === "/health") return;
   if (!PUBLIC_ROUTE.test(pathname)) return refuse("this route needs the access token", 403);
-  if (/\/hands(?:\/[^/]+)?$/.test(pathname) && request.headers.get("upgrade")?.toLowerCase() === "websocket" && !/^Bearer nch_/.test(request.headers.get("authorization") ?? "")) return refuse("hands attach with the session's hand token", 403);
+  if (/\/hands(?:\/[^/]+)?$/.test(pathname) && request.headers.get("upgrade")?.toLowerCase() === "websocket" && !bearerToken(request)?.startsWith("nch_")) return refuse("hands attach with the session's hand token", 403);
   if (!(await env.PUBLIC_LIMITS.get(env.PUBLIC_LIMITS.idFromName(client(request.headers.get("cf-connecting-ip")!))).admit())) return refuse("too many requests, try again in a minute", 429);
   if (request.method !== "POST" || !/\/(?:turns|warm)$/.test(pathname)) return;
   const body = await request.clone().json().catch(() => undefined) as { model?: unknown; prompt?: unknown; provider?: unknown; thinking?: unknown } | undefined;
