@@ -8,6 +8,7 @@
   "durable_objects": {
     "bindings": [
       { "name": "SESSIONS", "class_name": "AgentSession" },
+      { "name": "HAND_RELAYS", "class_name": "HandRelay" },
       { "name": "PUBLIC_LIMITS", "class_name": "PublicLimit" },
       { "name": "PYTHON", "class_name": "Pyodide", "script_name": "nanocode-python" },
       { "name": "WALLETS", "class_name": "Wallet" }

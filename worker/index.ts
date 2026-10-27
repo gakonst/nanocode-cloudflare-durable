@@ -1,5 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
-import { aiGateway, client, createNanocode, HandRelay, PublicLimit } from "nanocode-ts/cloudflare";
+import { aiGateway, client, createNanocode, HandRelay, PublicLimit, relay as relayHand } from "nanocode-ts/cloudflare";
 import { createWallets, type MachinesEnv, visitor, VISITOR } from "nanocode-ts/machines/cloudflare";
 import { PUBLIC_MODELS } from "./models";
 import { charge } from "./tools";
@@ -13,6 +13,7 @@ interface Env extends MachinesEnv {
   MODEL_FIRST_BYTE_MS?: string;
   ACCESS_TOKEN_SHA256: string;
   CHAT_PUBLIC: string;
+  HAND_RELAYS: DurableObjectNamespace<HandRelay>;
   PUBLIC_LIMITS: DurableObjectNamespace<PublicLimit>;
   PYTHON: DurableObjectNamespace<Pyodide>;
 }
@@ -104,6 +105,7 @@ export default {
     if (request.method === "POST" && (pathname === "/api/device/register" || pathname === "/api/device/token")) return relay(request, pathname);
     if (request.method === "GET" && pathname.startsWith("/api/github/")) return archive(pathname);
     if (request.method === "GET" && pathname === "/install") return Response.redirect("https://nanocode.xyz/install", 308);
+    if (request.method === "GET" && pathname === "/relay") return relayHand(request, env.HAND_RELAYS);
     const refused = env.CHAT_PUBLIC === "1" && !(await owner(request, env)) ? await admit(request, env) : undefined;
     return refused ?? await wallets.fetch(request, env) ?? nanocode.fetch(request, env);
   },
