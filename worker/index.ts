@@ -1,6 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
 import { aiGateway, client, createNanocode, PublicLimit } from "nanocode-ts/cloudflare";
-import { installScript } from "nanocode-ts/install";
 import { createWallets, type MachinesEnv, visitor, VISITOR } from "nanocode-ts/machines/cloudflare";
 import { PUBLIC_MODELS } from "./models";
 import { charge } from "./tools";
@@ -104,7 +103,7 @@ export default {
     const { pathname } = new URL(request.url);
     if (request.method === "POST" && (pathname === "/api/device/register" || pathname === "/api/device/token")) return relay(request, pathname);
     if (request.method === "GET" && pathname.startsWith("/api/github/")) return archive(pathname);
-    if (request.method === "GET" && pathname === "/install") return new Response(installScript(), { headers: { "cache-control": "public, max-age=300", "content-type": "text/plain; charset=utf-8" } });
+    if (request.method === "GET" && pathname === "/install") return Response.redirect("https://nanocode.xyz/install", 308);
     const refused = env.CHAT_PUBLIC === "1" && !(await owner(request, env)) ? await admit(request, env) : undefined;
     return refused ?? await wallets.fetch(request, env) ?? nanocode.fetch(request, env);
   },

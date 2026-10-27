@@ -101,7 +101,7 @@ function App() {
     try {
       const { session, token } = await transport.handToken();
       const socket = new URL(`sessions/${encodeURIComponent(session)}/hands/machine`, location.href).href.replace(/^http/, "ws");
-      const install = new URL("install", location.href).href;
+      const install = "https://nanocode.xyz/install";
       setHand({ session, command: `curl -fsSL ${install} | sh -s -- hand '${socket}' --token ${token}`, short: `nc hand '${socket}' --token ${token}` });
     } catch (error) {
       chat.note("error", `Could not connect a machine: ${error instanceof Error ? error.message : String(error)}`);
