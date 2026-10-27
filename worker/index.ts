@@ -1,5 +1,6 @@
 import { DurableObject } from "cloudflare:workers";
 import { aiGateway, client, createNanocode, PublicLimit } from "nanocode-ts/cloudflare";
+import { installScript } from "nanocode-ts/install";
 import { createWallets, type MachinesEnv, visitor, VISITOR } from "nanocode-ts/machines/cloudflare";
 import { PUBLIC_MODELS } from "./models";
 import { charge } from "./tools";
@@ -21,7 +22,7 @@ const DIGEST = /^[0-9a-f]{64}$/;
 const ACCOUNT = "owner";
 const PUBLIC_ACCOUNT = "public";
 const PUBLIC_PROMPT_CHARACTERS = 2000;
-const PUBLIC_ROUTE = /^\/(?:sessions\/[^/]+\/(?:turns(?:\/[^/]+(?:\/cancel)?)?|events|crash|warm|files(?:\/.+)?)|v1\/(?:keys|me)|api\/device\/(?:register|token))$/;
+const PUBLIC_ROUTE = /^\/(?:sessions\/[^/]+\/(?:turns(?:\/[^/]+(?:\/cancel)?)?|events|crash|warm|hands(?:\/[^/]+)?|files(?:\/.+)?)|v1\/(?:keys|me)|api\/device\/(?:register|token))$/;
 
 async function owner(request: Request, env: Env): Promise<boolean> {
   const header = request.headers.get("authorization") ?? "";
@@ -69,6 +70,7 @@ async function admit(request: Request, env: Env): Promise<Response | undefined> 
   const { pathname } = new URL(request.url);
   if (pathname === "/health") return;
   if (!PUBLIC_ROUTE.test(pathname)) return refuse("this route needs the access token", 403);
+  if (/\/hands(?:\/[^/]+)?$/.test(pathname) && request.headers.get("upgrade")?.toLowerCase() === "websocket" && !/^Bearer nch_/.test(request.headers.get("authorization") ?? "")) return refuse("hands attach with the session's hand token", 403);
   if (!(await env.PUBLIC_LIMITS.get(env.PUBLIC_LIMITS.idFromName(client(request.headers.get("cf-connecting-ip")!))).admit())) return refuse("too many requests, try again in a minute", 429);
   if (request.method !== "POST" || !/\/(?:turns|warm)$/.test(pathname)) return;
   const body = await request.clone().json().catch(() => undefined) as { model?: unknown; prompt?: unknown; provider?: unknown; thinking?: unknown } | undefined;
@@ -102,6 +104,7 @@ export default {
     const { pathname } = new URL(request.url);
     if (request.method === "POST" && (pathname === "/api/device/register" || pathname === "/api/device/token")) return relay(request, pathname);
     if (request.method === "GET" && pathname.startsWith("/api/github/")) return archive(pathname);
+    if (request.method === "GET" && pathname === "/install") return new Response(installScript(), { headers: { "cache-control": "public, max-age=300", "content-type": "text/plain; charset=utf-8" } });
     const refused = env.CHAT_PUBLIC === "1" && !(await owner(request, env)) ? await admit(request, env) : undefined;
     return refused ?? await wallets.fetch(request, env) ?? nanocode.fetch(request, env);
   },
