@@ -1,5 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
-import { aiGateway, client, createNanocode, PublicLimit } from "nanocode-ts/cloudflare";
+import { aiGateway, client, createNanocode, HandRelay, PublicLimit } from "nanocode-ts/cloudflare";
 import { createWallets, type MachinesEnv, visitor, VISITOR } from "nanocode-ts/machines/cloudflare";
 import { PUBLIC_MODELS } from "./models";
 import { charge } from "./tools";
@@ -94,7 +94,7 @@ const nanocode = createNanocode<Env>({
 
 export const { AgentSession } = nanocode;
 export const { Wallet } = wallets;
-export { PublicLimit };
+export { HandRelay, PublicLimit };
 
 export class Python extends DurableObject {}
 

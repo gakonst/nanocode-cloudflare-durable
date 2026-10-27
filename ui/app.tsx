@@ -3,7 +3,7 @@ import { createConfig, modelItems, thinkingItems } from "nanocode-ts/client";
 import { cloudflare } from "nanocode-ts/cloudflare/transport";
 import { Keyring } from "nanocode-ts/machines";
 import { Prompts, Unlock, useUnlock, walletCards } from "nanocode-ts/machines/react";
-import { Chat, Hand, NanocodeProvider, type Picker, useConfig, useConversations, useSend } from "nanocode-ts/react";
+import { Chat, HandConnect, NanocodeProvider, type Picker, useConfig, useConversations, useHand, useSend } from "nanocode-ts/react";
 import { skin, styles } from "nanocode-ts/react/skin";
 import { Demos, Header, Lead, Main, origin, Page, styles as site, Title } from "nanocode-ts/react/site";
 import { useEffect, useState, useSyncExternalStore } from "react";
@@ -78,35 +78,8 @@ function App() {
   const [access, setAccess] = useState(false);
   const [secret, setSecret] = useState(token);
   const unlock = useUnlock(keyring);
-  const [hand, setHand] = useState<{ session: string; command: string; short: string } | null>(null);
-  const [handOpen, setHandOpen] = useState(false);
-  const [machines, setMachines] = useState<string[]>([]);
-  const connected = machines.length > 0;
-  const handSession = hand?.session;
-
-  useEffect(() => {
-    if (!handSession || (!handOpen && !connected)) return;
-    let stopped = false;
-    const poll = async () => {
-      const found = await transport.hands().catch(() => []);
-      if (!stopped) setMachines(found);
-    };
-    void poll();
-    const timer = setInterval(() => void poll(), handOpen ? 3000 : 20_000);
-    return () => { stopped = true; clearInterval(timer); };
-  }, [handSession, handOpen, connected]);
-
-  const connect = async () => {
-    setHandOpen(true);
-    try {
-      const { session, token } = await transport.handToken();
-      const socket = new URL(`sessions/${encodeURIComponent(session)}/hands/machine`, location.href).href.replace(/^http/, "ws");
-      const install = "https://nanocode.xyz/install";
-      setHand({ session, command: `curl -fsSL ${install} | sh -s -- hand '${socket}' --token ${token}`, short: `nc hand '${socket}' --token ${token}` });
-    } catch (error) {
-      chat.note("error", `Could not connect a machine: ${error instanceof Error ? error.message : String(error)}`);
-    }
-  };
+  const hand = useHand(transport);
+  const machines = hand.hands.map(name => name ?? "your machine");
 
   const configure = async () => {
     const open = await fetch("health").catch(() => undefined);
@@ -153,9 +126,7 @@ function App() {
 
   const clear = () => {
     chat.clear();
-    setHand(null);
-    setHandOpen(false);
-    setMachines([]);
+    hand.reset();
     save();
   };
 
@@ -168,7 +139,7 @@ function App() {
       return true;
     }
     if (name === "/hand") {
-      void connect();
+      hand.show();
       return true;
     }
     if (name === "/model") {
@@ -215,12 +186,7 @@ function App() {
       commands={[...COMMANDS, ...unlock.commands]}
       empty="Ask a question to start a turn, or type /model to choose a model."
       extras={<>
-        {handOpen && hand ? <Hand command={hand.command} hands={machines} onClose={() => setHandOpen(false)} short={hand.short} /> : (
-        <p {...styles.row()}>
-          <span aria-hidden="true" {...styles.chevron()}>❯</span>
-          <button onClick={() => void connect()} type="button" {...styles.suggestion()}>{connected ? `running on ${machines.join(", ")} · show the command` : "Run this session on your own machine with nc →"}</button>
-        </p>
-        )}
+        <HandConnect hand={hand} />
         <Unlock machine={unlock} />
         <Prompts machine={unlock} />
         {access && (
@@ -247,7 +213,7 @@ function App() {
       onPickerClose={() => setPicker(null)}
       onSubmit={text => { if (unlock.handles(text)) void unlock.command(text); else if (!command(text)) void send(text); }}
       picker={picker}
-      status={`${harnessOf(model).label} · ${model.label} · ${store.thinking ?? model.effort} · ${transport.session().id ?? "new session"}${connected ? ` · on ${machines.join(", ")}` : ""} · ${busy ? "running" : "idle"}`}
+      status={`${harnessOf(model).label} · ${model.label} · ${store.thinking ?? model.effort} · ${transport.session().id ?? "new session"}${machines.length ? ` · on ${machines.join(", ")}` : ""} · ${busy ? "running" : "idle"}`}
       suggestions={[...prompts.map(prompt => ({ label: prompt, onClick: () => void send(prompt), disabled: busy })), { label: "Kill the next tool call", onClick: () => void crash(), disabled: !transport.session().id }]}
     />
   );
