@@ -10,6 +10,7 @@
       { "name": "SESSIONS", "class_name": "AgentSession" },
       { "name": "HAND_RELAYS", "class_name": "HandRelay" },
       { "name": "PUBLIC_LIMITS", "class_name": "PublicLimit" },
+      { "name": "MCP_LISTINGS", "class_name": "McpListings" },
       { "name": "PYTHON", "class_name": "Pyodide", "script_name": "nanocode-python" },
       { "name": "WALLETS", "class_name": "Wallet" }
     ]
@@ -20,7 +21,8 @@
     { "tag": "v3", "new_sqlite_classes": ["HandRelay"] },
     { "tag": "v4", "new_sqlite_classes": ["Wallet"] },
     { "tag": "v5", "new_sqlite_classes": ["Python"], "deleted_classes": ["HandRelay"] },
-    { "tag": "v6", "new_sqlite_classes": ["HandRelay"] }
+    { "tag": "v6", "new_sqlite_classes": ["HandRelay"] },
+    { "tag": "v7", "new_sqlite_classes": ["McpListings"] }
   ],
   "vars": {
     "AI_GATEWAY_ID": "default",

@@ -1,6 +1,6 @@
 import "nanocode-ts/react/zyzz.css";
-import { createConfig } from "nanocode-ts/client";
-import { cloudflare } from "nanocode-ts/cloudflare/transport";
+import { Config } from "nanocode-ts/client";
+import * as Transport from "nanocode-ts/cloudflare/transport";
 import { Keyring } from "nanocode-ts/machines";
 import { Playground } from "nanocode-ts/react/playground";
 import { Demos, Header, Lead, Main, origin, Page, styles as site, Title } from "nanocode-ts/react/site";
@@ -14,12 +14,12 @@ const HAIKU = HARNESSES[0]!.models[0]!;
 const highlight = () => import("nanocode-ts/highlight").then(module => module.highlight);
 
 function config(name: string, history: boolean) {
-  const transport = cloudflare({
+  const transport = Transport.create({
     headers: () => ({ ...Keyring.visitorHeaders() }),
     model: () => ({ model: HAIKU.id, provider: "claude", thinking: HAIKU.efforts.includes("low" as never) ? "low" : HAIKU.effort }),
     session: { load: () => ({}), save: () => {} },
   });
-  return createConfig({ ...(history ? { history: { key: KEY + ":" + name } } : {}), revealMs: 0, transport });
+  return Config.create({ ...(history ? { history: { key: KEY + ":" + name } } : {}), revealMs: 0, transport });
 }
 
 const configs = { button: config("button", false), chat: config("chat", true), rewrite: config("rewrite", false) };

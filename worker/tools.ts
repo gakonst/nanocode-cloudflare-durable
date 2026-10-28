@@ -1,5 +1,8 @@
-import type { HostTool } from "nanocode-ts";
-import type { HostToolCall } from "nanocode-ts/cloudflare";
+import type { Contracts } from "nanocode-ts";
+import type { App } from "nanocode-ts/cloudflare";
+
+type HostTool = Contracts.HostTool;
+type HostToolCall = App.HostToolCall;
 
 export const CHARGE_CONFIRM_MS = 3000;
 

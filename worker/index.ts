@@ -1,12 +1,17 @@
 import { DurableObject } from "cloudflare:workers";
-import { aiGateway, bearerToken, client, createNanocode, HandRelay, PublicLimit, relay as relayHand } from "nanocode-ts/cloudflare";
-import { createWallets, type MachinesEnv, visitor, VISITOR } from "nanocode-ts/machines/cloudflare";
+import { Remote } from "nanocode-ts";
+import { App, Gateway, HandRelay, Limit, Listings, McpListings, PublicLimit, Relay } from "nanocode-ts/cloudflare";
+import { Env as Machines, Wallets } from "nanocode-ts/machines/cloudflare";
+import * as Account from "nanocode-ts/machines/server";
 import { PUBLIC_MODELS } from "./models";
 import { charge } from "./tools";
-import type { PythonReply } from "nanocode-ts/bash";
+import type { Python as Shell } from "nanocode-ts/bash";
 import type { Python as Pyodide } from "nanocode-ts/cloudflare/python";
 
-interface Env extends MachinesEnv {
+const visitor = Account.visitor;
+const VISITOR = Account.visitorHeader;
+
+interface Env extends Machines.Env {
   AI: Ai;
   AI_GATEWAY_ID: string;
   OPENAI_SERVICE_TIER: string;
@@ -16,6 +21,7 @@ interface Env extends MachinesEnv {
   HAND_RELAYS: DurableObjectNamespace<HandRelay>;
   PUBLIC_LIMITS: DurableObjectNamespace<PublicLimit>;
   PYTHON: DurableObjectNamespace<Pyodide>;
+  MCP_LISTINGS: DurableObjectNamespace<McpListings>;
 }
 
 const DIGEST = /^[0-9a-f]{64}$/;
@@ -70,8 +76,8 @@ async function admit(request: Request, env: Env): Promise<Response | undefined> 
   const { pathname } = new URL(request.url);
   if (pathname === "/health") return;
   if (!PUBLIC_ROUTE.test(pathname)) return refuse("this route needs the access token", 403);
-  if (/\/hands(?:\/[^/]+)?$/.test(pathname) && request.headers.get("upgrade")?.toLowerCase() === "websocket" && !bearerToken(request)?.startsWith("nch_")) return refuse("hands attach with the session's hand token", 403);
-  if (!(await env.PUBLIC_LIMITS.get(env.PUBLIC_LIMITS.idFromName(client(request.headers.get("cf-connecting-ip")!))).admit())) return refuse("too many requests, try again in a minute", 429);
+  if (/\/hands(?:\/[^/]+)?$/.test(pathname) && request.headers.get("upgrade")?.toLowerCase() === "websocket" && !Remote.bearerToken(request)?.startsWith("nch_")) return refuse("hands attach with the session's hand token", 403);
+  if (!(await env.PUBLIC_LIMITS.get(env.PUBLIC_LIMITS.idFromName(Limit.client(request.headers.get("cf-connecting-ip")!))).admit())) return refuse("too many requests, try again in a minute", 429);
   if (request.method !== "POST" || !/\/(?:turns|warm)$/.test(pathname)) return;
   const body = await request.clone().json().catch(() => undefined) as { model?: unknown; prompt?: unknown; provider?: unknown; thinking?: unknown } | undefined;
   if (typeof body?.prompt === "string" && body.prompt.length > PUBLIC_PROMPT_CHARACTERS) return refuse(`prompts are limited to ${PUBLIC_PROMPT_CHARACTERS} characters`, 413);
@@ -82,20 +88,21 @@ async function admit(request: Request, env: Env): Promise<Response | undefined> 
   if (body?.thinking !== undefined && !allowed.efforts.includes(String(body.thinking))) return refuse(`${model} takes ${allowed.efforts.join(", ")}`, 403);
 }
 
-const wallets = createWallets<Env>({ account, scripts: true });
+const wallets = Wallets.create<Env>({ account, scripts: true });
 
-const nanocode = createNanocode<Env>({
+const nanocode = App.create<Env>({
   authenticate,
-  egress: env => aiGateway(env.AI, env.AI_GATEWAY_ID, env.OPENAI_SERVICE_TIER, Number(env.MODEL_FIRST_BYTE_MS) || undefined),
+  egress: env => Gateway.create(env.AI, { id: env.AI_GATEWAY_ID, serviceTier: env.OPENAI_SERVICE_TIER, firstByteMs: Number(env.MODEL_FIRST_BYTE_MS) || undefined }),
   tools: charge,
   chaos: true,
-  workspace: { python: (authority, env) => async request => await env.PYTHON.get(env.PYTHON.idFromName(authority.account_id)).run(request) as unknown as PythonReply },
+  workspace: { python: (authority, env) => async request => await env.PYTHON.get(env.PYTHON.idFromName(authority.account_id)).run(request) as unknown as Shell.Reply },
   ...wallets.nanocode,
+  ...(wallets.nanocode.mcp ? { mcp: { ...wallets.nanocode.mcp, store: env => Listings.store(env.MCP_LISTINGS) } } : {}),
 });
 
 export const { AgentSession } = nanocode;
 export const { Wallet } = wallets;
-export { HandRelay, PublicLimit };
+export { HandRelay, McpListings, PublicLimit };
 
 export class Python extends DurableObject {}
 
@@ -105,7 +112,7 @@ export default {
     if (request.method === "POST" && (pathname === "/api/device/register" || pathname === "/api/device/token")) return relay(request, pathname);
     if (request.method === "GET" && pathname.startsWith("/api/github/")) return archive(pathname);
     if (request.method === "GET" && pathname === "/install") return Response.redirect("https://nanocode.xyz/install", 308);
-    if (request.method === "GET" && pathname === "/relay") return relayHand(request, env.HAND_RELAYS);
+    if (request.method === "GET" && pathname === "/relay") return Relay.route(request, { namespace: env.HAND_RELAYS });
     const refused = env.CHAT_PUBLIC === "1" && !(await owner(request, env)) ? await admit(request, env) : undefined;
     return refused ?? await wallets.fetch(request, env) ?? nanocode.fetch(request, env);
   },

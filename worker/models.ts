@@ -1,4 +1,6 @@
-import type { ModelProvider } from "nanocode-ts";
+import type { Contracts } from "nanocode-ts";
+
+type ModelProvider = Contracts.ModelProvider;
 import { models } from "nanocode-ts/models";
 
 type Public = { id: ModelProvider; label: string; models: { id: string; label: string }[] };

@@ -5,7 +5,7 @@ Wallet.configure({ name: "nanocode on Cloudflare", relay: "api/device/", website
 
 const TOKEN = "nanocode-cloudflare-durable:token";
 
-type State = { connected?: Wallet.Wallet; busy: boolean; error?: string; device?: Wallet.Prompt };
+type State = { connected?: Wallet.AccessKey; busy: boolean; error?: string; device?: Wallet.Prompt };
 
 let state: State = { busy: false };
 const listeners = new Set<() => void>();
@@ -20,9 +20,9 @@ const headers = (): Record<string, string> => {
   return { ...Keyring.visitorHeaders(), ...(token ? { authorization: "Bearer " + token } : {}) };
 };
 
-const keyring = Keyring.keyring({ url: "v1/keys", headers });
+const keyring = Keyring.create({ url: "v1/keys", headers });
 
-async function use(connected: Wallet.Wallet | undefined) {
+async function use(connected: Wallet.AccessKey | undefined) {
   if (connected) await keyring.register(connected);
   set({ connected });
 }

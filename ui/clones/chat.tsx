@@ -1,5 +1,5 @@
-import { createConfig } from "nanocode-ts/client";
-import { cloudflare } from "nanocode-ts/cloudflare/transport";
+import { Config } from "nanocode-ts/client";
+import * as Transport from "nanocode-ts/cloudflare/transport";
 import { Keyring } from "nanocode-ts/machines";
 import { useState, useSyncExternalStore } from "react";
 import { PUBLIC_HARNESSES } from "../../worker/models.ts";
@@ -42,7 +42,7 @@ export function createClone(key: string, harness: "claude" | "codex") {
     return models.find(model => model.id === id) ?? models[0]!;
   };
 
-  const transport = cloudflare({
+  const transport = Transport.create({
     headers,
     model: () => {
       const model = current();
@@ -57,7 +57,7 @@ export function createClone(key: string, harness: "claude" | "codex") {
     },
   });
 
-  const config = createConfig({ history: { key }, transport });
+  const config = Config.create({ history: { key }, transport });
 
   const choose = (id: string) => {
     const conversation = config.getState().conversation;

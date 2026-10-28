@@ -1,6 +1,6 @@
 import "nanocode-ts/react/zyzz.css";
-import { createConfig, modelItems, thinkingItems } from "nanocode-ts/client";
-import { cloudflare } from "nanocode-ts/cloudflare/transport";
+import { Config, Pickers } from "nanocode-ts/client";
+import * as Transport from "nanocode-ts/cloudflare/transport";
 import { Keyring } from "nanocode-ts/machines";
 import { Prompts, Unlock, useUnlock, walletCards } from "nanocode-ts/machines/react";
 import { Chat, HandConnect, NanocodeProvider, type Picker, useConfig, useConversations, useHand, useSend } from "nanocode-ts/react";
@@ -58,16 +58,16 @@ function harnessOf(model: Model) {
 
 const headers = (): Record<string, string> => ({ ...Keyring.visitorHeaders(), ...(token ? { authorization: `Bearer ${token}` } : {}) });
 
-const keyring = Keyring.keyring({ url: "v1/keys", headers });
+const keyring = Keyring.create({ url: "v1/keys", headers });
 
-const transport = cloudflare({
+const transport = Transport.create({
   headers,
   model: () => ({ provider: harnessOf(current()).id, model: current().id, thinking: state.thinking ?? current().effort }),
   // The chat's history keeps each conversation's session; a change only re-renders the status line.
   session: { load: () => ({}), save: () => save() },
 });
 
-const config = createConfig({ history: { key: KEY }, transport });
+const config = Config.create({ history: { key: KEY }, transport });
 
 function App() {
   const store = useStore();
@@ -106,7 +106,7 @@ function App() {
 
   const pickThinking = (id: string) => {
     const model = MODELS.find(entry => entry.id === id);
-    setPicker({ title: `Thinking · ${id}`, items: () => thinkingItems(model, id === current().id ? state.thinking : undefined), onChoose: item => { setPicker(null); think(id, item.label); } });
+    setPicker({ title: `Thinking · ${id}`, items: () => Pickers.thinking(model, { thinking: id === current().id ? state.thinking : undefined }), onChoose: item => { setPicker(null); think(id, item.label); } });
   };
 
   const pick = (model: string) => {
@@ -144,7 +144,7 @@ function App() {
     }
     if (name === "/model") {
       if (!argument) {
-        setPicker({ title: "Model", filter: true, items: query => modelItems(HARNESSES, current().id, query), onChoose: item => pick(item.label) });
+        setPicker({ title: "Model", filter: true, items: query => Pickers.models(HARNESSES, { model: current().id, query }), onChoose: item => pick(item.label) });
         return true;
       }
       const match = MODELS.find(model => argument.split(" ").every(word => `${model.id} ${model.name}`.toLowerCase().includes(word)));
