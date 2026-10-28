@@ -30,14 +30,12 @@ async function use(connected: Wallet.AccessKey | undefined) {
 Wallet.onPrompt(device => set({ device }));
 
 const saved = Wallet.restore();
-if (saved) void Wallet.published(saved).then(async onChain => { if (onChain) await use(saved); }).catch(() => {});
+if (saved) void use(saved).catch(() => {});
 
 export async function login() {
   set({ busy: true, error: undefined });
   try {
-    const connected = await Wallet.connect();
-    await Wallet.publish(connected);
-    await use(connected);
+    await use(await Wallet.connect());
   } catch (error) {
     set({ error: error instanceof Error ? error.message : String(error) });
   } finally {
