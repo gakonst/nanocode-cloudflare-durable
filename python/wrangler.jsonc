@@ -3,6 +3,7 @@
   "main": "index.ts",
   "compatibility_date": "2026-10-16",
   "workers_dev": false,
+  "assets": { "directory": "../node_modules/nanocode-ts/dist/pyodide/snapshot", "binding": "PYODIDE_SNAPSHOT" },
   "durable_objects": {
     "bindings": [
       { "name": "PYTHON", "class_name": "Pyodide" }
