@@ -23,7 +23,6 @@ const TOKEN = `${KEY}:token`;
 let HARNESSES: Harness[] = PUBLIC_HARNESSES;
 let MODELS: Model[] = HARNESSES.flatMap(harness => harness.models);
 
-// A connected plan adds the models it serves, which then run on the visitor's plan instead of the deployment's gateway.
 function offer(status: Plans.Status | undefined) {
   HARNESSES = PUBLIC_HARNESSES.map(harness => {
     if (status?.[harness.id].state !== "authenticated") return harness;
@@ -76,7 +75,6 @@ const keyring = Keyring.create({ url: "v1/keys", headers });
 const transport = Transport.create({
   headers,
   model: () => ({ provider: harnessOf(current()).id, model: current().id, thinking: state.thinking ?? current().effort }),
-  // The chat's history keeps each conversation's session; a change only re-renders the status line.
   session: { load: () => ({}), save: () => save() },
 });
 

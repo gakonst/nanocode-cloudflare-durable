@@ -23,7 +23,6 @@ export const PUBLIC_HARNESSES = PUBLIC.map(harness => ({
 
 export const PUBLIC_MODELS: Record<string, { provider: ModelProvider; efforts: readonly string[] }> = Object.fromEntries(PUBLIC_HARNESSES.flatMap(harness => harness.models.map(model => [model.id, { provider: harness.id, efforts: model.efforts }])));
 
-// A visitor whose plan is connected gets every model that plan serves, on the plan instead of the gateway.
 export const PLAN_HARNESSES = PUBLIC_HARNESSES.map(harness => ({
   ...harness,
   models: (models.harnesses.find(candidate => candidate.id === harness.id)?.models ?? [])

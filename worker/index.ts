@@ -104,7 +104,6 @@ const wallets = Wallets.create<Env>({ account, scripts: true });
 const nanocode = App.create<Env>({
   authenticate,
   egress: env => Gateway.create(env.AI, { id: env.AI_GATEWAY_ID, serviceTier: env.OPENAI_SERVICE_TIER, firstByteMs: Number(env.MODEL_FIRST_BYTE_MS) || undefined }),
-  // A plan belongs to the owner or to one visitor, never to the shared public account.
   plans: { vault: env => env.PLANS, relay: env => env.RELAY, account },
   tools: charge,
   chaos: true,
