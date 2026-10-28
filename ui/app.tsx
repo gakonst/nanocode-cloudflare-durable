@@ -1,24 +1,37 @@
 import "nanocode-ts/react/zyzz.css";
-import { Config, Pickers } from "nanocode-ts/client";
+import { Config, Pickers, Plans } from "nanocode-ts/client";
 import * as Transport from "nanocode-ts/cloudflare/transport";
 import { Keyring } from "nanocode-ts/machines";
 import { Prompts, Unlock, useUnlock, walletCards } from "nanocode-ts/machines/react";
-import { Chat, HandConnect, NanocodeProvider, type Picker, useConfig, useConversations, useHand, useSend } from "nanocode-ts/react";
+import { Chat, HandConnect, NanocodeProvider, type Picker, PlanConnect, useConfig, useConversations, useHand, usePlans, useSend } from "nanocode-ts/react";
 import { skin, styles } from "nanocode-ts/react/skin";
 import { Demos, Header, Lead, Main, origin, Page, styles as site, Title } from "nanocode-ts/react/site";
 import { useEffect, useState, useSyncExternalStore } from "react";
 import { createRoot } from "react-dom/client";
-import { PUBLIC_HARNESSES as HARNESSES } from "../worker/models.ts";
+import { PLAN_HARNESSES, PUBLIC_HARNESSES } from "../worker/models.ts";
 import "./fonts.ts";
 import { prompts } from "./clones/prompts.ts";
 
-type Model = (typeof HARNESSES)[number]["models"][number];
+type Model = Pickers.Model & { label: string };
+
+type Harness = Pickers.Harness & { models: Model[] };
 
 type State = { model?: string; thinking?: string };
 
 const KEY = "nanocode-cloudflare-durable";
 const TOKEN = `${KEY}:token`;
-const MODELS: Model[] = HARNESSES.flatMap(harness => harness.models);
+let HARNESSES: Harness[] = PUBLIC_HARNESSES;
+let MODELS: Model[] = HARNESSES.flatMap(harness => harness.models);
+
+// A connected plan adds the models it serves, which then run on the visitor's plan instead of the deployment's gateway.
+function offer(status: Plans.Status | undefined) {
+  HARNESSES = PUBLIC_HARNESSES.map(harness => {
+    if (status?.[harness.id].state !== "authenticated") return harness;
+    const plan = PLAN_HARNESSES.find(entry => entry.id === harness.id)!;
+    return { ...harness, models: [...plan.models, ...harness.models.filter(model => !plan.models.some(entry => entry.id === model.id))] };
+  });
+  MODELS = HARNESSES.flatMap(harness => harness.models);
+}
 const COMMANDS = [
   { label: "/model", detail: "choose harness, model and thinking for a new session" },
   { label: "/effort", detail: "choose the thinking of the next turns" },
@@ -69,6 +82,8 @@ const transport = Transport.create({
 
 const config = Config.create({ history: { key: KEY }, transport });
 
+const plansClient = Plans.create({ url: "plans", headers });
+
 function App() {
   const store = useStore();
   const chat = useConfig();
@@ -79,6 +94,8 @@ function App() {
   const [secret, setSecret] = useState(token);
   const unlock = useUnlock(keyring);
   const hand = useHand(transport);
+  const plans = usePlans(plansClient);
+  offer(plans.status);
   const machines = hand.hands.map(name => name ?? "your machine");
 
   const configure = async () => {
@@ -186,6 +203,7 @@ function App() {
       commands={[...COMMANDS, ...unlock.commands]}
       empty="Ask a question to start a turn, or type /model to choose a model."
       extras={<>
+        <PlanConnect plans={plans} />
         <HandConnect hand={hand} />
         <Unlock machine={unlock} />
         <Prompts machine={unlock} />
@@ -213,7 +231,7 @@ function App() {
       onPickerClose={() => setPicker(null)}
       onSubmit={text => { if (unlock.handles(text)) void unlock.command(text); else if (!command(text)) void send(text); }}
       picker={picker}
-      status={`${harnessOf(model).label} · ${model.label} · ${store.thinking ?? model.effort} · ${transport.session().id ?? "new session"}${machines.length ? ` · on ${machines.join(", ")}` : ""} · ${busy ? "running" : "idle"}`}
+      status={`${harnessOf(model).label}${plans.status?.[harnessOf(model).id].state === "authenticated" && Plans.serves(harnessOf(model).id, model.id) ? " plan" : ""} · ${model.label} · ${store.thinking ?? model.effort} · ${transport.session().id ?? "new session"}${machines.length ? ` · on ${machines.join(", ")}` : ""} · ${busy ? "running" : "idle"}`}
       suggestions={[...prompts.map(prompt => ({ label: prompt, onClick: () => void send(prompt), disabled: busy })), { label: "Kill the next tool call", onClick: () => void crash(), disabled: !transport.session().id }]}
     />
   );
@@ -228,7 +246,7 @@ createRoot(document.getElementById("root")!).render(
       <Page>
         <Title subtitle="Durable agents in Durable Objects.">nanocode on Cloudflare</Title>
         <Demos current="cloudflare" />
-        <Lead>This agent runs in a Cloudflare Durable Object: the nanocode SDK compiled to WebAssembly, with its journal in the object's own SQLite. Its Code Mode cells run beside it in the object: bash on a workspace kept in the same SQLite, git clone, WebAssembly, Python with numpy, pandas and matplotlib on Pyodide, and a fetch, Mercator and the Tempo gateway that pay MPP services from your Tempo Wallet, whose access key the Worker keeps encrypted so turns go on paying after you close the tab. When the object resets mid-turn, its alarm starts it again, and the turn continues from the last checkpoint. Cloudflare AI Gateway serves its model requests. Its source is <a href="https://github.com/gakonst/nanocode-cloudflare-durable">gakonst/nanocode-cloudflare-durable</a>.</Lead>
+        <Lead>This agent runs in a Cloudflare Durable Object: the nanocode SDK compiled to WebAssembly, with its journal in the object's own SQLite. Its Code Mode cells run beside it in the object: bash on a workspace kept in the same SQLite, git clone, WebAssembly, Python with numpy, pandas and matplotlib on Pyodide, and a fetch, Mercator and the Tempo gateway that pay MPP services from your Tempo Wallet, whose access key the Worker keeps encrypted so turns go on paying after you close the tab. When the object resets mid-turn, its alarm starts it again, and the turn continues from the last checkpoint. Cloudflare AI Gateway serves its model requests, or your own ChatGPT or Claude plan once you connect it: its credential stays sealed in a Durable Object of this deployment, and ChatGPT's requests leave through a Cloudflare Container, because chatgpt.com refuses requests from Workers. Its source is <a href="https://github.com/gakonst/nanocode-cloudflare-durable">gakonst/nanocode-cloudflare-durable</a>.</Lead>
         <NanocodeProvider config={config} highlight={highlight} skin={skin}>
           <App />
         </NanocodeProvider>

@@ -1,9 +1,9 @@
 import { DurableObject } from "cloudflare:workers";
 import { Remote } from "nanocode-ts";
-import { App, Gateway, HandRelay, Limit, Listings, McpListings, PublicLimit, Relay } from "nanocode-ts/cloudflare";
+import { App, Gateway, HandRelay, Limit, Listings, McpListings, PlanVault, PublicLimit, Relay, RelayContainer } from "nanocode-ts/cloudflare";
 import { Env as Machines, Wallets } from "nanocode-ts/machines/cloudflare";
 import * as Account from "nanocode-ts/machines/server";
-import { PUBLIC_MODELS } from "./models";
+import { PLAN_MODELS, PUBLIC_MODELS } from "./models";
 import { charge } from "./tools";
 import type { Python as Shell } from "nanocode-ts/bash";
 import type { Python as Pyodide } from "nanocode-ts/cloudflare/python";
@@ -22,13 +22,16 @@ interface Env extends Machines.Env {
   PUBLIC_LIMITS: DurableObjectNamespace<PublicLimit>;
   PYTHON: DurableObjectNamespace<Pyodide>;
   MCP_LISTINGS: DurableObjectNamespace<McpListings>;
+  PLANS: DurableObjectNamespace<PlanVault>;
+  RELAY: DurableObjectNamespace<RelayContainer>;
+  PLAN_SECRET: string;
 }
 
 const DIGEST = /^[0-9a-f]{64}$/;
 const ACCOUNT = "owner";
 const PUBLIC_ACCOUNT = "public";
 const PUBLIC_PROMPT_CHARACTERS = 2000;
-const PUBLIC_ROUTE = /^\/(?:sessions\/[^/]+\/(?:turns(?:\/[^/]+(?:\/cancel)?)?|events|crash|warm|hands(?:\/[^/]+)?|files(?:\/.+)?)|v1\/(?:keys|me)|api\/device\/(?:register|token))$/;
+const PUBLIC_ROUTE = /^\/(?:sessions\/[^/]+\/(?:turns(?:\/[^/]+(?:\/cancel)?)?|events|crash|warm|hands(?:\/[^/]+)?|files(?:\/.+)?)|v1\/(?:keys|me)|api\/device\/(?:register|token)|plans(?:\/(?:claude|codex)(?:\/(?:sign-in|complete))?)?)$/;
 
 async function owner(request: Request, env: Env): Promise<boolean> {
   const header = request.headers.get("authorization") ?? "";
@@ -83,9 +86,17 @@ async function admit(request: Request, env: Env): Promise<Response | undefined> 
   if (typeof body?.prompt === "string" && body.prompt.length > PUBLIC_PROMPT_CHARACTERS) return refuse(`prompts are limited to ${PUBLIC_PROMPT_CHARACTERS} characters`, 413);
   const provider = body?.provider ?? "claude";
   const model = String(body?.model ?? (provider === "codex" ? "gpt-6.1-sol" : env.CLAUDE_MODEL ?? "claude-opus-5-5"));
-  const allowed = PUBLIC_MODELS[model];
-  if (!allowed || allowed.provider !== provider) return refuse(`this deployment serves ${Object.keys(PUBLIC_MODELS).join(", ")}`, 403);
+  const planned = await onPlan(request, env, provider);
+  const catalog = planned ? { ...PUBLIC_MODELS, ...PLAN_MODELS } : PUBLIC_MODELS;
+  const allowed = catalog[model];
+  if (!allowed || allowed.provider !== provider) return refuse(`this deployment serves ${Object.keys(catalog).join(", ")}${planned ? "" : ", and more on your own ChatGPT or Claude plan"}`, 403);
   if (body?.thinking !== undefined && !allowed.efforts.includes(String(body.thinking))) return refuse(`${model} takes ${allowed.efforts.join(", ")}`, 403);
+}
+
+async function onPlan(request: Request, env: Env, provider: unknown): Promise<boolean> {
+  const name = await visitor(request);
+  if (!name || (provider !== "claude" && provider !== "codex")) return false;
+  return await env.PLANS.get(env.PLANS.idFromName(name)).signedIn(provider).catch(() => false);
 }
 
 const wallets = Wallets.create<Env>({ account, scripts: true });
@@ -93,6 +104,8 @@ const wallets = Wallets.create<Env>({ account, scripts: true });
 const nanocode = App.create<Env>({
   authenticate,
   egress: env => Gateway.create(env.AI, { id: env.AI_GATEWAY_ID, serviceTier: env.OPENAI_SERVICE_TIER, firstByteMs: Number(env.MODEL_FIRST_BYTE_MS) || undefined }),
+  // A plan belongs to the owner or to one visitor, never to the shared public account.
+  plans: { vault: env => env.PLANS, relay: env => env.RELAY, account },
   tools: charge,
   chaos: true,
   workspace: { python: (authority, env) => async request => await env.PYTHON.get(env.PYTHON.idFromName(authority.account_id)).run(request) as unknown as Shell.Reply },
@@ -102,7 +115,7 @@ const nanocode = App.create<Env>({
 
 export const { AgentSession } = nanocode;
 export const { Wallet } = wallets;
-export { HandRelay, McpListings, PublicLimit };
+export { HandRelay, McpListings, PlanVault, PublicLimit, RelayContainer };
 
 export class Python extends DurableObject {}
 

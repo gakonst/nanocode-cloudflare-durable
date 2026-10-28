@@ -1,6 +1,7 @@
 import type { Contracts } from "nanocode-ts";
 
 type ModelProvider = Contracts.ModelProvider;
+import { Plans } from "nanocode-ts/client";
 import { models } from "nanocode-ts/models";
 
 type Public = { id: ModelProvider; label: string; models: { id: string; label: string }[] };
@@ -21,3 +22,13 @@ export const PUBLIC_HARNESSES = PUBLIC.map(harness => ({
 }));
 
 export const PUBLIC_MODELS: Record<string, { provider: ModelProvider; efforts: readonly string[] }> = Object.fromEntries(PUBLIC_HARNESSES.flatMap(harness => harness.models.map(model => [model.id, { provider: harness.id, efforts: model.efforts }])));
+
+// A visitor whose plan is connected gets every model that plan serves, on the plan instead of the gateway.
+export const PLAN_HARNESSES = PUBLIC_HARNESSES.map(harness => ({
+  ...harness,
+  models: (models.harnesses.find(candidate => candidate.id === harness.id)?.models ?? [])
+    .filter(model => Plans.serves(harness.id, model.id))
+    .map(model => ({ id: model.id, label: model.name, name: model.name, efforts: model.efforts, effort: model.effort })),
+}));
+
+export const PLAN_MODELS: Record<string, { provider: ModelProvider; efforts: readonly string[] }> = Object.fromEntries(PLAN_HARNESSES.flatMap(harness => harness.models.map(model => [model.id, { provider: harness.id, efforts: model.efforts }])));
