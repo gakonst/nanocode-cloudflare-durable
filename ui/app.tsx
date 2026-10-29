@@ -94,7 +94,6 @@ function App() {
   const hand = useHand(transport);
   const plans = usePlans(plansClient);
   offer(plans.status);
-  const machines = hand.hands.map(name => name ?? "your machine");
 
   const configure = async () => {
     const open = await fetch("health").catch(() => undefined);
@@ -229,7 +228,7 @@ function App() {
       onPickerClose={() => setPicker(null)}
       onSubmit={text => { if (unlock.handles(text)) void unlock.command(text); else if (!command(text)) void send(text); }}
       picker={picker}
-      status={`${harnessOf(model).label}${plans.status?.[harnessOf(model).id].state === "authenticated" && Plans.serves(harnessOf(model).id, model.id) ? " plan" : ""} · ${model.label} · ${store.thinking ?? model.effort} · ${transport.session().id ?? "new session"}${machines.length ? ` · on ${machines.join(", ")}` : ""} · ${busy ? "running" : "idle"}`}
+      status={`${harnessOf(model).label}${plans.status?.[harnessOf(model).id].state === "authenticated" && Plans.serves(harnessOf(model).id, model.id) ? " plan" : ""} · ${model.label} · ${store.thinking ?? model.effort} · ${transport.session().id ?? "new session"}${hand.where ? ` · ${hand.where}` : ""} · ${busy ? "running" : "idle"}`}
       suggestions={[...prompts.map(prompt => ({ label: prompt, onClick: () => void send(prompt), disabled: busy })), { label: "Kill the next tool call", onClick: () => void crash(), disabled: !transport.session().id }]}
     />
   );
