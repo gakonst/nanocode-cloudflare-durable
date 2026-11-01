@@ -5,7 +5,7 @@
   "assets": { "directory": "./public" },
   "build": { "command": "node scripts/build-ui.mjs" },
   "ai": { "binding": "AI" },
-  "containers": [{ "class_name": "RelayContainer", "image": "./node_modules/nanocode-egress/relay.Dockerfile", "instance_type": "lite", "max_instances": 2 }],
+  "containers": [{ "class_name": "RelayContainer", "image": "./node_modules/nanocode-ts/node_modules/nanocode-egress/relay.Dockerfile", "instance_type": "lite", "max_instances": 2 }],
   "durable_objects": {
     "bindings": [
       { "name": "SESSIONS", "class_name": "AgentSession" },
