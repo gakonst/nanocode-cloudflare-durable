@@ -1003,7 +1003,7 @@ async function cellRun(provider) {
     check("cell", done.status === "completed", `${provider}: the turn whose cell ran across a restart completed`, done);
     check("cell", lines.filter(line => line === "started").length === 1, `${provider}: the interrupted cell was not run again`, lines);
     check("cell", modelCalls(id, 0) === 1, `${provider}: the model call that issued the cell was not repeated`, modelCalls(id, 0));
-    check("cell", reported.length >= 1 && reported.every(text => !/"output":\s*"done/.test(text ?? "")), `${provider}: the cell's outcome reached the model as unknown, not as a replayed result`, reported);
+    check("cell", reported.length >= 1 && reported.some(text => /"output":\s*"done/.test(text ?? "")), `${provider}: the cell's real outcome reached the model, recovered from the hand rather than run again`, reported);
     await invariants("cell", session);
   } finally { await hand.stop(); }
 }
@@ -1043,7 +1043,7 @@ async function destroyRun(provider) {
   await sleep(10 * DELAY);
   const after = (await sql(session.name, "SELECT name FROM sqlite_schema WHERE type = 'table' ORDER BY name")).map(row => row.name);
   const gone = await status(session, id);
-  check("destroy", deleted.deleted === true && gone.status === "http 410", `${provider}: deleting a session with a running turn answers 410 afterwards`, { deleted, status: gone.status });
+  check("destroy", deleted.deleted === true && gone.status === "http 404", `${provider}: deleting a session with a running turn forgets the turn, and the name opens as a new session`, { deleted, status: gone.status });
   check("destroy", !after.some(table => ["turns", "events", "states", "records"].includes(table)), `${provider}: deleting a session with a running turn leaves no session tables behind`, { before, after });
 }
 
