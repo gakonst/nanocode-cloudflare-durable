@@ -104,7 +104,7 @@ try {
     first.ended === "result" && "the first stream finished the turn, so the crash never fired",
     charges.length !== 1 && `${charges.length} charges ran`,
     finished?.event?.status !== "completed" && "the turn did not complete",
-    !requests.some(entry => entry.tool_result?.includes("outcome unknown")) && "the model never heard that the charge's outcome is unknown",
+    !requests.some(entry => /outcome (is )?unknown/.test(entry.tool_result ?? "")) && "the model never heard that the charge's outcome is unknown",
     requests.filter(entry => entry.answer === "tool_use charge").length !== 1 && "the model was asked for the charge more than once",
   ].filter(Boolean);
   mkdirSync("output", { recursive: true });
