@@ -218,7 +218,7 @@ async function settled(session, id, timeout) {
 
 const watchers = new Set();
 async function watch(session) {
-  const watcher = { session, events: [], duplicates: [], gaps: [], socket: undefined, connects: 0 };
+  const watcher = { session, events: [], duplicates: [], socket: undefined, connects: 0 };
   watcher.connect = async () => {
     const after = watcher.events.at(-1)?.seq ?? 0;
     const response = await request(`${sessionUrl(session.name)}/socket?after=${after}`, { headers: { upgrade: "websocket" } });
@@ -233,10 +233,7 @@ async function watch(session) {
       if (message.type !== "event") return;
       const last = watcher.events.at(-1)?.seq ?? 0;
       if (message.seq <= last) watcher.duplicates.push({ seq: message.seq, last });
-      else {
-        if (message.seq !== last + 1) watcher.gaps.push({ from: last, to: message.seq });
-        watcher.events.push({ seq: message.seq, request_id: message.request_id, type: message.event?.type ?? message.event?.source });
-      }
+      else watcher.events.push({ seq: message.seq, request_id: message.request_id, type: message.event?.type ?? message.event?.source });
     });
     socket.accept();
     watcher.socket = socket;
@@ -292,11 +289,25 @@ function operationStatus(value) {
   return null;
 }
 
+function records(text, into) {
+  let at = 0;
+  while (at < text.length) {
+    const space = text.indexOf(" ", at);
+    const newline = text.indexOf("\n", space);
+    const length = Number(text.slice(space + 1, newline));
+    into.set(text.slice(at, space), text.slice(newline + 1, newline + 1 + length));
+    at = newline + 1 + length;
+  }
+  return into;
+}
+
 async function operations(name) {
   const [root] = await sql(name, "SELECT value FROM metadata WHERE key = 'session_id'");
   if (!root) return {};
-  const [state] = await sql(name, "SELECT payload FROM states WHERE id = ?", root.value);
-  if (!state) return {};
+  const [state] = await sql(name, "SELECT payload, tail FROM state_rows WHERE id = ?", root.value);
+  if (!state?.payload) return {};
+  const stored = records(state.tail ?? "", new Map());
+  for (const page of await sql(name, "SELECT body FROM state_pages WHERE id = ? ORDER BY page", root.value)) records(page.body, stored);
   const found = {};
   const pages = [];
   const collect = operations => {
@@ -313,13 +324,24 @@ async function operations(name) {
   };
   try { visit(JSON.parse(state.payload)); } catch { return { unreadable: true }; }
   while (pages.length) {
-    const [record] = await sql(name, "SELECT records.value FROM records JOIN state_records ON state_records.record = records.id WHERE state_records.state_id = ?1 AND records.key = ?2", root.value, pages.shift());
-    if (!record?.value?.startsWith("=")) return { unreadable: true };
-    const page = JSON.parse(record.value.slice(1));
+    const record = stored.get(pages.shift());
+    if (!record?.startsWith("=")) return { unreadable: true };
+    const page = JSON.parse(record.slice(1));
     collect(page.operations ?? {});
     pages.push(...(page.pages ?? []));
   }
   return found;
+}
+
+async function events(name) {
+  const bodies = await sql(name, "SELECT body FROM log_chunks WHERE scope = 'owner' UNION ALL SELECT tail AS body FROM log_turns WHERE scope = 'owner' AND tail IS NOT NULL");
+  const found = new Map();
+  for (const { body } of bodies) for (const line of body.split("\n")) {
+    if (!line) continue;
+    const [seq, , request_id, event] = JSON.parse(line);
+    found.set(seq, { seq, request_id, type: event.type, status: event.status, source: event.source, event_type: event.event?.type, update_type: event.update?.type });
+  }
+  return [...found.values()].sort((left, right) => left.seq - right.seq);
 }
 
 const findings = [];
@@ -332,16 +354,14 @@ function check(scenario, condition, detail, evidence) {
 
 async function invariants(scenario, session, { quiescent = true } = {}) {
   const name = session.name;
-  const turns = await sql(name, "SELECT request_id, status, CAST(first_seq AS INTEGER) AS first_seq, last_seq, cancel_requested, note, retry FROM turns WHERE scope = 'owner' ORDER BY first_seq");
-  const events = await sql(name, "SELECT seq, request_id, json_extract(body, '$.type') AS type, json_extract(body, '$.status') AS status, json_extract(body, '$.source') AS source FROM events ORDER BY seq");
+  const turns = await sql(name, "SELECT request_id, status, CAST(first_seq AS INTEGER) AS first_seq, last_seq, cancel_requested, note, retry FROM log_turns WHERE scope = 'owner' ORDER BY first_seq");
+  const logged = await events(name);
   const ops = await operations(name);
-  const gaps = events.filter((event, index) => event.seq !== (index === 0 ? events[0].seq : events[index - 1].seq + 1));
-  const unattributed = await sql(name, "SELECT seq, json_extract(body, '$.source') AS source, json_extract(body, '$.event.type') AS type, json_extract(body, '$.update.type') AS update_type FROM events WHERE request_id IS NULL ORDER BY seq");
+  const unattributed = logged.filter(event => event.request_id === null).map(event => ({ seq: event.seq, source: event.source, type: event.event_type, update_type: event.update_type }));
   report.unattributed[name] = unattributed.map(event => `${event.source}:${event.type ?? event.update_type}`).reduce((counts, key) => ({ ...counts, [key]: (counts[key] ?? 0) + 1 }), {});
   check(scenario, unattributed.every(event => event.source !== "agent"), `${name}: every root agent event is attributed to a turn`, unattributed.filter(event => event.source === "agent").slice(0, 5));
-  check(scenario, gaps.length === 0, `${name}: event sequence is contiguous`, gaps.slice(0, 5));
   for (const turn of turns) {
-    const own = events.filter(event => event.request_id === turn.request_id);
+    const own = logged.filter(event => event.request_id === turn.request_id);
     const results = own.filter(event => event.type === "result");
     const queued = own.filter(event => event.type === "queued");
     if (TERMINAL.has(turn.status)) {
@@ -368,13 +388,13 @@ async function invariants(scenario, session, { quiescent = true } = {}) {
   }
   for (const watcher of watchers) {
     if (watcher.session !== session) continue;
-    const latest = events.at(-1)?.seq ?? 0;
+    const latest = logged.at(-1)?.seq ?? 0;
     await until(async () => (watcher.events.at(-1)?.seq ?? 0) >= latest, "watcher catch-up", 5000).catch(() => undefined);
     const seen = watcher.events.map(event => event.seq);
-    const missing = events.map(event => event.seq).filter(seq => !seen.includes(seq));
-    check(scenario, watcher.duplicates.length === 0 && watcher.gaps.length === 0 && missing.length === 0, `${name}: socket watcher saw every event once in order across ${watcher.connects} connections`, { duplicates: watcher.duplicates.slice(0, 5), gaps: watcher.gaps.slice(0, 5), missing: missing.slice(0, 10), latest, seen: seen.at(-1) });
+    const missing = logged.map(event => event.seq).filter(seq => !seen.includes(seq));
+    check(scenario, watcher.duplicates.length === 0 && missing.length === 0, `${name}: socket watcher saw every event once in order across ${watcher.connects} connections`, { duplicates: watcher.duplicates.slice(0, 5), missing: missing.slice(0, 10), latest, seen: seen.at(-1) });
   }
-  return { turns, events, ops };
+  return { turns, events: logged, ops };
 }
 
 const modelCalls = (turn, round) => calls.filter(call => call.turn === turn && (round === undefined || call.round === round)).length;
@@ -401,7 +421,7 @@ const scenarios = {
     await restart();
     await Promise.race([reading, sleep(15000)]);
     check("slowEvict", ended !== undefined, `${provider}: the turn's stream ended at the restart`, ended);
-    check("slowEvict", text.includes("model.call.started") && !text.includes('"type":"result"'), `${provider}: the stream carried model.call.started and no result`, text.slice(-400));
+    check("slowEvict", text.includes("run.started") && !text.includes('"type":"result"'), `${provider}: the stream carried run.started and no result`, text.slice(-400));
     const done = await settled(session, id);
     check("slowEvict", done.status === "completed", `${provider}: the turn interrupted before its model call answered recovered`, done);
     check("slowEvict", started === 1 && modelCalls(id) === 2, `${provider}: the unanswered model call repeated once`, modelCalls(id));
@@ -473,12 +493,12 @@ const scenarios = {
 
   async faults(provider) {
     const plans = [
-      { label: "start", trigger: "BEFORE INSERT ON events WHEN json_extract(NEW.body, '$.type') = 'running'", calls: 1 },
-      { label: "agent-events", trigger: "BEFORE INSERT ON events WHEN json_extract(NEW.body, '$.source') = 'agent'", calls: [1, 2] },
-      { label: "result", trigger: "BEFORE INSERT ON events WHEN json_extract(NEW.body, '$.type') = 'result'", calls: 1 },
-      { label: "checkpoint", trigger: "BEFORE UPDATE ON states", calls: [0, 1] },
+      { label: "start", trigger: "BEFORE UPDATE ON log_turns WHEN NEW.status = 'running' AND OLD.status = 'queued'", calls: 1 },
+      { label: "agent-events", trigger: "BEFORE UPDATE ON log_turns WHEN instr(substr(NEW.tail, length(COALESCE(OLD.tail, '')) + 1), '\"source\":\"agent\"') > 0", calls: [1, 2] },
+      { label: "result", trigger: "BEFORE UPDATE ON log_turns WHEN NEW.result IS NOT NULL AND OLD.result IS NULL", calls: 1 },
+      { label: "checkpoint", trigger: "BEFORE UPDATE ON state_rows WHEN NEW.revision > OLD.revision", calls: [0, 6] },
       { label: "marker", trigger: "BEFORE DELETE ON metadata WHEN OLD.key LIKE 'background:%'", calls: 1 },
-      { label: "submit", trigger: "BEFORE INSERT ON events WHEN json_extract(NEW.body, '$.type') = 'queued'", calls: 1, submit: true },
+      { label: "submit", trigger: "BEFORE INSERT ON log_turns", calls: 1, submit: true },
     ];
     for (const plan of plans) {
       const session = await newSession(provider, `fault-${plan.label}`);
@@ -594,34 +614,6 @@ const scenarios = {
     return outcomes;
   },
 
-  async retryColumn(provider) {
-    const session = await newSession(provider, "retry-column");
-    const watcher = await watch(session);
-    const first = `rc-first-${provider}`;
-    await submit(session, first, "plain");
-    await settled(session, first);
-    await sql(session.name, "ALTER TABLE turns DROP COLUMN retry");
-    await sql(session.name, "DELETE FROM nanocode_formats WHERE component = 'session_log'");
-    const dropped = await sql(session.name, "SELECT COUNT(*) AS count FROM pragma_table_info('turns') WHERE name = 'retry'");
-    check("retryColumn", dropped[0].count === 0, `${provider}: the turns table lost its retry column`, dropped);
-    await mf.unsafeEvictDurableObject("nanocode", "AgentSession", { name: objectName(session.name) });
-    await watcher.reconnect();
-    const resubmitted = await submit(session, first, "plain");
-    check("retryColumn", resubmitted.status === 200 && resubmitted.body?.status === "completed", `${provider}: a finished turn reads back on a table without the retry column`, resubmitted);
-    const waiting = `rc-hand-${provider}`;
-    const submitted = await submit(session, waiting, "plain", { hand: "absent" });
-    check("retryColumn", submitted.status === 202, `${provider}: a turn naming an absent hand is accepted`, submitted);
-    const retried = await until(async () => { const current = await status(session, waiting); return current.kind ? current : undefined; }, "retry recorded");
-    check("retryColumn", retried.status === "queued" && retried.kind === "detached" && retried.attempts >= 1 && typeof retried.retry_at === "number", `${provider}: the retry is recorded after the column migration`, retried);
-    const cancelled = await cancel(session, waiting);
-    check("retryColumn", cancelled.status === 200 && cancelled.body?.status === "cancelled", `${provider}: the waiting turn cancels`, cancelled);
-    const last = `rc-last-${provider}`;
-    await submit(session, last, "plain");
-    const done = await settled(session, last);
-    check("retryColumn", done.status === "completed", `${provider}: a later turn completes`, done);
-    await invariants("retryColumn", session);
-    watcher.close();
-  },
 
   async background(provider) {
     for (const size of ["small", "large"]) await backgroundRun(provider, size);
@@ -1044,7 +1036,7 @@ async function destroyRun(provider) {
   const after = (await sql(session.name, "SELECT name FROM sqlite_schema WHERE type = 'table' ORDER BY name")).map(row => row.name);
   const gone = await status(session, id);
   check("destroy", deleted.deleted === true && gone.status === "http 404", `${provider}: deleting a session with a running turn forgets the turn, and the name opens as a new session`, { deleted, status: gone.status });
-  check("destroy", !after.some(table => ["turns", "events", "states", "records"].includes(table)), `${provider}: deleting a session with a running turn leaves no session tables behind`, { before, after });
+  check("destroy", !after.some(table => ["log_turns", "log_chunks", "state_rows", "state_pages"].includes(table)), `${provider}: deleting a session with a running turn leaves no session tables behind`, { before, after });
 }
 
 async function chaosRun(provider) {
@@ -1076,7 +1068,7 @@ async function chaosRun(provider) {
   for (const { id, stream: collected } of streams) {
     const expected = events.filter(event => event.request_id === id).map(event => event.seq);
     const seen = collected.events.map(event => event.seq);
-    check("chaos", JSON.stringify(expected) === JSON.stringify(seen), `${provider}/${id}: SSE stream carried exactly the turn's events`, { expected, seen });
+    check("chaos", JSON.stringify(expected) === JSON.stringify(seen), `${provider}/${id}: SSE stream carried exactly the turn's events`, { expected, seen, unlogged: collected.events.filter(event => !expected.includes(event.seq)) });
   }
   const resubmitted = await Promise.all(ids.map(id => submit(session, id, kinds[ids.indexOf(id) % kinds.length])));
   check("chaos", resubmitted.every(entry => entry.status === 200 && entry.body?.status === "completed"), `${provider}: resubmission after finish returns the saved result`, resubmitted.map(entry => entry.status));

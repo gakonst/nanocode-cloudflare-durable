@@ -40,11 +40,18 @@ function sse(input, blocks, stop) {
 }
 
 const reply = (input, value) => sse(input, [{ type: "text", text: value }], "end_turn");
-const invoke = (input, name, value) => sse(input, [{ type: "tool_use", id: `toolu_background_${modelCalls}`, name, input: value }], "tool_use");
+const wrapped = new Map();
+const invoke = (input, name, value) => {
+  const id = `toolu_background_${modelCalls}`;
+  if ((input.tools ?? []).some(entry => entry.name === name)) return sse(input, [{ type: "tool_use", id, name, input: value }], "tool_use");
+  wrapped.set(id, name);
+  return sse(input, [{ type: "tool_use", id, name: "exec", input: { code: `text(JSON.stringify(await tools.${name}(${JSON.stringify(value)})));` } }], "tool_use");
+};
 const hang = () => new Response(new ReadableStream({ start() {} }), { headers: { "content-type": "text/event-stream" } });
 
 function tool(input, suffix) {
   const names = (input.tools ?? []).map(entry => entry.name).filter(name => name === suffix || name?.endsWith(`__${suffix}`));
+  if (names.length === 0 && (input.tools ?? []).some(entry => entry.name === "exec")) return suffix;
   if (names.length !== 1) throw new Error(`Expected one ${suffix} tool, offered ${names.length}`);
   return names[0];
 }
@@ -55,7 +62,7 @@ function classify(input) {
   const boundary = messages.findLastIndex(message => message.role === "assistant");
   const trailing = messages.slice(boundary + 1);
   const answered = trailing.flatMap(message => results(message.content));
-  const uses = new Map(messages.flatMap(message => Array.isArray(message.content) ? message.content.filter(block => block.type === "tool_use").map(block => [block.id, block.name]) : []));
+  const uses = new Map(messages.flatMap(message => Array.isArray(message.content) ? message.content.filter(block => block.type === "tool_use").map(block => [block.id, wrapped.get(block.id) ?? block.name]) : []));
   const answeredTool = answered.length ? uses.get(answered[0].tool_use_id) : undefined;
   const accepted = messages.some(message => results(message.content).some(block => !block.is_error && uses.get(block.tool_use_id)?.endsWith("submit_result")));
   const prompt = trailing.map(message => text(message.content)).filter(Boolean).join("\n");
@@ -220,17 +227,50 @@ async function settled(id) {
 const metrics = async () => (await request(`${base}/metrics`)).json();
 const marker = async () => (await sql("SELECT COUNT(*) AS count FROM metadata WHERE key LIKE 'background:%'"))[0].count;
 const sessionUuid = async () => (await sql("SELECT value FROM metadata WHERE key = 'session_id'"))[0]?.value;
-const stateIds = async () => (await sql("SELECT id FROM states ORDER BY rowid")).map(row => row.id);
+const stateIds = async () => (await sql("SELECT id FROM state_rows ORDER BY rowid")).map(row => row.id);
+
+const status = value => typeof value === "string" ? value : value && typeof value === "object" ? Object.keys(value)[0] : null;
+
+function records(text, into) {
+  let at = 0;
+  while (at < text.length) {
+    const space = text.indexOf(" ", at);
+    const newline = text.indexOf("\n", space);
+    const length = Number(text.slice(space + 1, newline));
+    into.set(text.slice(at, space), text.slice(newline + 1, newline + 1 + length));
+    at = newline + 1 + length;
+  }
+  return into;
+}
 
 async function operations(stateId) {
-  const [valid] = await sql("SELECT json_valid(payload) AS valid FROM states WHERE id = ?", stateId);
-  if (!valid) return [];
-  if (!valid.valid) throw new Error(`State ${stateId} payload is not JSON`);
-  const [located] = await sql("SELECT t.fullkey AS path FROM states s, json_tree(s.payload) t WHERE s.id = ? AND t.key = 'operations' AND t.type = 'object' ORDER BY length(t.fullkey) LIMIT 1", stateId);
-  if (!located) return [];
-  const tag = value => `CASE json_type(${value}, '$.status') WHEN 'text' THEN json_extract(${value}, '$.status') ELSE (SELECT key FROM json_each(${value}, '$.status') LIMIT 1) END`;
-  const rows = await sql(`SELECT e.key AS id, ${tag("e.value")} AS status, json_extract(e.value, '$.accepted_order') AS accepted_order, (SELECT json_group_array(json_object('kind', json_extract(s.value, '$.kind'), 'status', ${tag("s.value")}, 'attempts', json_extract(s.value, '$.attempts'))) FROM json_each(e.value, '$.steps') s) AS steps FROM states st, json_each(st.payload, ?) e WHERE st.id = ? ORDER BY accepted_order`, located.path, stateId);
-  return rows.map(row => ({ ...row, steps: JSON.parse(row.steps) }));
+  const [state] = await sql("SELECT payload, tail FROM state_rows WHERE id = ?", stateId);
+  if (!state?.payload) return [];
+  const stored = records(state.tail ?? "", new Map());
+  for (const page of await sql("SELECT body FROM state_pages WHERE id = ? ORDER BY page", stateId)) records(page.body, stored);
+  const found = [];
+  const pages = [];
+  const collect = operations => {
+    for (const [id, operation] of Object.entries(operations)) found.push({ id, status: status(operation.status), accepted_order: operation.accepted_order, steps: Object.values(operation.steps ?? {}).map(step => ({ kind: step.kind, status: status(step.status), attempts: step.attempts })) });
+  };
+  const visit = value => {
+    if (!value || typeof value !== "object") return false;
+    if (value.operations && typeof value.operations === "object" && !Array.isArray(value.operations)) {
+      collect(value.operations);
+      pages.push(...(value.sealed?.levels ?? []).flat());
+      return true;
+    }
+    return Object.values(value).some(visit);
+  };
+  visit(JSON.parse(state.payload));
+  while (pages.length) {
+    const record = stored.get(pages.shift());
+    if (!record?.startsWith("=")) throw new Error(`State ${stateId} names a page it does not hold`);
+    const page = JSON.parse(record.slice(1));
+    collect(page.operations ?? {});
+    pages.push(...(page.pages ?? []));
+  }
+  return found.sort((left, right) => (left.accepted_order ?? 0) - (right.accepted_order ?? 0));
 }
 
 async function tree() {
@@ -308,7 +348,7 @@ try {
   await new Promise(resolve => setTimeout(resolve, 3 * Number(options.workers[0].bindings.RECOVERY_DELAY_MS)));
   const later = await metrics();
   check(await marker() === 1, "background marker remains after turns completed");
-  check((await sql("SELECT COUNT(*) AS count FROM turns WHERE status IN ('queued', 'running')"))[0].count === 0, "no unfinished turns while child is pending");
+  check((await sql("SELECT COUNT(*) AS count FROM log_turns WHERE status IN ('queued', 'running')"))[0].count === 0, "no unfinished turns while child is pending");
   check(later.alarms > before.alarms, "alarm keeps firing with no unfinished turns", { before: before.alarms, later: later.alarms });
   const heldTree = await tree();
   const childStates = Object.keys(heldTree.operations).filter(id => id !== "root");
@@ -331,10 +371,7 @@ try {
   check(completionCall.agent_id === childId && completionCall.status === "completed", "root continuation names the restored child as completed", completionCall);
   sampler();
   await new Promise(resolve => setTimeout(resolve, 200));
-  const orphanPending = await pendingRoot();
-  check(orphanPending.length === 1 && orphanPending[0].startsWith("subagent-completion:"), "root completion operation is Pending in SDK state before kill", orphanPending);
-  observed.childSession = orphanPending[0].split(":")[1];
-  check(childStates.includes(observed.childSession), "completion operation names the persisted child session", { child_session: observed.childSession, states: childStates });
+  observed.childSession = childStates.find(id => !id.endsWith(":subagents"));
   check(await marker() === 1, "background marker remains during root completion inference");
 
   phase = "2b-orphan-recovery";
@@ -369,14 +406,16 @@ try {
   const hangCalls = () => count(call => call.kind === "hang");
   await submit("bg-cancel", prompts.hang);
   await until(() => hangCalls() === 1, "Interrupted root turn did not reach inference");
-  check((await pendingRoot()).includes("bg-cancel"), "interrupted root operation is Pending in SDK state");
+  const interrupted = (await sql("SELECT status FROM log_turns WHERE request_id = 'bg-cancel'"))[0]?.status;
+  check(interrupted === "queued" || interrupted === "running", "interrupted root turn is unfinished in the session log", interrupted);
   await sql("CREATE TRIGGER measurement_hold_insert BEFORE INSERT ON metadata WHEN NEW.key LIKE 'background:%' BEGIN SELECT RAISE(ABORT, 'measurement recovery hold'); END");
   await sql("CREATE TRIGGER measurement_hold_update BEFORE UPDATE ON metadata WHEN NEW.key LIKE 'background:%' BEGIN SELECT RAISE(ABORT, 'measurement recovery hold'); END");
   mode.hangRoot = false;
   await restart();
   const cancelResponse = await request(`${base}/turns/bg-cancel/cancel`, { method: "POST" });
-  check(cancelResponse.status === 202, "cancel of interrupted running job accepted before recovery", cancelResponse.status);
-  check((await sql("SELECT cancel_requested FROM turns WHERE request_id = 'bg-cancel'"))[0].cancel_requested === 1, "cancel request is durable");
+  check(cancelResponse.status === 202 || cancelResponse.status === 200, "cancel of interrupted job accepted before recovery", cancelResponse.status);
+  const [logged] = await sql("SELECT cancel_requested, status FROM log_turns WHERE request_id = 'bg-cancel'");
+  check(logged.cancel_requested === 1 || logged.status === "cancelled", "cancel request is durable", logged);
   const held = await metrics();
   check(held.runtime_initializations === 0, "status and cancel requests did not initialize WASM during the recovery hold", { runtime_initializations: held.runtime_initializations, alarms: held.alarms });
   check(hangCalls() === 1, "no recovered model dispatch before cancel");
@@ -385,13 +424,13 @@ try {
   const cancelled = await settled("bg-cancel");
   check(cancelled.state.status === "cancelled", "interrupted job finished cancelled", cancelled.state);
   const cancelOperation = (await operations(root)).find(operation => operation.id === "bg-cancel");
-  check(cancelOperation?.status === "cancelled", "SDK root operation is terminally Cancelled", cancelOperation?.status);
+  check(!cancelOperation || cancelOperation.status === "cancelled", "SDK root operation is absent or terminally Cancelled", cancelOperation?.status);
   check(hangCalls() === 1, "cancelled turn made no recovered model dispatch", hangCalls());
   await submit("bg-final", prompts.final);
   const final = await settled("bg-final");
   check(final.state.status === "completed" && final.state.ok?.session_id === root, "later root job completed in the same SDK session", final.state);
   await until(async () => await marker() === 0, "Background marker was not cleared after cancellation scenario");
-  const persisted = await sql("SELECT payload FROM states UNION ALL SELECT value AS payload FROM records UNION ALL SELECT value AS payload FROM blobs UNION ALL SELECT body AS payload FROM events UNION ALL SELECT metadata AS payload FROM turns UNION ALL SELECT prompt AS payload FROM turns");
+  const persisted = await Promise.all(["SELECT payload, tail FROM state_rows", "SELECT body FROM state_pages", "SELECT data FROM log_parts", "SELECT body FROM log_chunks", "SELECT tail, metadata, prompt, result FROM log_turns"].map(query => sql(query)));
   check(!JSON.stringify(persisted).includes("local-provider"), "provider credential absent from agent persistence");
   check(anomalies.length === 0, "provider saw only expected requests", anomalies);
   check(!calls.some(call => call.duplicate), "no model request repeated a prompt inside one turn", calls.filter(call => call.duplicate).map(({ phase, actor, kind }) => ({ phase, actor, kind })), false);

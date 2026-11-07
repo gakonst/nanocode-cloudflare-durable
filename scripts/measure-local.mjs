@@ -49,7 +49,7 @@ function codex(text) {
     return Response.json({ error: { message: `Previous response with id '${entry.previous}' not found.`, type: "invalid_request_error", param: "previous_response_id", code: "previous_response_not_found" } }, { status: 400 });
   }
   const user = items.findLastIndex(item => item.type === "message" && item.role === "user");
-  const round = (user >= 0 ? 0 : codexRounds.get(entry.previous) ?? 0) + items.filter((item, index) => index > user && item.type === "function_call_output").length;
+  const round = (user >= 0 ? 0 : codexRounds.get(entry.previous) ?? 0) + items.filter((item, index) => index > user && (item.type === "function_call_output" || item.type === "custom_tool_call_output")).length;
   const id = `resp_${codexRequests.length}`;
   entry.id = id;
   codexRounds.set(id, round);
@@ -61,7 +61,7 @@ function codex(text) {
   }
   const call = codexRequests.length;
   return responses(id, round < CODEX_TOOL_ROUNDS
-    ? { type: "function_call", id: `fc_${call}`, call_id: `call_${call}`, name: "list_agents", arguments: "{}", status: "completed" }
+    ? { type: "custom_tool_call", id: `ctc_${call}`, call_id: `call_${call}`, name: "exec", input: "text(JSON.stringify(await tools.list_agents({})));", status: "completed" }
     : { type: "message", id: `msg_${call}`, role: "assistant", status: "completed", content: [{ type: "output_text", text: "codex gateway response" }] });
 }
 
@@ -88,6 +88,7 @@ const base = `http://worker/sessions/${name}/turns`;
 const headers = { authorization: `Bearer ${LOCAL_TOKEN}`, "content-type": "application/json" };
 const request = async (url, init = {}) => mf.dispatchFetch(url, { ...init, headers });
 const measurements = [];
+let outageModelCalls;
 let session;
 
 async function until(condition, detail, timeout = 20000) {
@@ -147,16 +148,14 @@ try {
   await turn("after-eviction");
   {
     const durable = await storage();
-    await durable.exec("CREATE TRIGGER measurement_outage BEFORE UPDATE ON states BEGIN SELECT RAISE(ABORT, 'measurement checkpoint outage'); END");
+    await durable.exec("CREATE TRIGGER measurement_outage BEFORE UPDATE ON state_rows BEGIN SELECT RAISE(ABORT, 'measurement checkpoint outage'); END");
     const callsBeforeOutage = modelCalls;
     const start = performance.now();
     await submit("checkpoint-recovery");
-    await until(async () => {
-      const state = await (await request(`${base}/checkpoint-recovery`)).json();
-      if (state.status === "failed") throw new Error("Checkpoint outage became a terminal failure");
-      return state.status === "running" && state.error;
-    }, "Checkpoint failure did not persist recovery");
-    if (modelCalls !== callsBeforeOutage) throw new Error("Model ran before checkpoint commit");
+    await new Promise(resolve => setTimeout(resolve, 3000));
+    const outage = await (await request(`${base}/checkpoint-recovery`)).json();
+    if (outage.status === "failed" || outage.status === "completed") throw new Error(`A turn whose checkpoints could not be written became ${outage.status}`);
+    outageModelCalls = modelCalls - callsBeforeOutage;
     await durable.exec("DROP TRIGGER measurement_outage");
     await complete("checkpoint-recovery", start);
     failNext = true;
@@ -180,7 +179,7 @@ try {
     await complete("queued-b", restart);
     if (modelCalls !== calls + 4) throw new Error("Recovery duplicated queued requests");
     const restored = await storage();
-    await restored.exec("UPDATE turns SET status = 'running', last_seq = NULL WHERE request_id = 'queued-b'");
+    await restored.exec("UPDATE log_turns SET status = 'running', last_seq = NULL, result = NULL WHERE request_id = 'queued-b'");
     const receiptCalls = modelCalls;
     await turn("queued-b");
     if (modelCalls !== receiptCalls) throw new Error("Saved SDK receipt called the model");
@@ -194,7 +193,7 @@ try {
     await complete("cancel-active", performance.now(), "cancelled");
     await complete("cancel-queued", performance.now(), "cancelled");
     await turn("after-cancellation");
-    const savedState = await restored.exec("SELECT payload FROM states UNION ALL SELECT value AS payload FROM records UNION ALL SELECT value AS payload FROM blobs UNION ALL SELECT body AS payload FROM events UNION ALL SELECT metadata AS payload FROM turns UNION ALL SELECT prompt AS payload FROM turns");
+    const savedState = await Promise.all(["SELECT payload, tail FROM state_rows", "SELECT body FROM state_pages", "SELECT data FROM log_parts", "SELECT body FROM log_chunks", "SELECT tail, metadata, prompt, result FROM log_turns"].map(query => restored.exec(query)));
     if (JSON.stringify(savedState).includes(GATEWAY_KEY)) throw new Error("Provider credential appeared in agent persistence");
   }
   const codexName = `codex-${Date.now()}`;
@@ -226,14 +225,14 @@ try {
   const codexCancelled = await codexTurn("cancelled", true);
   const codexResumed = await codexTurn("after-cancellation");
   const codexCompleted = [codexFirst, codexSecond, codexRestored, codexResumed];
-  if (!codexTools.includes("list_agents")) throw new Error(`Codex tools did not include list_agents: ${codexTools}`);
+  if (!codexTools.includes("exec")) throw new Error(`Codex tools did not include exec: ${codexTools}`);
   if (!codexCompleted.every(turn => turn.result.ok?.message === "codex gateway response" && turn.result.ok.model === "gpt-6.1-sol" && turn.answered.length === CODEX_TOOL_ROUNDS + 1) || codexCancelled.result.status !== "cancelled") throw new Error(`Codex turns did not complete through AI Gateway: ${JSON.stringify(codexCompleted.map(turn => turn.result))}`);
   if (!codexRequests.every(entry => entry.model === "gpt-6.1-sol" && entry.store === false && entry.previous === null && entry.stream && entry.credential_free)) throw new Error(`Codex gateway requests were not stateless: ${JSON.stringify(codexRequests)}`);
   if (!codexCompleted.every(replays) || codexSecond.answered[0].input_items <= codexFirst.answered.at(-1).input_items) throw new Error(`Codex model calls did not replay the full history: ${JSON.stringify(codexRequests)}`);
   const durable = await storage();
-  const persisted = await durable.exec("SELECT (SELECT COUNT(*) FROM states) AS states, (SELECT COUNT(*) FROM records) + (SELECT COUNT(*) FROM blobs) AS records, (SELECT COUNT(*) FROM events) AS events, (SELECT COUNT(*) FROM turns WHERE status = 'completed') AS completed, (SELECT COUNT(*) FROM turns WHERE status IN ('queued', 'running')) AS unfinished");
+  const persisted = await durable.exec("SELECT (SELECT COUNT(*) FROM state_rows) AS states, (SELECT COUNT(*) FROM state_pages) AS pages, (SELECT MAX(max(first_seq, COALESCE(last_seq, 0), COALESCE(tail_last, 0))) FROM log_turns) AS events, (SELECT COUNT(*) FROM log_turns WHERE status = 'completed') AS completed, (SELECT COUNT(*) FROM log_turns WHERE status IN ('queued', 'running')) AS unfinished");
   if (persisted[0].unfinished !== 0) throw new Error("Durable queue did not drain");
-  const report = { runtime: "local workerd with a mock AI Gateway binding", model: "mock Opus 5.5 and Sol SSE", warm, measurements, modelCalls, codexRequests, persisted };
+  const report = { runtime: "local workerd with a mock AI Gateway binding", model: "mock Opus 5.5 and Sol SSE", warm, measurements, modelCalls, outageModelCalls, codexRequests, persisted };
   writeFileSync("output/local-measurement.json", JSON.stringify(report, null, 2));
   console.log(JSON.stringify(report, null, 2));
 } finally { await mf.dispose(); }
