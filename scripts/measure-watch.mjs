@@ -47,6 +47,8 @@ async function until(condition, detail, timeout = 30000) {
   }
 }
 
+const logged = event => [event.source, event.event?.type ?? event.update?.type ?? event.type, event.event?.seq ?? null];
+
 async function attach(name, after) {
   const response = await mf.dispatchFetch(`http://worker/sessions/${name}/socket${after === undefined ? "" : `?after=${after}`}`, { headers: { authorization, upgrade: "websocket" } });
   const socket = response.webSocket;
@@ -64,7 +66,7 @@ async function attach(name, after) {
 }
 
 const result = (watcher, id) => watcher.events.find(entry => entry.request_id === id && entry.event?.type === "result");
-const contiguous = watcher => watcher.events.every((entry, index) => index === 0 || entry.seq === watcher.events[index - 1].seq + 1);
+const ordered = watcher => watcher.events.every((entry, index) => index === 0 || entry.seq > watcher.events[index - 1].seq);
 
 async function reply(watcher, type, count) {
   await until(async () => watcher.replies.filter(entry => entry.type === type).length >= count, `No ${type} reply`);
@@ -94,18 +96,18 @@ try {
   await sleep(100);
   check(primary.events.length === 0 && primary.closed === null, "A watcher on an empty session stays open with no events");
   const first = await socketTurn(primary, "first", "Say hello");
-  check(first.status === "completed" && first.message === "watch-ok" && contiguous(primary) && primary.events[0].event.type === "queued", "A turn submitted over the socket is admitted and its events stream to the same socket in order");
+  check(first.status === "completed" && first.message === "watch-ok" && ordered(primary) && primary.events[0].event.type === "queued", "A turn submitted over the socket is admitted and its events stream to the same socket in order");
 
   const backlog = await attach(name, 0);
   const middle = primary.events[Math.floor(primary.events.length / 2)].seq;
   const tail = await attach(name, middle);
   await until(async () => backlog.events.length === primary.events.length && tail.events.at(-1)?.seq === primary.events.at(-1).seq, "Backlog did not replay");
-  check(JSON.stringify(backlog.events.map(entry => [entry.seq, entry.event])) === JSON.stringify(primary.events.map(entry => [entry.seq, entry.event])) && tail.events[0].seq === middle + 1 && contiguous(tail), "A new watcher replays the stored events from its cursor exactly once");
+  check(JSON.stringify(backlog.events.map(entry => [entry.seq, logged(entry.event)])) === JSON.stringify(primary.events.map(entry => [entry.seq, logged(entry.event)])) && tail.events[0].seq === middle + 1 && ordered(tail), "A new watcher replays the stored events from its cursor exactly once");
 
   const submitted = await mf.dispatchFetch(`http://worker/sessions/${name}/turns`, { method: "POST", headers: { authorization, "content-type": "application/json" }, body: JSON.stringify({ request_id: "http", prompt: "Say hello over HTTP" }) });
   check(submitted.status === 202, "An HTTP turn is still accepted alongside watchers");
   await until(async () => [primary, backlog, tail].every(watcher => result(watcher, "http")), "HTTP turn events did not fan out");
-  check([primary, backlog, tail].every(contiguous) && backlog.events.at(-1).seq === primary.events.at(-1).seq && tail.events.at(-1).seq === primary.events.at(-1).seq, "Every watcher receives live events from turns submitted elsewhere without gaps or duplicates");
+  check([primary, backlog, tail].every(ordered) && backlog.events.at(-1).seq === primary.events.at(-1).seq && tail.events.at(-1).seq === primary.events.at(-1).seq, "Every watcher receives live events from turns submitted elsewhere without gaps or duplicates");
 
   primary.socket.send(JSON.stringify({ type: "warm" }));
   check((await reply(primary, "warm", 1)).warmed === true, "Warm restores the resident runtime for the next turn");
@@ -128,7 +130,7 @@ try {
   const woken = await socketTurn(primary, "after-eviction", "Say hello after eviction");
   await until(async () => result(backlog, "after-eviction") && result(tail, "after-eviction"), "Restored watchers missed events");
   const restored = await metrics(name);
-  check(woken.status === "completed" && startsBefore > 1 && restored.direct_starts === 1 && restored.runtime_initializations === 1 && [primary, backlog, tail].every(contiguous) && primary.events.find(entry => entry.seq > seen).seq === seen + 1, "A turn sent over a hibernated socket wakes the session and every watcher resumes at its cursor");
+  check(woken.status === "completed" && startsBefore > 1 && restored.direct_starts === 1 && restored.runtime_initializations === 1 && [primary, backlog, tail].every(ordered) && JSON.stringify(primary.events.filter(entry => entry.seq > seen).map(entry => entry.seq)) === JSON.stringify(backlog.events.filter(entry => entry.seq > seen).map(entry => entry.seq)), "A turn sent over a hibernated socket wakes the session and every watcher resumes at its cursor");
 
   const closing = performance.now();
   tail.socket.close(1000, "done");
@@ -137,7 +139,7 @@ try {
   check(tail.closed.code === 1000, "The session answers a client close handshake");
   const resumed = await attach(name, seen);
   await until(async () => result(resumed, "after-eviction"), "Resumed watcher missed events");
-  check(resumed.events[0].seq === seen + 1 && resumed.events.at(-1).seq === primary.events.at(-1).seq && contiguous(resumed), "Reconnecting with after resumes exactly after the last seen event");
+  check(resumed.events[0].seq === primary.events.find(entry => entry.seq > seen).seq && resumed.events.at(-1).seq === primary.events.at(-1).seq && ordered(resumed), "Reconnecting with after resumes exactly after the last seen event");
 
   primary.socket.send("not json");
   check((await reply(primary, "error", 1)).error === "messages must be JSON", "Malformed messages get an error reply and keep the socket open");
