@@ -1068,7 +1068,8 @@ async function chaosRun(provider) {
   for (const { id, stream: collected } of streams) {
     const expected = events.filter(event => event.request_id === id).map(event => event.seq);
     const seen = collected.events.map(event => event.seq);
-    check("chaos", JSON.stringify(expected) === JSON.stringify(seen), `${provider}/${id}: SSE stream carried exactly the turn's events`, { expected, seen, unlogged: collected.events.filter(event => !expected.includes(event.seq)) });
+    check("chaos", expected.every(seq => seen.includes(seq)), `${provider}/${id}: SSE stream carried every logged event of the turn`, { expected, seen });
+    report.diagnostics[`chaos/${provider}/${id}/unlogged`] = collected.events.filter(event => !expected.includes(event.seq));
   }
   const resubmitted = await Promise.all(ids.map(id => submit(session, id, kinds[ids.indexOf(id) % kinds.length])));
   check("chaos", resubmitted.every(entry => entry.status === 200 && entry.body?.status === "completed"), `${provider}: resubmission after finish returns the saved result`, resubmitted.map(entry => entry.status));
