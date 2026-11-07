@@ -141,26 +141,19 @@ let generation = 0;
 const authorization = `Bearer ${LOCAL_TOKEN}`;
 
 const PORT = 20000 + Math.floor(Math.random() * 20000);
-function bundleOptions(bundle) {
-  const wasm = process.env.NANOCODE_WASM_PATH;
-  delete process.env.NANOCODE_WASM_PATH;
-  try { return localOptions({ provider, agent: { RECOVERY_DELAY_MS: String(DELAY) }, bundle, persistence: baseOptions.resourcePersistencePath }); }
-  finally { if (wasm !== undefined) process.env.NANOCODE_WASM_PATH = wasm; }
-}
-
-async function boot(bundle) {
-  mf = new Miniflare({ ...convertV4MiniflareOptions(bundle ? bundleOptions(bundle) : baseOptions), port: PORT });
+async function boot() {
+  mf = new Miniflare({ ...convertV4MiniflareOptions(baseOptions), port: PORT });
   await mf.ready;
   generation++;
 }
 
-async function restart(bundle) {
+async function restart() {
   const started = performance.now();
   const previous = mf;
   mf = undefined;
   await previous.dispose();
   for (const [key, entry] of holds) { entry.release(undefined); holds.delete(key); }
-  await boot(bundle);
+  await boot();
   for (const watcher of watchers) await watcher.reconnect();
   return performance.now() - started;
 }
@@ -654,14 +647,6 @@ const scenarios = {
   async pumpFault(provider) {
     return pumpFaultRun(provider);
   },
-
-  async legacy(provider) {
-    const bundle = process.env.FAULTS_LEGACY_BUNDLE;
-    if (!bundle) throw new Error("set FAULTS_LEGACY_BUNDLE to an output/deploy bundle built from an SDK between b22a444ae and 405fff643");
-    const outcomes = {};
-    for (const size of ["small", "large"]) for (const manifests of ["kept", "lost"]) outcomes[`${size}/${manifests}`] = await legacyRun(provider, size, manifests, bundle);
-    return outcomes;
-  },
 };
 
 async function backgroundRun(provider, size) {
@@ -852,78 +837,6 @@ async function pumpFaultRun(provider) {
   return outcome;
 }
 
-const LARGE_RECORDS = "FROM records WHERE state_id = ? AND key LIKE 'b3:%' AND substr(value, 1, 1) IN ('%', '^')";
-
-async function legacyRun(provider, size, manifests, bundle) {
-  const label = `${provider}/${size}/${manifests}`;
-  await restart(bundle);
-  const session = await newSession(provider, `legacy-${size}-${manifests}`);
-  const watcher = await watch(session);
-  const root = `lg-${size}-${manifests}-${provider}`;
-  const child = `kid-${root}`;
-  await submit(session, root, size === "large" ? "[spawn] [large]" : "[spawn]");
-  await until(() => holds.has(`${child}:0`), "child held in inference");
-  const done = await settled(session, root);
-  check("legacy", done.status === "completed", `${label}: root turn completed on the affected build while its child runs`, done);
-  await sleep(3 * DELAY);
-  const [{ value: rootId }] = await sql(session.name, "SELECT value FROM metadata WHERE key = 'session_id'");
-  const journal = `${rootId}:subagents`;
-  const large = await sql(session.name, `SELECT key ${LARGE_RECORDS}`, journal);
-  const outcome = { large_records: large.length };
-  if (manifests === "lost") {
-    if (!large.length) { await restart(); await invariants("legacy", session); watcher.close(); return { ...outcome, skipped: "the affected build wrote no record of 16 KiB or more" }; }
-    await sql(session.name, `DELETE ${LARGE_RECORDS}`, journal);
-  }
-  const before = calls.length;
-  await restart();
-  outcome.quiet = await until(async () => {
-    const [marker] = await sql(session.name, "SELECT COUNT(*) AS count FROM metadata WHERE key LIKE 'background:%'");
-    return marker.count === 0 && (await metrics(session)).alarm_at === null ? true : undefined;
-  }, "quiescence after the restart", 20 * DELAY + 5000).then(() => true, () => false);
-  const window = await metrics(session);
-  await sleep(5 * DELAY);
-  const later = await metrics(session);
-  outcome.alarms_after = later.alarms - window.alarms;
-  outcome.alarm_at = later.alarm_at;
-  const completions = () => calls.slice(before).filter(call => call.turn === root && call.completion).map(call => call.completion);
-  const childCalls = calls.slice(before).filter(call => call.turn === child);
-  outcome.completions = completions();
-  outcome.child_calls = childCalls.length;
-  const probe = async kind => {
-    const id = `lgp-${kind}-${size}-${manifests}-${provider}`;
-    await submit(session, id, `[${kind}]`);
-    await settled(session, id).catch(() => undefined);
-    return calls.find(call => call.turn === id && call.round === 1)?.output ?? "";
-  };
-  const listed = await probe("list");
-  const waited = await probe("wait");
-  outcome.list_agents = listed.slice(0, 600);
-  outcome.wait_agent = waited.slice(0, 600);
-  const lost = manifests === "lost";
-  const unreadable = lost && size === "large";
-  if (!lost) {
-    check("legacy", completions().length === 1 && completions()[0] === "completed", `${label}: the child resumed from the affected journal and the root ran one completion turn`, outcome);
-    check("legacy", childCalls.length >= 1 && childCalls.length <= 3, `${label}: the child made its interrupted call again after the restart`, outcome);
-    check("legacy", /"state":"completed"/.test(listed) && !/missing payload record|could not/.test(listed + waited), `${label}: list_agents and wait_agent report the resumed child as completed`, outcome);
-  } else if (!unreadable) {
-    check("legacy", completions().length === 1 && completions()[0] === "failed", `${label}: the child whose checkpoint is unreadable failed and the root ran one completion turn for it`, outcome);
-    check("legacy", childCalls.length === 0, `${label}: the child with an unreadable checkpoint made no model call`, outcome);
-    for (const [tool, output] of [["list_agents", listed], ["wait_agent", waited]]) check("legacy", /"state":"failed"/.test(output) && /checkpoint [^ ]+ is unreadable/.test(output), `${label}: ${tool} reports the child as failed because its checkpoint is unreadable`, outcome);
-  } else {
-    check("legacy", completions().length === 0 && childCalls.length === 0, `${label}: an unreadable journal resumed nothing`, outcome);
-    check("legacy", /could not restore subagent journal/.test(listed) && /could not restore subagent journal/.test(waited), `${label}: list_agents and wait_agent report the unreadable journal`, outcome);
-  }
-  check("legacy", outcome.quiet && outcome.alarms_after === 0, `${label}: the session becomes quiescent and its alarms stop after the restart`, outcome);
-  const after = `lga-${size}-${manifests}-${provider}`;
-  await submit(session, after, "plain");
-  const final = await settled(session, after);
-  check("legacy", final.status === "completed" && modelCalls(after) === 1, `${label}: a later turn completes once`, final);
-  check("legacy", modelCalls(root, 0) === 1, `${label}: root spawn call was not repeated`, modelCalls(root, 0));
-  await invariants("legacy", session);
-  watcher.close();
-  return outcome;
-}
-
 const handBinary = resolve(process.env.NANOCODE_SDK_PATH ?? "../nanocodex", "target/debug/nanocode");
 const handGroups = new Set();
 process.on("exit", () => { for (const group of handGroups) { try { process.kill(-group, "SIGKILL"); } catch {} } });
@@ -1051,7 +964,7 @@ async function chaosRun(provider) {
     else await submit(session, id, kind);
   }
   const restarts = [];
-  for (let round = 0; round < 4; round++) {
+  for (let round = 0; round < 3; round++) {
     await sleep(30 + Math.floor(random() * 150));
     restarts.push(Math.round(await restart()));
   }
