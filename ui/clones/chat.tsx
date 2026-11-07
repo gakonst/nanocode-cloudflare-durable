@@ -1,7 +1,7 @@
 import { Config } from "nanocode-ts/client";
 import * as Transport from "nanocode-ts/cloudflare/transport";
 import { Keyring } from "nanocode-ts/machines";
-import { useState, useSyncExternalStore } from "react";
+import { useSyncExternalStore } from "react";
 import { PUBLIC_HARNESSES } from "../../worker/models.ts";
 
 export type Model = (typeof PUBLIC_HARNESSES)[number]["models"][number];
