@@ -1,5 +1,5 @@
-import "nanocode-ts/react/zyzz.css";
-import { Demos, Header, Lead, Main, origin, Page, styles as site, Title } from "nanocode-ts/react/site";
+import "nds/zyzz.css";
+import { Demos, Header, Lead, Main, origin, Page, styles as site, Title } from "nds/site";
 import { createRoot } from "react-dom/client";
 import { Demo } from "./agent.tsx";
 import "./fonts.ts";

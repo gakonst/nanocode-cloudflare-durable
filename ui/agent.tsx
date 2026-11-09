@@ -1,7 +1,7 @@
 import { Plans } from "nanocode-ts/client";
 import * as Transport from "nanocode-ts/cloudflare/transport";
 import { Keyring } from "nanocode-ts/machines";
-import { Agent, type Theme } from "nanocode-ts/react/agent";
+import { Agent, type Theme } from "nds/agent";
 import { PLAN_HARNESSES, PUBLIC_HARNESSES, WALLET_HARNESSES } from "../worker/models.ts";
 
 const PROMPTS = [
