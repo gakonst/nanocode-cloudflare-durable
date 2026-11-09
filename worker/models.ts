@@ -11,17 +11,34 @@ const PUBLIC: Public[] = [
   { id: "codex", label: "Codex", models: [{ id: "gpt-6-luna", label: "Luna", detail: "Fast for everyday questions" }, { id: "gpt-6.1-sol", label: "Sol", detail: "Thinks longer for harder problems" }, { id: "glm-5.3", label: "GLM-5.3", detail: "Open-weights model on Workers AI" }] },
 ];
 
-export const PUBLIC_HARNESSES = PUBLIC.map(harness => ({
-  id: harness.id,
-  label: harness.label,
-  models: harness.models.map(({ id, label, detail }) => {
-    const entry = models.harnesses.find(candidate => candidate.id === harness.id)?.models.find(candidate => candidate.id === id);
-    if (!entry) throw new Error(`nanocode-ts's ${harness.id} catalog has no ${id}`);
-    return { id, label, detail, name: entry.name, efforts: entry.efforts, effort: entry.effort };
-  }),
-}));
+function harnesses(list: Public[]) {
+  return list.map(harness => ({
+    id: harness.id,
+    label: harness.label,
+    models: harness.models.map(({ id, label, detail }) => {
+      const entry = models.harnesses.find(candidate => candidate.id === harness.id)?.models.find(candidate => candidate.id === id);
+      if (!entry) throw new Error(`nanocode-ts's ${harness.id} catalog has no ${id}`);
+      return { id, label, detail, name: entry.name, efforts: entry.efforts, effort: entry.effort };
+    }),
+  }));
+}
 
-export const PUBLIC_MODELS: Record<string, { provider: ModelProvider; efforts: readonly string[] }> = Object.fromEntries(PUBLIC_HARNESSES.flatMap(harness => harness.models.map(model => [model.id, { provider: harness.id, efforts: model.efforts }])));
+function catalog(list: { id: ModelProvider; models: { id: string; efforts: readonly string[] }[] }[]): Record<string, { provider: ModelProvider; efforts: readonly string[] }> {
+  return Object.fromEntries(list.flatMap(harness => harness.models.map(model => [model.id, { provider: harness.id, efforts: model.efforts }])));
+}
+
+export const PUBLIC_HARNESSES = harnesses(PUBLIC);
+
+export const PUBLIC_MODELS = catalog(PUBLIC_HARNESSES);
+
+const WALLET: Public[] = [
+  { id: "claude", label: "Claude", models: [{ id: "claude-haiku-5-5", label: "Haiku 5.5", detail: "Fastest for quick answers" }, { id: "claude-sonnet-5-5", label: "Sonnet 5.5", detail: "Smart, efficient model for everyday use" }, { id: "claude-opus-5-5", label: "Opus 5.5", detail: "Most capable for complex work" }] },
+  { id: "codex", label: "Codex", models: [{ id: "gpt-6-luna", label: "Luna", detail: "Fast for everyday questions" }, { id: "gpt-6.1-sol", label: "Sol", detail: "Thinks longer for harder problems" }] },
+];
+
+export const WALLET_HARNESSES = harnesses(WALLET);
+
+export const WALLET_MODELS = catalog(WALLET_HARNESSES);
 
 export const PLAN_HARNESSES = PUBLIC_HARNESSES.map(harness => ({
   ...harness,
@@ -30,4 +47,4 @@ export const PLAN_HARNESSES = PUBLIC_HARNESSES.map(harness => ({
     .map(model => ({ id: model.id, label: model.name, name: model.name, efforts: model.efforts, effort: model.effort })),
 }));
 
-export const PLAN_MODELS: Record<string, { provider: ModelProvider; efforts: readonly string[] }> = Object.fromEntries(PLAN_HARNESSES.flatMap(harness => harness.models.map(model => [model.id, { provider: harness.id, efforts: model.efforts }])));
+export const PLAN_MODELS = catalog(PLAN_HARNESSES);

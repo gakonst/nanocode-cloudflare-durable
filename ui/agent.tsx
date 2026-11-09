@@ -2,7 +2,7 @@ import { Plans } from "nanocode-ts/client";
 import * as Transport from "nanocode-ts/cloudflare/transport";
 import { Keyring } from "nanocode-ts/machines";
 import { Agent, type Theme } from "nanocode-ts/react/agent";
-import { PLAN_HARNESSES, PUBLIC_HARNESSES } from "../worker/models.ts";
+import { PLAN_HARNESSES, PUBLIC_HARNESSES, WALLET_HARNESSES } from "../worker/models.ts";
 
 const PROMPTS = [
   "Clone wevm/viem and list its five largest source files",
@@ -17,7 +17,7 @@ export function Demo(props: { theme: Theme; title?: string }) {
       connect={({ headers, selection, session }) => ({
         keyring: Keyring.create({ headers, url: "v1/keys" }),
         plans: Plans.create({ headers, url: "plans" }),
-        transport: Transport.create({ headers, model: () => ({ model: selection().model, provider: selection().harness, thinking: selection().thinking }), session }),
+        transport: Transport.create({ headers, model: () => ({ model: selection().model, payer: selection().payer, provider: selection().harness, thinking: selection().thinking }), session }),
       })}
       crash="Armed: the next tool call resets its Durable Object 1.5 s in."
       footer={props.title && <Footer title={props.title} />}
@@ -30,6 +30,7 @@ export function Demo(props: { theme: Theme; title?: string }) {
       {...(props.title ? { title: props.title } : {})}
       token={async () => !(await fetch("health").then(response => response.ok, () => false))}
       wallet={{ name: "nanocode on Cloudflare", relay: "api/device/", websiteUrl: "https://nanocode.xyz/cloudflare/" }}
+      walletHarnesses={WALLET_HARNESSES}
     />
   );
 }

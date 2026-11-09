@@ -3,7 +3,7 @@ import { Remote } from "nanocode-ts";
 import { App, Gateway, HandRelay, Limit, Listings, McpListings, PlanVault, PublicLimit, Relay, RelayContainer } from "nanocode-ts/cloudflare";
 import { Env as Machines, Wallets } from "nanocode-ts/machines/cloudflare";
 import * as Account from "nanocode-ts/machines/server";
-import { PLAN_MODELS, PUBLIC_MODELS } from "./models";
+import { PLAN_MODELS, PUBLIC_MODELS, WALLET_MODELS } from "./models";
 import { charge } from "./tools";
 import type { Python as Shell } from "nanocode-ts/bash";
 import type { Python as Pyodide } from "nanocode-ts/cloudflare/python";
@@ -84,14 +84,15 @@ async function admit(request: Request, env: Env): Promise<Response | undefined> 
   if (/\/hands(?:\/[^/]+)?$/.test(pathname) && request.headers.get("upgrade")?.toLowerCase() === "websocket" && !Remote.bearerToken(request)?.startsWith("nch_")) return refuse("hands attach with the session's hand token", 403);
   if (!(await env.PUBLIC_LIMITS.get(env.PUBLIC_LIMITS.idFromName(Limit.client(request.headers.get("cf-connecting-ip")!))).admit())) return refuse("too many requests, try again in a minute", 429);
   if (request.method !== "POST" || !/\/(?:turns|warm)$/.test(pathname)) return;
-  const body = await request.clone().json().catch(() => undefined) as { model?: unknown; prompt?: unknown; provider?: unknown; thinking?: unknown } | undefined;
+  const body = await request.clone().json().catch(() => undefined) as { model?: unknown; payer?: unknown; prompt?: unknown; provider?: unknown; thinking?: unknown } | undefined;
   if (typeof body?.prompt === "string" && body.prompt.length > PUBLIC_PROMPT_CHARACTERS) return refuse(`prompts are limited to ${PUBLIC_PROMPT_CHARACTERS} characters`, 413);
   const provider = body?.provider ?? "claude";
   const model = String(body?.model ?? (provider === "codex" ? "gpt-6.1-sol" : env.CLAUDE_MODEL ?? "claude-opus-5-5"));
-  const planned = await onPlan(request, env, provider);
-  const catalog = planned ? { ...PUBLIC_MODELS, ...PLAN_MODELS } : PUBLIC_MODELS;
+  const payer = body?.payer;
+  const planned = payer === "plan" || (payer === undefined && await onPlan(request, env, provider));
+  const catalog = payer === "wallet" ? WALLET_MODELS : payer === "plan" ? PLAN_MODELS : planned ? { ...PUBLIC_MODELS, ...PLAN_MODELS } : PUBLIC_MODELS;
   const allowed = catalog[model];
-  if (!allowed || allowed.provider !== provider) return refuse(`this deployment serves ${Object.keys(catalog).join(", ")}${planned ? "" : ", and more on your own ChatGPT or Claude plan"}`, 403);
+  if (!allowed || allowed.provider !== provider) return refuse(payer === "wallet" ? `Tempo Wallet pays for ${Object.keys(catalog).join(", ")}` : payer === "plan" ? `your plan serves ${Object.keys(catalog).join(", ")}` : `this deployment serves ${Object.keys(catalog).join(", ")}, and more on your Tempo Wallet or your own ChatGPT or Claude plan`, 403);
   if (body?.thinking !== undefined && !allowed.efforts.includes(String(body.thinking))) return refuse(`${model} takes ${allowed.efforts.join(", ")}`, 403);
 }
 
@@ -105,7 +106,8 @@ const wallets = Wallets.create<Env>({ account, scripts: true });
 
 const nanocode = App.create<Env>({
   authenticate,
-  egress: env => Gateway.create(env.AI, { id: env.AI_GATEWAY_ID, serviceTier: env.OPENAI_SERVICE_TIER, firstByteMs: Number(env.MODEL_FIRST_BYTE_MS) || undefined }),
+  egress: wallets.egress(env => Gateway.create(env.AI, { id: env.AI_GATEWAY_ID, serviceTier: env.OPENAI_SERVICE_TIER, firstByteMs: Number(env.MODEL_FIRST_BYTE_MS) || undefined })),
+  payers: ["deployment", "plan", "wallet"],
   plans: { vault: env => env.PLANS, relay: env => env.RELAY, account },
   tools: charge,
   chaos: true,
