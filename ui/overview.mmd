@@ -1,0 +1,7 @@
+flowchart LR
+  browser[/Browser/] -->|POST| worker[Worker]
+  worker -->|fetch| object[Session Durable Object]
+  object --> gateway[AI Gateway]
+  object -->|checkpoints, turns, events| sqlite[(The object's SQLite)]
+  object -. alarm after a reset .-> resumed[Next instance of the object]
+  resumed -->|resumes the turn from| sqlite

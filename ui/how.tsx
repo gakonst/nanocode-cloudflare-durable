@@ -2,6 +2,7 @@ import "nanocode-ts/react/zyzz.css";
 import { Block, Card, Cards, Diagram, Docs, Header, Main, origin, styles } from "nanocode-ts/react/site";
 import { createRoot } from "react-dom/client";
 import "./fonts.ts";
+import overview from "./overview.mmd";
 
 document.body.className = styles.body().className;
 
@@ -16,14 +17,7 @@ createRoot(document.getElementById("root")!).render(
         <h2>Overview</h2>
         <p>A request reaches the Worker, which forwards it to one Durable Object per account and session. The object runs the nanocode SDK compiled to WebAssembly from <a href="https://github.com/nanocodexyz/nanocode-ts">nanocode-ts</a>, and its model requests go to Cloudflare AI Gateway through the <code>AI</code> binding.</p>
         <p>Before a turn runs, the object stores a watchdog alarm. If the object resets mid-turn, the alarm starts it again, and the turn resumes from the checkpoint in SQLite.</p>
-        <Diagram>{`browser ─POST─▶ Worker ─fetch─▶ session Durable Object ─▶ AI Gateway
-                                     │
-                                     │ checkpoints, turns, events
-                                     ▼
-                             the object's SQLite
-                                     ▲
-                                     │ alarm after a reset
-                           session Durable Object ─▶ resumes the turn`}</Diagram>
+        <Diagram svg={overview} />
         <p>To try it, open the <a href="./">home page</a>, press "Kill the next tool call", then ask for a charge. The object resets during the charge, its alarm starts it again, and the agent reports that the charge may have gone through.</p>
 
         <h2>The Agent</h2>
