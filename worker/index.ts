@@ -124,7 +124,7 @@ export default {
   async fetch(request, env) {
     const { pathname, searchParams } = new URL(request.url);
     if ((request.method === "GET" || request.method === "HEAD") && pathname === "/") {
-      const page = THEMES.get(searchParams.get("theme") ?? "codex");
+      const page = THEMES.get(searchParams.get("theme") ?? "nanocode");
       return page ? env.ASSETS.fetch(new URL(page, request.url), { method: request.method }) : refuse("theme is claude, codex or nanocode", 404);
     }
     if (request.method === "POST" && (pathname === "/api/device/register" || pathname === "/api/device/token")) return relay(request, pathname);
