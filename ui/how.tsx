@@ -11,10 +11,10 @@ createRoot(document.getElementById("root")!).render(
     <Main>
       <Docs>
         <h1>How It Works</h1>
-        <p>nanocode on Cloudflare runs a nanocode agent in a Cloudflare Durable Object. The agent keeps its journal in the object's own SQLite, so a turn that loses its object continues in the next one from the last checkpoint. Its source is <a href="https://github.com/gakonst/nanocode-cloudflare-durable">gakonst/nanocode-cloudflare-durable</a>.</p>
+        <p>nanocode on Cloudflare runs a nanocode agent in a Cloudflare Durable Object. The agent keeps its journal in the object's own SQLite, so a turn that loses its object continues in the next one from the last checkpoint. Its source is <a href="https://github.com/nanocodexyz/durable-cloudflare">nanocodexyz/durable-cloudflare</a>.</p>
 
         <h2>Overview</h2>
-        <p>A request reaches the Worker, which forwards it to one Durable Object per account and session. The object runs the nanocode SDK compiled to WebAssembly from <a href="https://github.com/gakonst/nanocode-ts">nanocode-ts</a>, and its model requests go to Cloudflare AI Gateway through the <code>AI</code> binding.</p>
+        <p>A request reaches the Worker, which forwards it to one Durable Object per account and session. The object runs the nanocode SDK compiled to WebAssembly from <a href="https://github.com/nanocodexyz/nanocode-ts">nanocode-ts</a>, and its model requests go to Cloudflare AI Gateway through the <code>AI</code> binding.</p>
         <p>Before a turn runs, the object stores a watchdog alarm. If the object resets mid-turn, the alarm starts it again, and the turn resumes from the checkpoint in SQLite.</p>
         <Diagram>{`browser ─POST─▶ Worker ─fetch─▶ session Durable Object ─▶ AI Gateway
                                      │
@@ -89,8 +89,8 @@ return this.storage.transactionSync(() =>
 
         <h2>More</h2>
         <Cards>
-          <Card href="https://github.com/gakonst/nanocode-cloudflare-durable" title="Source →">The Worker, the session object, the app and the drill.</Card>
-          <Card href="https://github.com/gakonst/nanocode-ts" title="nanocode-ts →">The runtime and its Durable Object SqlHost.</Card>
+          <Card href="https://github.com/nanocodexyz/durable-cloudflare" title="Source →">The Worker, the session object, the app and the drill.</Card>
+          <Card href="https://github.com/nanocodexyz/nanocode-ts" title="nanocode-ts →">The runtime and its Durable Object SqlHost.</Card>
           <Card href="https://nanocode.xyz/vercel" title="nanocode on Vercel →">The same agent on durable-harness in Vercel Functions.</Card>
           <Card href="https://nanocode.xyz/docs/introduction/getting-started" title="nanocode docs →">The SDK, its runtime and its hosts.</Card>
         </Cards>
