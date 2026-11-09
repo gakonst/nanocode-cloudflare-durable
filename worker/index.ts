@@ -13,6 +13,7 @@ const VISITOR = Account.visitorHeader;
 
 interface Env extends Machines.Env {
   AI: Ai;
+  ASSETS: Fetcher;
   AI_GATEWAY_ID: string;
   OPENAI_SERVICE_TIER: string;
   MODEL_FIRST_BYTE_MS?: string;
@@ -27,6 +28,7 @@ interface Env extends Machines.Env {
   PLAN_SECRET: string;
 }
 
+const THEMES = new Map([["claude", "/claude"], ["codex", "/chatgpt"], ["nanocode", "/nanocode"]]);
 const DIGEST = /^[0-9a-f]{64}$/;
 const ACCOUNT = "owner";
 const PUBLIC_ACCOUNT = "public";
@@ -120,7 +122,11 @@ export class Python extends DurableObject {}
 
 export default {
   async fetch(request, env) {
-    const { pathname } = new URL(request.url);
+    const { pathname, searchParams } = new URL(request.url);
+    if ((request.method === "GET" || request.method === "HEAD") && pathname === "/") {
+      const page = THEMES.get(searchParams.get("theme") ?? "codex");
+      return page ? env.ASSETS.fetch(new URL(page, request.url), { method: request.method }) : refuse("theme is claude, codex or nanocode", 404);
+    }
     if (request.method === "POST" && (pathname === "/api/device/register" || pathname === "/api/device/token")) return relay(request, pathname);
     if (request.method === "GET" && pathname.startsWith("/api/github/")) return archive(pathname);
     if (request.method === "GET" && pathname === "/install") return Response.redirect("https://nanocode.xyz/install", 308);

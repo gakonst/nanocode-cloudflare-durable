@@ -2,7 +2,7 @@
   "name": "nanocode",
   "main": "worker/index.ts",
   "compatibility_date": "2026-10-16",
-  "assets": { "directory": "./public" },
+  "assets": { "binding": "ASSETS", "directory": "./public" },
   "build": { "command": "node scripts/build-ui.mjs" },
   "ai": { "binding": "AI" },
   "containers": [{ "class_name": "RelayContainer", "image": "./node_modules/nanocode-ts/node_modules/nanocode-egress/relay.Dockerfile", "instance_type": "lite", "max_instances": 2 }],
