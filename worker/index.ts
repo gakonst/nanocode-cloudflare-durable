@@ -132,6 +132,7 @@ export default {
     if (request.method === "POST" && (pathname === "/api/device/register" || pathname === "/api/device/token")) return relay(request, pathname);
     if (request.method === "GET" && pathname.startsWith("/api/github/")) return archive(pathname);
     if (request.method === "GET" && pathname === "/install") return Response.redirect("https://nanocode.xyz/install", 308);
+    if ((request.method === "GET" || request.method === "HEAD") && pathname === "/how-it-works") return Response.redirect("https://nanocode.xyz/experiments/durable-nanocode-on-cloudflare", 308);
     if (request.method === "GET" && pathname === "/relay") return Relay.route(request, { namespace: env.HAND_RELAYS });
     const refused = env.CHAT_PUBLIC === "1" && !(await owner(request, env)) ? await admit(request, env) : undefined;
     return refused ?? await wallets.fetch(request, env) ?? nanocode.fetch(request, env);
