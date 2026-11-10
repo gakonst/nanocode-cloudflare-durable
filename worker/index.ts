@@ -3,7 +3,7 @@ import { Remote } from "nanocode-ts";
 import { App, Gateway, HandRelay, Limit, Listings, McpListings, PlanVault, PublicLimit, Relay, RelayContainer } from "nanocode-ts/cloudflare";
 import { Env as Machines, Wallets } from "nanocode-ts/machines/cloudflare";
 import * as Account from "nanocode-ts/machines/server";
-import { PLAN_MODELS, PUBLIC_MODELS, WALLET_MODELS } from "./models";
+import { PLAN_MODELS, PUBLIC_MODELS } from "./models";
 import { charge } from "./tools";
 import type { Python as Shell } from "nanocode-ts/bash";
 import type { Python as Pyodide } from "nanocode-ts/cloudflare/python";
@@ -90,12 +90,13 @@ async function admit(request: Request, env: Env): Promise<Response | undefined> 
   const provider = body?.provider ?? "claude";
   const model = String(body?.model ?? (provider === "codex" ? "gpt-6.1-sol" : env.CLAUDE_MODEL ?? "claude-opus-5-5"));
   const payer = body?.payer;
+  if (payer === "wallet") return provider === "claude" || provider === "codex" ? undefined : refuse("provider is claude or codex", 400);
   const open = PUBLIC_MODELS[model];
   const fits = open?.provider === provider && (body?.thinking === undefined || open.efforts.includes(String(body.thinking)));
   const planned = payer === "plan" || (payer === undefined && !fits && await onPlan(request, env, provider));
-  const catalog = payer === "wallet" ? WALLET_MODELS : payer === "plan" ? PLAN_MODELS : planned ? { ...PUBLIC_MODELS, ...PLAN_MODELS } : PUBLIC_MODELS;
+  const catalog = payer === "plan" ? PLAN_MODELS : planned ? { ...PUBLIC_MODELS, ...PLAN_MODELS } : PUBLIC_MODELS;
   const allowed = catalog[model];
-  if (!allowed || allowed.provider !== provider) return refuse(payer === "wallet" ? `Tempo Wallet pays for ${Object.keys(catalog).join(", ")}` : payer === "plan" ? `your plan serves ${Object.keys(catalog).join(", ")}` : `this deployment serves ${Object.keys(catalog).join(", ")}, and more on your Tempo Wallet or your own ChatGPT or Claude plan`, 403);
+  if (!allowed || allowed.provider !== provider) return refuse(payer === "plan" ? `your plan serves ${Object.keys(catalog).join(", ")}` : `this deployment serves ${Object.keys(catalog).join(", ")}, and more on your Tempo Wallet or your own ChatGPT or Claude plan`, 403);
   if (body?.thinking !== undefined && !allowed.efforts.includes(String(body.thinking))) return refuse(`${model} takes ${allowed.efforts.join(", ")}`, 403);
 }
 

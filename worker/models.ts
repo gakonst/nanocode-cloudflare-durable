@@ -31,15 +31,6 @@ export const PUBLIC_HARNESSES = harnesses(PUBLIC);
 
 export const PUBLIC_MODELS = catalog(PUBLIC_HARNESSES);
 
-const WALLET: Public[] = [
-  { id: "claude", label: "Claude", models: [{ id: "claude-haiku-5-5", label: "Haiku 5.5", detail: "Fastest for quick answers" }, { id: "claude-sonnet-5-5", label: "Sonnet 5.5", detail: "Smart, efficient model for everyday use" }, { id: "claude-opus-5-5", label: "Opus 5.5", detail: "Most capable for complex work" }] },
-  { id: "codex", label: "Codex", models: [{ id: "gpt-6-luna", label: "Luna", detail: "Fast for everyday questions" }, { id: "gpt-6.1-sol", label: "Sol", detail: "Thinks longer for harder problems" }] },
-];
-
-export const WALLET_HARNESSES = harnesses(WALLET);
-
-export const WALLET_MODELS = catalog(WALLET_HARNESSES);
-
 export const PLAN_HARNESSES = PUBLIC_HARNESSES.map(harness => ({
   ...harness,
   models: (models.harnesses.find(candidate => candidate.id === harness.id)?.models ?? [])

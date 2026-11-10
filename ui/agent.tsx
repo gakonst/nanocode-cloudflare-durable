@@ -2,7 +2,7 @@ import { Plans } from "nanocode-ts/client";
 import * as Transport from "nanocode-ts/cloudflare/transport";
 import { Keyring } from "nanocode-ts/machines";
 import { Agent, type Theme } from "nds/agent";
-import { PLAN_HARNESSES, PUBLIC_HARNESSES, WALLET_HARNESSES } from "../worker/models.ts";
+import { PLAN_HARNESSES, PUBLIC_HARNESSES } from "../worker/models.ts";
 
 const PROMPTS = [
   "Clone wevm/viem and list its five largest source files",
@@ -30,7 +30,6 @@ export function Demo(props: { theme: Theme; title?: string }) {
       {...(props.title ? { title: props.title } : {})}
       token={async () => !(await fetch("health").then(response => response.ok, () => false))}
       wallet={{ name: "nanocode on Cloudflare", relay: "api/device/", websiteUrl: "https://nanocode.xyz/cloudflare/" }}
-      walletHarnesses={WALLET_HARNESSES}
     />
   );
 }
