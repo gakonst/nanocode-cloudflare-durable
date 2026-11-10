@@ -31,6 +31,8 @@ export const PUBLIC_HARNESSES = harnesses(PUBLIC);
 
 export const PUBLIC_MODELS = catalog(PUBLIC_HARNESSES);
 
+export const CLAUDE_MODELS = new Set(models.harnesses.find(harness => harness.id === "claude")?.models.map(model => model.id));
+
 export const PLAN_HARNESSES = PUBLIC_HARNESSES.map(harness => ({
   ...harness,
   models: (models.harnesses.find(candidate => candidate.id === harness.id)?.models ?? [])

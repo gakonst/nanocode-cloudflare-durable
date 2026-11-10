@@ -1,9 +1,10 @@
 import { DurableObject } from "cloudflare:workers";
 import { Remote } from "nanocode-ts";
 import { App, Gateway, HandRelay, Limit, Listings, McpListings, PlanVault, PublicLimit, Relay, RelayContainer } from "nanocode-ts/cloudflare";
+import { Tempo } from "nanocode-ts/machines";
 import { Env as Machines, Wallets } from "nanocode-ts/machines/cloudflare";
 import * as Account from "nanocode-ts/machines/server";
-import { PLAN_MODELS, PUBLIC_MODELS } from "./models";
+import { CLAUDE_MODELS, PLAN_MODELS, PUBLIC_MODELS } from "./models";
 import { charge } from "./tools";
 import type { Python as Shell } from "nanocode-ts/bash";
 import type { Python as Pyodide } from "nanocode-ts/cloudflare/python";
@@ -111,6 +112,7 @@ const wallets = Wallets.create<Env>({ account, scripts: true });
 const nanocode = App.create<Env>({
   authenticate,
   egress: wallets.egress(env => Gateway.create(env.AI, { id: env.AI_GATEWAY_ID, serviceTier: env.OPENAI_SERVICE_TIER, firstByteMs: Number(env.MODEL_FIRST_BYTE_MS) || undefined })),
+  limits: session => session.provider === "claude" && session.model && !CLAUDE_MODELS.has(session.model) ? { max_tokens: Tempo.outputTokens } : undefined,
   payers: ["deployment", "plan", "wallet"],
   plans: { vault: env => env.PLANS, relay: env => env.RELAY, account },
   tools: charge,
