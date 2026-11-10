@@ -1,5 +1,5 @@
 import "nds/zyzz.css";
-import { Demos, Header, Links, Main, origin, Page, Points, styles as site, Title } from "nds/site";
+import { Demos, Header, Links, Main, origin, Page, Points, styles as site, Terminal, Title } from "nds/site";
 import { createRoot } from "react-dom/client";
 import { Demo } from "./agent.tsx";
 import "./fonts.ts";
@@ -19,7 +19,7 @@ createRoot(document.getElementById("root")!).render(
           <li><strong>A shell without a machine.</strong> Cells run bash, git, Python and WebAssembly beside the agent.</li>
           <li><strong>Yours to connect.</strong> Connect adds a Tempo Wallet, your ChatGPT or Claude plan, or your own machine.</li>
         </Points>
-        <Demo theme="nanocode" />
+        <Terminal><Demo theme="nanocode" /></Terminal>
         <Links>
           <a href={`${origin}/experiments/durable-nanocode-on-cloudflare`}>How it works</a>
           <a href={`${origin}/docs/guides/workers`}>Build your own</a>
