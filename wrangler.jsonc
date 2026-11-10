@@ -5,6 +5,7 @@
   "assets": { "binding": "ASSETS", "directory": "./public" },
   "build": { "command": "node scripts/build-ui.mjs" },
   "ai": { "binding": "AI" },
+  "ratelimits": [{ "name": "PUBLIC_RATE", "namespace_id": "4203", "simple": { "limit": 30, "period": 60 } }],
   "containers": [{ "class_name": "RelayContainer", "image": "./node_modules/nanocode-ts/node_modules/nanocode-egress/relay.Dockerfile", "instance_type": "lite", "max_instances": 2 }],
   "durable_objects": {
     "bindings": [

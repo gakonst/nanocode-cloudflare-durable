@@ -21,6 +21,7 @@ interface Env extends Machines.Env {
   CHAT_PUBLIC: string;
   HAND_RELAYS: DurableObjectNamespace<HandRelay>;
   PUBLIC_LIMITS: DurableObjectNamespace<PublicLimit>;
+  PUBLIC_RATE: RateLimit;
   PYTHON: DurableObjectNamespace<Pyodide>;
   MCP_LISTINGS: DurableObjectNamespace<McpListings>;
   PLANS: DurableObjectNamespace<PlanVault>;
@@ -82,14 +83,16 @@ async function admit(request: Request, env: Env): Promise<Response | undefined> 
   if (pathname === "/health") return;
   if (!PUBLIC_ROUTE.test(pathname)) return refuse("this route needs the access token", 403);
   if (/\/hands(?:\/[^/]+)?$/.test(pathname) && request.headers.get("upgrade")?.toLowerCase() === "websocket" && !Remote.bearerToken(request)?.startsWith("nch_")) return refuse("hands attach with the session's hand token", 403);
-  if (!(await env.PUBLIC_LIMITS.get(env.PUBLIC_LIMITS.idFromName(Limit.client(request.headers.get("cf-connecting-ip")!))).admit())) return refuse("too many requests, try again in a minute", 429);
+  if (!(await env.PUBLIC_RATE.limit({ key: Limit.client(request.headers.get("cf-connecting-ip")!) })).success) return refuse("too many requests, try again in a minute", 429);
   if (request.method !== "POST" || !/\/(?:turns|warm)$/.test(pathname)) return;
   const body = await request.clone().json().catch(() => undefined) as { model?: unknown; payer?: unknown; prompt?: unknown; provider?: unknown; thinking?: unknown } | undefined;
   if (typeof body?.prompt === "string" && body.prompt.length > PUBLIC_PROMPT_CHARACTERS) return refuse(`prompts are limited to ${PUBLIC_PROMPT_CHARACTERS} characters`, 413);
   const provider = body?.provider ?? "claude";
   const model = String(body?.model ?? (provider === "codex" ? "gpt-6.1-sol" : env.CLAUDE_MODEL ?? "claude-opus-5-5"));
   const payer = body?.payer;
-  const planned = payer === "plan" || (payer === undefined && await onPlan(request, env, provider));
+  const open = PUBLIC_MODELS[model];
+  const fits = open?.provider === provider && (body?.thinking === undefined || open.efforts.includes(String(body.thinking)));
+  const planned = payer === "plan" || (payer === undefined && !fits && await onPlan(request, env, provider));
   const catalog = payer === "wallet" ? WALLET_MODELS : payer === "plan" ? PLAN_MODELS : planned ? { ...PUBLIC_MODELS, ...PLAN_MODELS } : PUBLIC_MODELS;
   const allowed = catalog[model];
   if (!allowed || allowed.provider !== provider) return refuse(payer === "wallet" ? `Tempo Wallet pays for ${Object.keys(catalog).join(", ")}` : payer === "plan" ? `your plan serves ${Object.keys(catalog).join(", ")}` : `this deployment serves ${Object.keys(catalog).join(", ")}, and more on your Tempo Wallet or your own ChatGPT or Claude plan`, 403);
