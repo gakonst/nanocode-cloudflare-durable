@@ -108,7 +108,7 @@ function modules(directory) {
   if (scripts.length !== 1) throw new Error(`Expected one compiled Worker in ${directory}; run npm run dry-run`);
   const path = `${directory}/${scripts[0]}`;
   const contents = readFileSync(path, "utf8");
-  const imports = [...contents.matchAll(/from\s+["']\.\/([^"']+\.wasm)["']/g)].map(match => match[1]);
+  const imports = [...contents.matchAll(/from\s*["']\.\/([^"']+\.wasm)["']/g)].map(match => match[1]);
   return [{ type: "ESModule", path: `${directory}/local-shim.mjs`, contents: shim(scripts[0], wallets(contents), listings(contents)) }, { type: "ESModule", path, contents }, ...[...new Set(imports)].map(file => ({ type: "CompiledWasm", path: `${directory}/${file}`, contents: readFileSync(process.env.NANOCODE_WASM_PATH ?? `${directory}/${file}`) }))];
 }
 
