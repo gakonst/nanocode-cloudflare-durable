@@ -22,7 +22,7 @@
 ```sh
 npm install
 npm run dev       # wrangler dev, at http://localhost:8787
-npm run drill     # Crash the object mid-turn against a scripted model, and check the turn
+npm run drill     # Crash a turn midway and check that it resumes
 npm run deploy    # Deploy the Worker and its Python Worker
 ```
 
