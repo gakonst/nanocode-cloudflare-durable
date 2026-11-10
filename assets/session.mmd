@@ -1,0 +1,8 @@
+flowchart LR
+  accTitle: A turn goes from the client through the Worker to the session object, which journals in its SQLite and is restarted by an alarm after a reset
+  client[/Client/] --> worker[Worker]
+  worker --> object[Session object]
+  object -->|journal| storage[(Object SQLite)]
+  object -->|model requests| gateway[AI Gateway]
+  object -. alarm after a reset .-> next[Next instance]
+  next --> storage
