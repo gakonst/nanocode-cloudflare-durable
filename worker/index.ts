@@ -115,6 +115,7 @@ const nanocode = App.create<Env>({
   limits: session => session.provider === "claude" && session.model && !CLAUDE_MODELS.has(session.model) ? { max_tokens: Tempo.outputTokens } : undefined,
   payers: ["deployment", "plan", "wallet"],
   plans: { vault: env => env.PLANS, relay: env => env.RELAY, account },
+  retainedTurns: 8,
   tools: charge,
   chaos: true,
   workspace: { python: (authority, env) => async request => await env.PYTHON.get(env.PYTHON.idFromName(authority.account_id)).run(request) as unknown as Shell.Reply },
