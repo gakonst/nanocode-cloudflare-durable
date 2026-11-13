@@ -1,6 +1,6 @@
 import { DurableObject } from "cloudflare:workers";
 import { Remote } from "nanocode-ts";
-import { App, Gateway, HandRelay, Limit, Listings, McpListings, PlanVault, PublicLimit, Relay, RelayContainer } from "nanocode-ts/cloudflare";
+import { App, Gateway, HandRelay, Limit, McpListings, PlanVault, PublicLimit, Relay, RelayContainer } from "nanocode-ts/cloudflare";
 import { Tempo } from "nanocode-ts/machines";
 import { Env as Machines, Wallets } from "nanocode-ts/machines/cloudflare";
 import * as Account from "nanocode-ts/machines/server";
@@ -27,6 +27,7 @@ interface Env extends Machines.Env {
   PUBLIC_RATE: RateLimit;
   PYTHON: DurableObjectNamespace<Pyodide>;
   MCP_LISTINGS: DurableObjectNamespace<McpListings>;
+  MCP_LISTINGS_KV: KVNamespace;
   PLANS: DurableObjectNamespace<PlanVault>;
   RELAY: DurableObjectNamespace<RelayContainer>;
   PLAN_SECRET: string;
@@ -122,7 +123,7 @@ const nanocode = App.create<Env>({
   chaos: true,
   workspace: { python: (authority, env) => async request => await env.PYTHON.get(env.PYTHON.idFromName(authority.account_id)).run(request) as unknown as Shell.Reply, psh: pshModule, pythonModule, pythonCpuMs: 5_000 },
   ...wallets.nanocode,
-  ...(wallets.nanocode.mcp ? { mcp: { ...wallets.nanocode.mcp, store: env => Listings.store(env.MCP_LISTINGS) } } : {}),
+  ...(wallets.nanocode.mcp ? { mcp: { ...wallets.nanocode.mcp, store: env => ({ get: key => env.MCP_LISTINGS_KV.get(key), put: (key, value, ttlMs) => env.MCP_LISTINGS_KV.put(key, value, { expirationTtl: Math.max(60, Math.ceil(ttlMs / 1000)) }) }) } } : {}),
 });
 
 export const { AgentSession } = nanocode;
