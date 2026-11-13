@@ -8,6 +8,7 @@ import { CLAUDE_MODELS, PLAN_MODELS, PUBLIC_MODELS } from "./models";
 import { charge } from "./tools";
 import type { Python as Shell } from "nanocode-ts/bash";
 import type { Python as Pyodide } from "nanocode-ts/cloudflare/python";
+import pshModule from "nanocode-ts/psh.wasm";
 import pythonModule from "nanocode-ts/python.wasm";
 
 const visitor = Account.visitor;
@@ -119,7 +120,7 @@ const nanocode = App.create<Env>({
   retainedTurns: 8,
   tools: charge,
   chaos: true,
-  workspace: { python: (authority, env) => async request => await env.PYTHON.get(env.PYTHON.idFromName(authority.account_id)).run(request) as unknown as Shell.Reply, pythonModule },
+  workspace: { python: (authority, env) => async request => await env.PYTHON.get(env.PYTHON.idFromName(authority.account_id)).run(request) as unknown as Shell.Reply, psh: pshModule, pythonModule, pythonCpuMs: 5_000 },
   ...wallets.nanocode,
   ...(wallets.nanocode.mcp ? { mcp: { ...wallets.nanocode.mcp, store: env => Listings.store(env.MCP_LISTINGS) } } : {}),
 });
