@@ -1,6 +1,7 @@
 {
   "name": "nanocode",
   "main": "worker/index.ts",
+  "workers_dev": true,
   "compatibility_date": "2026-10-16",
   "minify": true,
   "assets": { "binding": "ASSETS", "directory": "./public" },
