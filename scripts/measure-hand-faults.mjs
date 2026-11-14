@@ -67,15 +67,15 @@ const gate = name => { let open; const promise = new Promise(resolve => { open =
 const scripts = {
   "faults-ping": [() => ({ code: 'text("pong");' })],
   "faults-where": [() => ({ code: 'text((await tools.exec_command({ cmd: "pwd" })).output);' })],
-  "faults-reconnect": [() => ({ code: '// @exec: {"yield_time_ms": 1000}' + "\n" + 'await tools.exec_command({ cmd: "sleep 3105", yield_time_ms: 600000 }); text("finished");' }), results => ({ wait: { cell_id: cellId(results[0]?.text), yield_time_ms: 20000 } }), async results => { await gates.reattached.promise; return { wait: { cell_id: cellId(results[0]?.text), yield_time_ms: 1000 } }; }],
+  "faults-reconnect": [() => ({ code: '// @exec: {"yield_time_ms": 1000}' + "\n" + 'await tools.exec_command({ cmd: "/bin/sleep 3105", yield_time_ms: 600000 }); text("finished");' }), results => ({ wait: { cell_id: cellId(results[0]?.text), yield_time_ms: 20000 } }), async results => { await gates.reattached.promise; return { wait: { cell_id: cellId(results[0]?.text), yield_time_ms: 1000 } }; }],
   "faults-text": [() => ({ code: 'text("x".repeat(1500000));' }), () => ({ code: 'text("after");' })],
   "faults-image": [() => ({ code: "await tools.Write({ file_path: 'big.py', content: " + JSON.stringify(PNG) + " }); await tools.exec_command({ cmd: 'python3 big.py' }); const file = await tools.Read({ file_path: 'big.png' }); text('read ' + JSON.stringify(file).length);" }), () => ({ code: 'text("after");' })],
   "faults-copy": [() => ({ code: 'const written = await tools.Write({ file_path: "copy.txt", content: "y".repeat(1500000), hand: "beta" }); text("copied " + JSON.stringify(written).slice(0, 200));' }), () => ({ code: 'text("after");' })],
-  "faults-displace": [() => ({ code: '// @exec: {"yield_time_ms": 1000}' + "\n" + 'await tools.exec_command({ cmd: "sleep 3106", yield_time_ms: 600000 }); text("finished");' }), results => ({ wait: { cell_id: cellId(results[0]?.text), yield_time_ms: 20000 } })],
+  "faults-displace": [() => ({ code: '// @exec: {"yield_time_ms": 1000}' + "\n" + 'await tools.exec_command({ cmd: "/bin/sleep 3106", yield_time_ms: 600000 }); text("finished");' }), results => ({ wait: { cell_id: cellId(results[0]?.text), yield_time_ms: 20000 } })],
   "faults-catch": [() => ({ code: 'try { await tools.Write({ file_path: "caught.txt", content: "z".repeat(1500000), hand: "beta" }); text("written"); } catch (error) { const message = String(error?.message ?? error); text(JSON.stringify({ length: message.length, head: message.slice(0, 300) })); }' })],
   "faults-missing": [() => ({ code: 'const settled = await Promise.allSettled(["nowhere", "alpha"].map(hand => tools.exec_command({ cmd: "pwd", hand }))); text(JSON.stringify(settled.map(entry => entry.status === "fulfilled" ? { ok: entry.value.output } : { error: String(entry.reason) })));' })],
   "faults-yield": [() => ({ code: '// @exec: {"yield_time_ms": ' + (policy.timeout_ms + 4000) + '}' + "\n" + 'await tools.exec_command({ cmd: "sleep ' + (Math.ceil(policy.timeout_ms / 1000) + 1) + '", yield_time_ms: ' + (policy.timeout_ms + 3000) + ' }); text("slept");' })],
-  "faults-cancel": [() => ({ code: '// @exec: {"yield_time_ms": 1500}' + "\n" + 'await Promise.all([tools.exec_command({ cmd: "sleep ' + markers.exec + '", yield_time_ms: 600000 }), tools.Bash({ command: "sh -c ' + "'sleep " + markers.child + " & sleep " + markers.grandchild + "'" + '; sleep ' + markers.bash + '", timeout: 600000 })]); text("finished");' }), results => ({ wait: { cell_id: cellId(results[0]?.text), yield_time_ms: 120000 } })],
+  "faults-cancel": [() => ({ code: '// @exec: {"yield_time_ms": 1500}' + "\n" + 'await Promise.all([tools.exec_command({ cmd: "/bin/sleep ' + markers.exec + '", yield_time_ms: 600000 }), tools.Bash({ command: "/bin/sh -c ' + "'/bin/sleep " + markers.child + " & /bin/sleep " + markers.grandchild + "'" + '; /bin/sleep ' + markers.bash + '", timeout: 600000 })]); text("finished");' }), results => ({ wait: { cell_id: cellId(results[0]?.text), yield_time_ms: 120000 } })],
 };
 
 async function model(input) {
@@ -187,6 +187,14 @@ try {
     report[scenario] = { ...result, results: brief(result.results), reconnects: { alpha: after.alpha - before.alpha, beta: after.beta - before.beta } };
     check(scenario + ": an oversized frame fails only its own operation and the hands stay connected", result.status === "completed" && after.alpha === before.alpha && after.beta === before.beta && result.results[1]?.text.includes("after"), report[scenario]);
     if (scenario === "image") check("image: a script whose nested calls exceed the frame limit still delivers its own output", /read [0-9]+/.test(result.results[0]?.text ?? ""), report[scenario].results);
+    else if (scenario === "text") {
+      const text = result.results[0]?.text ?? "";
+      report.text.shape = text.replace(/x{40,}/g, run => "<" + run.length + " x>");
+      const kept = (text.match(/x/g) ?? []).length;
+      const elided = Number(/…([0-9]+) tokens truncated…/.exec(text)?.[1] ?? 0);
+      report.text.delivered_bytes = kept + 4 * elided;
+      check("text: a script output over the frame limit arrives cut on the hand, its head and tail kept, instead of failing the cell", !result.results[0]?.error && text.startsWith("Script completed") && kept > 0 && report.text.delivered_bytes <= policy.max_frame_bytes, { shape: report.text.shape, delivered_bytes: report.text.delivered_bytes });
+    }
     else check(scenario + ": the failure names the frame limit", /max_frame_bytes/.test(result.results[0]?.text ?? ""), report[scenario].results);
     check(scenario + ": the failure is not reported as an unknown outcome", !/unknown outcome/.test(result.results[0]?.text ?? ""), report[scenario].results);
   }
@@ -261,7 +269,7 @@ try {
   if (scenarios.includes("duplicate")) {
     const before = connects("alpha");
     await submit("displace", "faults-displace", "alpha");
-    await until(async () => (observed.displace?.length ?? 0) >= 1 && processes([3106]).length === 1, () => "displaced cell did not start: " + JSON.stringify(observed.displace));
+    await until(async () => (observed.displace?.length ?? 0) >= 1 && processes([3106]).length >= 1, () => "displaced cell did not start: " + JSON.stringify(observed.displace));
     await new Promise(resolve => setTimeout(resolve, 500));
     startHand("impostor", "alpha", base);
     const displaced = await finished("displace");

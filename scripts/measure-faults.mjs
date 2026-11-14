@@ -4,6 +4,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 
 import { resolve } from "node:path";
 import { performance } from "node:perf_hooks";
 import { parseArgs } from "node:util";
+import { inflateRawSync } from "node:zlib";
 import { GATEWAY_KEY, LOCAL_TOKEN, localOptions } from "./local-runtime.mjs";
 
 const { values, positionals } = parseArgs({ allowPositionals: true, options: { providers: { type: "string", default: "claude,codex" }, delay: { type: "string", default: "200" }, rounds: { type: "string", default: "6" }, slow: { type: "string", default: "20000" }, seed: { type: "string", default: String(Date.now() % 100000) } } });
@@ -15,6 +16,8 @@ let seed = Number(values.seed);
 const random = () => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 2147483648; };
 const sleep = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
 const TERMINAL = new Set(["completed", "failed", "cancelled"]);
+const RETAINED_TURNS = Number(/retainedTurns: (\d+)/.exec(readFileSync("worker/index.ts", "utf8"))?.[1] ?? NaN);
+if (!Number.isInteger(RETAINED_TURNS)) throw new Error("worker/index.ts names no retainedTurns; update the fault probes");
 
 const calls = [];
 const holds = new Map();
@@ -198,14 +201,14 @@ async function until(condition, detail, timeout = 30000) {
   for (;;) {
     const value = await condition();
     if (value) return value;
-    if (performance.now() - started > timeout) throw new Error(`timed out: ${detail}`);
+    if (performance.now() - started > timeout) throw new Error(`timed out: ${typeof detail === "function" ? detail() : detail}`);
     await sleep(10);
   }
 }
 
 async function settled(session, id, timeout) {
   let last;
-  await until(async () => { last = await status(session, id); return TERMINAL.has(last.status); }, `turn ${id} did not finish (last ${JSON.stringify(last)})`, timeout);
+  await until(async () => { last = await status(session, id); return TERMINAL.has(last.status); }, () => `turn ${id} did not finish (last ${JSON.stringify(last)})`, timeout);
   return last;
 }
 
@@ -282,25 +285,63 @@ function operationStatus(value) {
   return null;
 }
 
-function records(text, into) {
-  let at = 0;
-  while (at < text.length) {
-    const space = text.indexOf(" ", at);
-    const newline = text.indexOf("\n", space);
-    const length = Number(text.slice(space + 1, newline));
-    into.set(text.slice(at, space), text.slice(newline + 1, newline + 1 + length));
-    at = newline + 1 + length;
+function decode(rows) {
+  const logical = [];
+  for (const { seq, body } of rows) {
+    if (body[0] === "+") {
+      if (!logical.length) throw new Error(`turn log row ${seq} continues no row`);
+      logical.at(-1).text += body.slice(1);
+      continue;
+    }
+    if (!"abrs".includes(body[0])) throw new Error(`turn log row ${seq} has no known tag`);
+    logical.push({ seq: Number(seq), tag: body[0], text: body.slice(1) });
   }
-  return into;
+  let history = Buffer.alloc(0);
+  const decoded = [];
+  for (const row of logical) {
+    if (row.tag !== "r") history = Buffer.alloc(0);
+    const plain = inflateRawSync(Buffer.from(row.text, "base64"), history.length ? { dictionary: history } : {});
+    history = Buffer.concat([history, plain]).subarray(-32768);
+    decoded.push({ ...row, records: plain.toString("utf8").split("\n").filter(Boolean).map(line => JSON.parse(line)) });
+  }
+  return decoded;
+}
+
+async function turnLog(name) {
+  const rows = await sql(name, "SELECT seq, body FROM nanocode_log WHERE scope = 'owner' ORDER BY seq");
+  const log = { rows: rows.length, tags: {}, turns: new Map(), events: new Map(), checkpoints: new Map(), stored: new Map() };
+  for (const row of decode(rows)) {
+    log.tags[row.tag] = (log.tags[row.tag] ?? 0) + 1;
+    for (const record of row.records) {
+      const [kind] = Object.keys(record);
+      const value = record[kind];
+      if (kind === "admitted") log.turns.set(value.turn, { request_id: value.turn, status: "queued", first_seq: value.first, last_seq: null, cancel_requested: false, note: null });
+      else if (kind === "status") {
+        const turn = log.turns.get(value.turn);
+        if (!turn) throw new Error(`turn log row ${row.seq} sets the status of unknown turn ${value.turn}`);
+        const status = typeof value.status === "string" ? { [value.status]: true } : value.status;
+        if (status.running) Object.assign(turn, { status: "running", cancel_requested: false, note: null });
+        if (status.cancelling) turn.cancel_requested = true;
+        if (status.interrupted) turn.note = status.interrupted.note;
+        if (status.finished) Object.assign(turn, { status: status.finished.outcome, last_seq: status.finished.last });
+      } else if (kind === "event") {
+        const event = value.event;
+        log.events.set(value.seq, { seq: value.seq, request_id: value.turn ?? null, type: event.type, status: event.status, source: event.source, event_type: event.event?.type, update_type: event.update?.type });
+      } else if (kind === "checkpoint") log.checkpoints.set(value.state, value);
+      else if (kind === "stored") log.stored.set(value.key, value.value);
+    }
+  }
+  return log;
 }
 
 async function operations(name) {
   const [root] = await sql(name, "SELECT value FROM metadata WHERE key = 'session_id'");
   if (!root) return {};
-  const [state] = await sql(name, "SELECT payload, tail FROM state_rows WHERE id = ?", root.value);
+  const log = await turnLog(name);
+  const state = log.checkpoints.get(root.value);
   if (!state?.payload) return {};
-  const stored = records(state.tail ?? "", new Map());
-  for (const page of await sql(name, "SELECT body FROM state_pages WHERE id = ? ORDER BY page", root.value)) records(page.body, stored);
+  const prefix = `${root.value}\n`;
+  const stored = new Map([...log.stored].filter(([key]) => key.startsWith(prefix)).map(([key, value]) => [key.slice(prefix.length), value]));
   const found = {};
   const pages = [];
   const collect = operations => {
@@ -327,14 +368,7 @@ async function operations(name) {
 }
 
 async function events(name) {
-  const bodies = await sql(name, "SELECT body FROM log_chunks WHERE scope = 'owner' UNION ALL SELECT tail AS body FROM log_turns WHERE scope = 'owner' AND tail IS NOT NULL");
-  const found = new Map();
-  for (const { body } of bodies) for (const line of body.split("\n")) {
-    if (!line) continue;
-    const [seq, , request_id, event] = JSON.parse(line);
-    found.set(seq, { seq, request_id, type: event.type, status: event.status, source: event.source, event_type: event.event?.type, update_type: event.update?.type });
-  }
-  return [...found.values()].sort((left, right) => left.seq - right.seq);
+  return [...(await turnLog(name)).events.values()].sort((left, right) => left.seq - right.seq);
 }
 
 const findings = [];
@@ -347,8 +381,9 @@ function check(scenario, condition, detail, evidence) {
 
 async function invariants(scenario, session, { quiescent = true } = {}) {
   const name = session.name;
-  const turns = await sql(name, "SELECT request_id, status, CAST(first_seq AS INTEGER) AS first_seq, last_seq, cancel_requested, note, retry FROM log_turns WHERE scope = 'owner' ORDER BY first_seq");
-  const logged = await events(name);
+  const log = await turnLog(name);
+  const turns = [...log.turns.values()].sort((left, right) => left.first_seq - right.first_seq);
+  const logged = [...log.events.values()].sort((left, right) => left.seq - right.seq);
   const ops = await operations(name);
   const unattributed = logged.filter(event => event.request_id === null).map(event => ({ seq: event.seq, source: event.source, type: event.event_type, update_type: event.update_type }));
   report.unattributed[name] = unattributed.map(event => `${event.source}:${event.type ?? event.update_type}`).reduce((counts, key) => ({ ...counts, [key]: (counts[key] ?? 0) + 1 }), {});
@@ -415,14 +450,16 @@ const scenarios = {
     await Promise.race([reading, sleep(15000)]);
     check("slowEvict", ended !== undefined, `${provider}: the turn's stream ended at the restart`, ended);
     check("slowEvict", text.includes("run.started") && !text.includes('"type":"result"'), `${provider}: the stream carried run.started and no result`, text.slice(-400));
+    const lost = await status(session, id);
+    check("slowEvict", lost.status === "http 404", `${provider}: a streamed turn reset before its first commit is not in the log, so its client submits it again`, lost);
+    const again = await request(`${sessionUrl(session.name)}/turns`, { method: "POST", headers: { accept: "text/event-stream" }, body: JSON.stringify({ request_id: id, prompt: `turn=${id} [slow:3000]`, provider }) });
+    const resubmitted = await again.text();
+    check("slowEvict", resubmitted.includes('"type":"result"') && resubmitted.includes('"status":"completed"'), `${provider}: the resubmitted stream carried the turn's result`, resubmitted.slice(-400));
     const done = await settled(session, id);
-    check("slowEvict", done.status === "completed", `${provider}: the turn interrupted before its model call answered recovered`, done);
+    check("slowEvict", done.status === "completed", `${provider}: the turn interrupted before its model call answered completed once submitted again`, done);
     check("slowEvict", started === 1 && modelCalls(id) === 2, `${provider}: the unanswered model call repeated once`, modelCalls(id));
-    const page = await (await request(`${sessionUrl(session.name)}/events?after=0&limit=128`)).json();
-    const result = (page.events ?? []).filter(entry => entry.request_id === id && entry.event?.type === "result").at(-1);
-    check("slowEvict", result?.event?.recovered === true || JSON.stringify(result ?? {}).includes('"recovered":true'), `${provider}: the recovered turn's result says recovered`, result);
     await invariants("slowEvict", session);
-    return { ended };
+    return { ended, lost: lost.status };
   },
 
   async slowCold(provider) {
@@ -473,25 +510,30 @@ const scenarios = {
     const session = await newSession(provider, "evict-tool");
     const watcher = await watch(session);
     const id = `et-${provider}`;
-    await submit(session, id, "[tool] [hold-after-tool]");
+    cells[id] = `await new Promise(resolve => setTimeout(resolve, 1)); text(JSON.stringify(await tools.list_agents({ include_completed: true })));`;
+    await submit(session, id, "[exec] [hold-after-tool]");
     await until(() => holds.has(`${id}:1`), "held call after the tool");
     await restart();
     const done = await settled(session, id);
     check("evictAfterTool", done.status === "completed", `${provider}: turn after a recorded tool call recovered`, done);
-    check("evictAfterTool", modelCalls(id, 0) === 1, `${provider}: model call before the tool was not repeated`, modelCalls(id, 0));
+    check("evictAfterTool", modelCalls(id, 0) === 1, `${provider}: model call before the recorded cell was not repeated`, modelCalls(id, 0));
     check("evictAfterTool", modelCalls(id, 1) === 2, `${provider}: held call after the tool repeated once`, modelCalls(id, 1));
+    const pure = `etp-${provider}`;
+    await submit(session, pure, "[tool] [hold-after-tool]");
+    await until(() => holds.has(`${pure}:1`), "held call after the unrecorded tool");
+    await restart();
+    const pureDone = await settled(session, pure);
+    check("evictAfterTool", pureDone.status === "completed" && modelCalls(pure, 0) <= 2 && modelCalls(pure, 1) === 2, `${provider}: a turn whose tool call wrote no row recovers, asking again at most for the steps since its last row`, { status: pureDone.status, round0: modelCalls(pure, 0), round1: modelCalls(pure, 1) });
     await invariants("evictAfterTool", session);
     watcher.close();
   },
 
   async faults(provider) {
     const plans = [
-      { label: "start", trigger: "BEFORE UPDATE ON log_turns WHEN NEW.status = 'running' AND OLD.status = 'queued'", calls: 1 },
-      { label: "agent-events", trigger: "BEFORE UPDATE ON log_turns WHEN instr(substr(NEW.tail, length(COALESCE(OLD.tail, '')) + 1), '\"source\":\"agent\"') > 0", calls: [1, 2] },
-      { label: "result", trigger: "BEFORE UPDATE ON log_turns WHEN NEW.result IS NOT NULL AND OLD.result IS NULL", calls: 1 },
-      { label: "checkpoint", trigger: "BEFORE UPDATE ON state_rows WHEN NEW.revision > OLD.revision", calls: [0, 6] },
-      { label: "marker", trigger: "BEFORE DELETE ON metadata WHEN OLD.key LIKE 'background:%'", calls: 1 },
-      { label: "submit", trigger: "BEFORE INSERT ON log_turns", calls: 1, submit: true },
+      { label: "admission", trigger: "BEFORE INSERT ON nanocode_log", calls: [1], submit: true },
+      { label: "finish", trigger: "BEFORE INSERT ON nanocode_log", calls: [1, 2], held: "[hold]" },
+      { label: "call", trigger: "BEFORE INSERT ON nanocode_log", calls: [2, 4], held: "[exec] [hold]", cell: `await new Promise(resolve => setTimeout(resolve, 1)); text("timer");` },
+      { label: "snapshot", trigger: "BEFORE INSERT ON nanocode_log WHEN substr(NEW.body, 1, 1) = 's'", calls: [1, 2], snapshot: true },
     ];
     for (const plan of plans) {
       const session = await newSession(provider, `fault-${plan.label}`);
@@ -499,14 +541,43 @@ const scenarios = {
       const warm = `fw-${plan.label}-${provider}`;
       await submit(session, warm, "plain");
       await settled(session, warm);
-      const id = `f-${plan.label}-${provider}`;
-      await sql(session.name, `CREATE TRIGGER fault_injection ${plan.trigger} BEGIN SELECT RAISE(ABORT, 'injected fault'); END`);
-      const first = await submit(session, id, "plain");
-      if (plan.submit) check("faults", first.status === 503, `${provider}/${plan.label}: failed submission answered 503`, first);
-      await sleep(4 * DELAY);
-      const before = await status(session, id);
+      let id = `f-${plan.label}-${provider}`;
+      const arm = () => sql(session.name, `CREATE TRIGGER fault_injection ${plan.trigger} BEGIN SELECT RAISE(ABORT, 'injected fault'); END`);
+      let before;
+      let refused = false;
+      if (plan.snapshot) {
+        await arm();
+        const rows = (await turnLog(session.name)).rows;
+        const started = performance.now();
+        for (let turn = 0; performance.now() - started < 60000; turn++) {
+          id = `f-${plan.label}-${turn}-${provider}`;
+          refused = (await submit(session, id, "plain")).status === 503;
+          if (refused || !await settled(session, id, 4 * DELAY + 2000).catch(() => undefined)) break;
+        }
+        await sleep(4 * DELAY);
+        before = await status(session, id);
+        check("faults", refused ? before.status === "http 404" : !TERMINAL.has(before.status), `${provider}/${plan.label}: a turn whose snapshot row cannot be written is refused or waits`, { before, refused, rows });
+      } else if (plan.held) {
+        if (plan.cell) cells[id] = plan.cell;
+        await submit(session, id, plan.held);
+        await until(() => holds.has(`${id}:0`), "held model call");
+        await arm();
+        const entry = holds.get(`${id}:0`);
+        holds.delete(`${id}:0`);
+        entry.release(entry.reply());
+        await sleep(4 * DELAY);
+        before = await status(session, id);
+        check("faults", !TERMINAL.has(before.status), `${provider}/${plan.label}: the turn does not finish while its row cannot be written`, before);
+      } else {
+        await arm();
+        const first = await submit(session, id, "plain");
+        check("faults", first.status === 503, `${provider}/${plan.label}: failed submission answered 503`, first);
+        refused = true;
+        await sleep(4 * DELAY);
+        before = await status(session, id);
+      }
       await sql(session.name, "DROP TRIGGER fault_injection");
-      if (plan.submit) {
+      if (refused) {
         check("faults", before.status === "http 404", `${provider}/${plan.label}: failed submission left no turn`, before);
         const retried = await submit(session, id, "plain");
         check("faults", retried.status === 202, `${provider}/${plan.label}: resubmission accepted`, retried);
@@ -516,6 +587,7 @@ const scenarios = {
       const count = modelCalls(id);
       const allowed = Array.isArray(plan.calls) ? plan.calls : [plan.calls];
       check("faults", count >= Math.min(...allowed) && count <= Math.max(...allowed), `${provider}/${plan.label}: model calls ${allowed.join(" or ")}`, count);
+      if (plan.snapshot) check("faults", (await turnLog(session.name)).tags.s >= 1, `${provider}/${plan.label}: the snapshot was written once the fault cleared`, (await turnLog(session.name)).tags);
       const next = `fn-${plan.label}-${provider}`;
       await submit(session, next, "plain");
       const after = await settled(session, next);
@@ -557,6 +629,10 @@ const scenarios = {
       answers.push({ id, submitted: submitted.status, cancelled: cancelled.status });
     }
     for (let round = 0; round < ROUNDS; round++) {
+      const done = await settled(session, `cs-${round}-${provider}`);
+      check("cancelRace", TERMINAL.has(done.status), `${provider}/cs-${round}: a cancel racing its submission settles the turn`, done);
+    }
+    for (let round = 0; round < ROUNDS; round++) {
       const id = `cf-${round}-${provider}`;
       await submit(session, id, "[slow:60]");
       await until(() => modelCalls(id) > 0, "slow call started");
@@ -569,7 +645,6 @@ const scenarios = {
       const after = await settled(session, next);
       check("cancelRace", after.status === "completed", `${provider}/${next}: turn after a cancel racing finish completed`, { cancelled: done.status, after });
     }
-    for (let round = 0; round < ROUNDS; round++) await settled(session, `cs-${round}-${provider}`);
     const last = `cl-${provider}`;
     await submit(session, last, "plain");
     const final = await settled(session, last);
@@ -949,7 +1024,7 @@ async function destroyRun(provider) {
   const after = (await sql(session.name, "SELECT name FROM sqlite_schema WHERE type = 'table' ORDER BY name")).map(row => row.name);
   const gone = await status(session, id);
   check("destroy", deleted.deleted === true && gone.status === "http 404", `${provider}: deleting a session with a running turn forgets the turn, and the name opens as a new session`, { deleted, status: gone.status });
-  check("destroy", !after.some(table => ["log_turns", "log_chunks", "state_rows", "state_pages"].includes(table)), `${provider}: deleting a session with a running turn leaves no session tables behind`, { before, after });
+  check("destroy", before.includes("nanocode_log") && !after.includes("nanocode_log"), `${provider}: deleting a session with a running turn leaves no session tables behind`, { before, after });
 }
 
 async function chaosRun(provider) {
@@ -984,9 +1059,12 @@ async function chaosRun(provider) {
     check("chaos", expected.every(seq => seen.includes(seq)), `${provider}/${id}: SSE stream carried every logged event of the turn`, { expected, seen });
     report.diagnostics[`chaos/${provider}/${id}/unlogged`] = collected.events.filter(event => !expected.includes(event.seq));
   }
-  const resubmitted = await Promise.all(ids.map(id => submit(session, id, kinds[ids.indexOf(id) % kinds.length])));
-  check("chaos", resubmitted.every(entry => entry.status === 200 && entry.body?.status === "completed"), `${provider}: resubmission after finish returns the saved result`, resubmitted.map(entry => entry.status));
-  const conflicting = await submit(session, ids[0], "different");
+  const kept = ids.slice(-RETAINED_TURNS);
+  const resubmitted = await Promise.all(kept.map(id => submit(session, id, kinds[ids.indexOf(id) % kinds.length])));
+  check("chaos", resubmitted.every(entry => entry.status === 200 && entry.body?.status === "completed"), `${provider}: resubmission of a retained finished turn returns the saved result`, resubmitted.map(entry => entry.status));
+  const forgotten = await Promise.all(ids.slice(0, -RETAINED_TURNS).map(id => status(session, id)));
+  check("chaos", forgotten.every(entry => entry.status === "http 404"), `${provider}: finished turns past the ${RETAINED_TURNS} newest are retired`, forgotten.map(entry => entry.status));
+  const conflicting = await submit(session, kept[0], "different");
   check("chaos", conflicting.status === 409, `${provider}: resubmission with different input conflicts`, conflicting.status);
   watcher.close();
   return { restarts };
