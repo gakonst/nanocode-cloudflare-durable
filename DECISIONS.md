@@ -361,3 +361,20 @@ Split of the server first delta (p50/p90/p99): Worker to session object round tr
 - The largest Worker hop is the round trip to the session object, about 100 ms per warm turn from SJC. Pooled objects start near the session pool object (`idFromName('pool')`, no `SESSION_LOCATION_HINT`), so a session does not live near its user. A pool of ready objects per region, with the bindings kept in one place, removes it. This change is not made here, because it changes the pool that the cold start work depends on.
 - Admission takes 15 ms p50 before the model request: the turn log write and its commit. Dispatch before the commit saves at most this time and requires `allowUnconfirmed`, which shows a client a turn that a storage failure can lose. This change is not made.
 - Hedging dispatched once in 132 warm turns (primary first byte at 1,848 ms, hedge sent at 1,514 ms, and the primary won). The p99 tails come from the provider and from Worker to object round trips of up to 725 ms in SJC, not from admission.
+
+## 2026-11-14: pooled session objects stay in memory between pool keepalives
+
+nanocode-ts build-d867d11 (durable-cloudflare 1950608, version aa3e33fb) adds `object_*` and `pool_*` timings to `server-timing`. With them, 24 single-turn claims from the hosted Hand (15:55 UTC) showed that 10 of 24 pooled objects were constructed again at the claim: Cloudflare removed a ready object about 10 s after its prestart (kept at 0.8 to 12.6 s, gone at 10.3 to 18.9 s), and `SESSION_POOL_KEEPALIVE_MS` pings it every 30 s. A reconstructed object started in 155 to 324 ms in a live isolate and in 626 to 762 ms in a new isolate, against 122 to 190 ms for an object still in memory.
+
+nanocode-ts build-e1ed915 (durable-cloudflare 9b251e0, version 55edf81d) sends `x-nanocode-prestart-hold-ms` (the keepalive) with each prestart, and the object keeps a timer of that length, so it cannot hibernate between pings. The 3-turn smoke after each deploy completed 12 of 12 turns on both hosts and providers.
+
+The probe after the deploy (`probe.ts --sessions=24`, 288 turns from each client, 0 errors) found no reconstructed pooled object: 0 of 95 claims from the hosted Hand and 0 of 96 from gak-9. Values are p50/p99 ms for cold turns (n = 24 per cell), before (build-6129d53, hosted Hand) and after:
+
+| Cell | edge headers, hosted Hand | object start, hosted Hand | edge headers, gak-9 |
+| --- | --- | --- | --- |
+| custom domain, claude | 176/921 to 153/819 | 159/677 to 133/737 | 209/391 |
+| custom domain, codex | 210/1,110 to 148/449 | 192/1,097 to 129/391 | 204/678 |
+| workers.dev, claude | 171/1,763 to 160/1,338 | 146/1,108 to 144/1,272 | 136/1,442 |
+| workers.dev, codex | 180/1,113 to 180/514 | 166/1,034 to 171/474 | 137/414 |
+
+The cold p99 is still above 500 ms. From the hosted Hand, 11 of 96 cold turns took more than 400 ms to edge headers, and 10 of those 11 had a `runtime_open_ms` of 300 to 630 ms, against none of the other 85. The object returns the response at admission and then opens the turn's runtime, and that work delays the delivery of the headers. Every claimed object in this run was less than 60 s old, and older objects opened in about 45 ms (gak-9). The next step is to make the prestart open a runtime for the turn, or to move the open after the headers are sent.
