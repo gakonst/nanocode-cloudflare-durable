@@ -199,3 +199,8 @@ The demo runs b71431b (nanocode-ts build-0624213) since 2026-11-14 as version bd
 ## 2026-11-14: MCP listings stay in each location's KV cache for a day
 
 `MCP_LISTINGS_KV.get` passes `cacheTtl` from `MCP_LISTING_CACHE_TTL_S` (86400 in `wrangler.jsonc` and `scripts/local-runtime.mjs`). KV's default keeps a read in a location's cache for 60 s, so on 2026-11-13 a new session read its listings in 3 to 65 ms when another session had read them within a minute and in 336 to 349 ms otherwise. `Mcp.defer` already serves a listing up to a day old and revalidates it in the background, so a location may serve a listing up to a day older than KV holds. Georgios accepted a stale tool list on a first turn (2026-11-13).
+
+
+## 2026-11-14: server-timing on turns, nanocode-ts build-b58fe04
+
+The Worker appends `server-timing: admit;dur=<ms>, worker;dur=<ms>` (the public route's checks, then the Worker's whole time to the response's headers) to every response but WebSocket upgrades, and nanocode-ts build-b58fe04 adds `session;dur=<ms>` from the session object. A new session's first turn on version a9e3d78f reached response headers in 1,244 ms p50 and 2,587 ms p99 from gak-9 (12 sessions), against 209 and 467 ms warm (24 turns). Its object reported 74 ms p50 of admission, so the client could not tell where the other second goes. `npm run build` passes.

@@ -145,7 +145,13 @@ export default {
     if (request.method === "GET" && pathname === "/install") return Response.redirect("https://nanocode.xyz/install", 308);
     if ((request.method === "GET" || request.method === "HEAD") && pathname === "/how-it-works") return Response.redirect("https://nanocode.xyz/experiments/durable-nanocode-on-cloudflare", 308);
     if (request.method === "GET" && pathname === "/relay") return Relay.route(request, { namespace: env.HAND_RELAYS });
+    const started = performance.now();
     const refused = env.CHAT_PUBLIC === "1" && !(await owner(request, env)) ? await admit(request, env) : undefined;
-    return refused ?? await wallets.fetch(request, env) ?? nanocode.fetch(request, env);
+    const admitted = performance.now();
+    const response = refused ?? await wallets.fetch(request, env) ?? await nanocode.fetch(request, env);
+    if (response.webSocket || response.status === 101) return response;
+    const timed = new Response(response.body, response);
+    timed.headers.append("server-timing", "admit;dur=" + Math.round(admitted - started) + ", worker;dur=" + Math.round(performance.now() - started));
+    return timed;
   },
 } satisfies ExportedHandler<Env>;
