@@ -324,3 +324,19 @@ The hosted Hand reached the YYZ and SEA colos (151 and 137 turns), and its egres
 - A cron trigger (`* * * * *`) runs `scheduled`, which calls `Pool.warm`: the pool refills its ready objects and arms its keepalive alarm again if a failed alarm stopped retrying. A cron invocation runs in a colo that Cloudflare selects, so it cannot keep a routing isolate warm in the colos that serve traffic. The one-minute interval is the smallest that cron allows, and costs 43,200 invocations a month, each one pool RPC.
 - The Worker appends `isolate;dur=<isolate age ms>;desc=<requests served>` to `server-timing`, to measure isolate reuse and eviction on the demo.
 - `scripts/local-runtime.mjs` exports `SessionPool` and `scheduled` from its shim, so a local harness can bind `SESSION_POOL` and fire the cron. With a bound and sealed pool (output/pool-sla.mjs, ignored: `measure-sla.mjs` with `SESSION_POOL`, a seal and a cron call per round, and turn 2 from a new isolate), claude and codex finished 30 of 30 local turns on the dist overlay and 12 of 12 on the build-6129d53 tarball, with turn 1 routed through the pool, and turn 2 through the pool when `SESSION_POOL_BINDING_CACHE_S` is unset. Checked: `npm run build`, `npm run dry-run` (the bundle is written; the relay container image does not build on the hosted Hand's Docker).
+The demo runs 55644e3 (nanocode-ts build-6129d53) since 2026-11-14 as version a7699f29, with the cron trigger `* * * * *`. The same probe after the deploy (hosted Hand, 288 turns, 0 errors, 96 of 96 three-turn sessions completed; colos SEA 132, YYZ 106, IAD 50), p50/p99 ms, before then after:
+
+| Cell | edge headers | edge first delta | session_resolve | object start |
+| --- | --- | --- | --- | --- |
+| custom domain, claude, cold | 257/1,293 to 176/921 | 926/2,680 to 887/2,052 | 97/113 to 5/18 | 142/1,181 to 159/677 |
+| custom domain, claude, warm | 101/224 to 103/168 | 711/2,122 to 710/1,449 | 6/92 to 6/32 | 52/118 to 81/140 |
+| custom domain, codex, cold | 259/1,410 to 210/1,110 | 1,543/4,599 to 1,362/4,203 | 97/115 to 6/23 | 155/1,301 to 192/1,097 |
+| custom domain, codex, warm | 104/1,019 to 111/907 | 1,150/2,593 to 1,142/2,046 | 6/100 to 6/45 | 61/113 to 87/128 |
+| workers.dev, claude, cold | 269/2,323 to 171/1,763 | 1,069/3,675 to 992/3,055 | 91/800 to 0/0 | 156/1,093 to 146/1,108 |
+| workers.dev, claude, warm | 116/266 to 98/176 | 700/2,031 to 686/1,913 | 38/86 to 0/0 | 88/167 to 80/164 |
+| workers.dev, codex, cold | 234/1,425 to 180/1,113 | 1,412/3,760 to 1,330/4,044 | 50/109 to 0/0 | 126/1,256 to 166/1,034 |
+| workers.dev, codex, warm | 125/291 to 104/1,631 | 1,142/2,534 to 1,127/2,606 | 37/83 to 0/0 | 70/175 to 88/150 |
+
+A miss now pays its pool round trip inside `session_response` (object start) instead of before it, so the two round trips of a miss became one: cold edge headers fell 50 to 98 ms at p50 on every cell. The cold p99 is the pooled object's start (object start p99 677 to 1,108 ms), which this change does not address. From gak-9 (home network, CMH and SJC, 288 turns, 0 errors) the client headers were 285 to 702/1,413 to 1,864 ms cold and 171 to 234/327 to 1,404 ms warm.
+
+Isolate reuse, read from `isolate;dur` with `/health` requests from gak-9 at gaps of 0 s to 15 minutes: in CMH (workers.dev) the same isolates answered for 30 minutes and more while traffic continued, and after a 15 minute idle gap a new isolate answered. In SJC (custom domain) about half of the requests reached a new isolate even 1 s apart, so isolate placement inside a colo, not idle eviction, decides whether the routing isolate holds a binding. The cron trigger therefore cannot keep a warm routing isolate in a serving colo. It keeps `Pool.warm` running, which restarts the pool's refill and alarm.
