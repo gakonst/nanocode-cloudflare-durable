@@ -1,6 +1,6 @@
 import { DurableObject } from "cloudflare:workers";
 import { Remote } from "nanocode-ts";
-import { App, Gateway, HandRelay, Limit, McpListings, PlanVault, PublicLimit, Relay, RelayContainer, SessionPool } from "nanocode-ts/cloudflare";
+import { App, Gateway, HandRelay, Limit, McpListings, PlanVault, Pool, PublicLimit, Relay, RelayContainer, SessionPool } from "nanocode-ts/cloudflare";
 import { Tempo } from "nanocode-ts/machines";
 import { Env as Machines, Wallets } from "nanocode-ts/machines/cloudflare";
 import * as Account from "nanocode-ts/machines/server";
@@ -137,8 +137,16 @@ export { HandRelay, McpListings, PlanVault, PublicLimit, RelayContainer, Session
 
 export class Python extends DurableObject {}
 
+let loaded: number | undefined;
+let served = 0;
+
 export default {
+  async scheduled(_controller, env) {
+    await Pool.warm(env.SESSION_POOL);
+  },
   async fetch(request, env) {
+    loaded ??= Date.now();
+    served++;
     const { pathname, searchParams } = new URL(request.url);
     if ((request.method === "GET" || request.method === "HEAD") && pathname === "/") {
       const page = THEMES.get(searchParams.get("theme") ?? "nanocode");
@@ -155,7 +163,7 @@ export default {
     const response = refused ?? await wallets.fetch(request, env) ?? await nanocode.fetch(request, env);
     if (response.webSocket || response.status === 101) return response;
     const timed = new Response(response.body, response);
-    timed.headers.append("server-timing", "admit;dur=" + Math.round(admitted - started) + ", worker;dur=" + Math.round(performance.now() - started));
+    timed.headers.append("server-timing", "admit;dur=" + Math.round(admitted - started) + ", worker;dur=" + Math.round(performance.now() - started) + ", isolate;dur=" + (Date.now() - loaded) + ";desc=" + served);
     return timed;
   },
 } satisfies ExportedHandler<Env>;

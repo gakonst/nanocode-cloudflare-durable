@@ -9,6 +9,7 @@ const GATEWAY = `export default { fetch(request) { return fetch(request); } };`;
 
 function shim(entry, wallet, listings) {
   return `import worker, { AgentSession as Session } from "./${entry}";
+export { SessionPool } from "./${entry}";
 ${wallet ? `export { Wallet } from "./${entry}";` : ""}
 ${listings ? `export { McpListings } from "./${entry}";` : ""}
 function gateway(upstream) {
@@ -93,7 +94,7 @@ export class AgentSession extends Session {
     return Response.json({ ...await response.json(), sql: this.sqlTotals(), idle: { timers_ms: pendingTimers(), wait_until: this.waiting.count } });
   }
 }
-export default { fetch(request, env, ctx) { return worker.fetch(request, local(env), ctx); } };
+export default { fetch(request, env, ctx) { return worker.fetch(request, local(env), ctx); }, scheduled(controller, env, ctx) { return worker.scheduled(controller, local(env), ctx); } };
 `;
 }
 
