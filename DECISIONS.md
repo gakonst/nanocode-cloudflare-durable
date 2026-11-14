@@ -204,3 +204,7 @@ The demo runs b71431b (nanocode-ts build-0624213) since 2026-11-14 as version bd
 ## 2026-11-14: server-timing on turns, nanocode-ts build-b58fe04
 
 The Worker appends `server-timing: admit;dur=<ms>, worker;dur=<ms>` (the public route's checks, then the Worker's whole time to the response's headers) to every response but WebSocket upgrades, and nanocode-ts build-b58fe04 adds `session;dur=<ms>` from the session object. A new session's first turn on version a9e3d78f reached response headers in 1,244 ms p50 and 2,587 ms p99 from gak-9 (12 sessions), against 209 and 467 ms warm (24 turns). Its object reported 74 ms p50 of admission, so the client could not tell where the other second goes. `npm run build` passes.
+
+## 2026-11-14: nanocode-ts build-3a5564a
+
+The dependency moves to build-3a5564a, whose public app appends its server-timing entries instead of replacing the header. A response now carries `session;dur` (the session object time from `fetch` to response headers) beside `session_response` and `worker`, so a new session's first-turn cost splits into object start and session work.
