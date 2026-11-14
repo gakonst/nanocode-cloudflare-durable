@@ -259,3 +259,21 @@ Scratch A/B before the deploy (two scratch Workers, without and with the pool, p
 
 Warm turns did not change. `npm run build` passes.
 
+
+Production after the deploy of 5fdd376 (versions e0927a48 and 3b853441) and the seal (3,858 legacy ids, 4 ready objects), `sla/p99.mjs` from gak-9, 12 sessions of 3 turns per provider, p50/p99 (the p99 of 12 cold turns is their maximum). Object start is `session_response` minus `session`.
+
+| Lane | Before pool | With pool |
+| --- | --- | --- |
+| Claude cold headers | 1,146/2,504 ms | 419/904 ms |
+| Claude cold first delta | 2,635/4,451 ms | 1,934/2,615 ms |
+| Claude cold object start | 965/1,667 ms | 150/412 ms |
+| Claude cold `session_resolve` | not measured | 36/39 ms |
+| Codex cold headers | 1,089/2,059 ms | 355/1,081 ms |
+| Codex cold first delta | 2,784/4,754 ms | 1,993/2,623 ms |
+| Codex cold object start | 905/1,565 ms | 132/638 ms |
+| Codex cold `session_resolve` | not measured | 34/756 ms |
+| Claude warm headers | 128/259 ms | 140/367 ms |
+| Codex warm headers | 141/368 ms | 149/271 ms |
+
+Warm turns: first delta 748/1,907 ms on Claude and 1,014/4,873 ms on Codex (one slow provider stream), object start 43/105 and 41/79 ms, `session_resolve` 0 ms (the routing Worker caches the binding). An existing session (`perf-dd-mwg0lpjo-0`) read back its own workspace file after the seal, and a new session answered.
+
