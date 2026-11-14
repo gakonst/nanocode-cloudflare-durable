@@ -530,9 +530,9 @@ const scenarios = {
 
   async faults(provider) {
     const plans = [
-      { label: "admission", trigger: "BEFORE INSERT ON nanocode_log", calls: [1], submit: true },
-      { label: "finish", trigger: "BEFORE INSERT ON nanocode_log", calls: [1, 2], held: "[hold]" },
-      { label: "call", trigger: "BEFORE INSERT ON nanocode_log", calls: [2, 4], held: "[exec] [hold]", cell: `await new Promise(resolve => setTimeout(resolve, 1)); text("timer");` },
+      { label: "admission", trigger: "BEFORE INSERT ON nanocode_log", update: true, calls: [1], submit: true },
+      { label: "finish", trigger: "BEFORE INSERT ON nanocode_log", update: true, calls: [1, 2], held: "[hold]" },
+      { label: "call", trigger: "BEFORE INSERT ON nanocode_log", update: true, calls: [2, 4], held: "[exec] [hold]", cell: `await new Promise(resolve => setTimeout(resolve, 1)); text("timer");` },
       { label: "snapshot", trigger: "BEFORE INSERT ON nanocode_log WHEN substr(NEW.body, 1, 1) = 's'", calls: [1, 2], snapshot: true },
     ];
     for (const plan of plans) {
@@ -542,7 +542,10 @@ const scenarios = {
       await submit(session, warm, "plain");
       await settled(session, warm);
       let id = `f-${plan.label}-${provider}`;
-      const arm = () => sql(session.name, `CREATE TRIGGER fault_injection ${plan.trigger} BEGIN SELECT RAISE(ABORT, 'injected fault'); END`);
+      const arm = async () => {
+        await sql(session.name, `CREATE TRIGGER fault_injection ${plan.trigger} BEGIN SELECT RAISE(ABORT, 'injected fault'); END`);
+        if (plan.update) await sql(session.name, "CREATE TRIGGER fault_injection_update BEFORE UPDATE ON nanocode_log BEGIN SELECT RAISE(ABORT, 'injected fault'); END");
+      };
       let before;
       let refused = false;
       if (plan.snapshot) {
@@ -577,6 +580,7 @@ const scenarios = {
         before = await status(session, id);
       }
       await sql(session.name, "DROP TRIGGER fault_injection");
+      if (plan.update) await sql(session.name, "DROP TRIGGER fault_injection_update");
       if (refused) {
         check("faults", before.status === "http 404", `${provider}/${plan.label}: failed submission left no turn`, before);
         const retried = await submit(session, id, "plain");
