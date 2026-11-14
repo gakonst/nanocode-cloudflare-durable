@@ -340,3 +340,24 @@ The demo runs 55644e3 (nanocode-ts build-6129d53) since 2026-11-14 as version a7
 A miss now pays its pool round trip inside `session_response` (object start) instead of before it, so the two round trips of a miss became one: cold edge headers fell 50 to 98 ms at p50 on every cell. The cold p99 is the pooled object's start (object start p99 677 to 1,108 ms), which this change does not address. From gak-9 (home network, CMH and SJC, 288 turns, 0 errors) the client headers were 285 to 702/1,413 to 1,864 ms cold and 171 to 234/327 to 1,404 ms warm.
 
 Isolate reuse, read from `isolate;dur` with `/health` requests from gak-9 at gaps of 0 s to 15 minutes: in CMH (workers.dev) the same isolates answered for 30 minutes and more while traffic continued, and after a 15 minute idle gap a new isolate answered. In SJC (custom domain) about half of the requests reached a new isolate even 1 s apart, so isolate placement inside a colo, not idle eviction, decides whether the routing isolate holds a binding. The cron trigger therefore cannot keep a warm routing isolate in a serving colo. It keeps `Pool.warm` running, which restarts the pool's refill and alarm.
+## 2026-11-14: build-9f3c5c7 demo deploy and the warm gate against native nanocode
+
+ddf2f3b (nanocode-ts build-9f3c5c7: hedged first-byte model requests on SDK 8467d6aa0) went live on the demo on 2026-11-14 at 07:39 PT as version d46752f1. After the deploy, 16 of 16 three-turn sessions completed from gak-9 on both hosts and both providers (48 turns, 0 errors).
+
+The warm gate compares Worker turns 2 and 3 with native nanocode on the same model (claude-haiku-5-5), measured at the same time from gak-9 (home network, colos CMH for workers.dev and SJC for the custom domain). The Worker side is `node probe.ts --providers=claude` (66 sessions, 132 warm turns, 0 errors: 26 sessions on ddf2f3b, then 40 on 1950608, whose build-d867d11 adds only server-timing entries), with POST to first `assistant.delta` on the client and `worker;dur + (first delta - headers)` on the server. The native side is `bench/sla/run.ts --live --lanes=live-nc-claude` with a native build of SDK 8467d6aa0 (52 sessions, 104 warm turns, 0 errors), Enter to the first reply token on the terminal. The paths differ: the Worker calls Claude through the AI binding (`anthropic/claude-haiku-5.5`, Cloudflare unified billing) from the session object, and native nanocode calls api.anthropic.com from gak-9 with a Claude login. p50/p90/p99 ms:
+
+| Cell | n | p50 | p90 | p99 |
+| --- | --- | --- | --- | --- |
+| Worker client first delta | 132 | 806 | 1,064 | 1,531 |
+| Worker server first delta | 132 | 730 | 989 | 1,440 |
+| Worker server first delta, workers.dev (CMH) | 66 | 690 | 989 | 1,891 |
+| Worker server first delta, custom domain (SJC) | 66 | 761 | 1,017 | 1,305 |
+| Native first token | 104 | 667 | 891 | 1,060 |
+| Worker client minus native | | +139 | +173 | +472 |
+| Worker server minus native | | +63 | +98 | +380 |
+
+Split of the server first delta (p50/p90/p99): Worker to session object round trip (`session_response - session`) 66/110/301, of which 47/59/72 from CMH and 100/128/725 from SJC; admission to model dispatch inside the object 15/22/114; provider headers through the AI binding 666/878/1,297. The client adds 73/178/255 between the Worker and gak-9.
+
+- The largest Worker hop is the round trip to the session object, about 100 ms per warm turn from SJC. Pooled objects start near the session pool object (`idFromName('pool')`, no `SESSION_LOCATION_HINT`), so a session does not live near its user. A pool of ready objects per region, with the bindings kept in one place, removes it. This change is not made here, because it changes the pool that the cold start work depends on.
+- Admission takes 15 ms p50 before the model request: the turn log write and its commit. Dispatch before the commit saves at most this time and requires `allowUnconfirmed`, which shows a client a turn that a storage failure can lose. This change is not made.
+- Hedging dispatched once in 132 warm turns (primary first byte at 1,848 ms, hedge sent at 1,514 ms, and the primary won). The p99 tails come from the provider and from Worker to object round trips of up to 725 ms in SJC, not from admission.
