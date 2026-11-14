@@ -1,6 +1,6 @@
 import { DurableObject } from "cloudflare:workers";
 import { Remote } from "nanocode-ts";
-import { App, Gateway, HandRelay, Limit, McpListings, PlanVault, PublicLimit, Relay, RelayContainer } from "nanocode-ts/cloudflare";
+import { App, Gateway, HandRelay, Limit, McpListings, PlanVault, PublicLimit, Relay, RelayContainer, SessionPool } from "nanocode-ts/cloudflare";
 import { Tempo } from "nanocode-ts/machines";
 import { Env as Machines, Wallets } from "nanocode-ts/machines/cloudflare";
 import * as Account from "nanocode-ts/machines/server";
@@ -31,6 +31,10 @@ interface Env extends Machines.Env {
   MCP_LISTING_CACHE_TTL_S: string;
   PLANS: DurableObjectNamespace<PlanVault>;
   RELAY: DurableObjectNamespace<RelayContainer>;
+  SESSION_POOL: DurableObjectNamespace<SessionPool>;
+  SESSION_POOL_CACHED_NAMES: string;
+  SESSION_POOL_KEEPALIVE_MS: string;
+  SESSION_POOL_SIZE: string;
   PLAN_SECRET: string;
 }
 
@@ -129,7 +133,7 @@ const nanocode = App.create<Env>({
 
 export const { AgentSession } = nanocode;
 export const { Wallet } = wallets;
-export { HandRelay, McpListings, PlanVault, PublicLimit, RelayContainer };
+export { HandRelay, McpListings, PlanVault, PublicLimit, RelayContainer, SessionPool };
 
 export class Python extends DurableObject {}
 

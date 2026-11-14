@@ -242,3 +242,20 @@ A warm object answered in 18 to 24 ms p50 in every lane. The dynamic `import("./
 Before this bump (build-2aad477, from gak-9, `p99.mjs` with the run.started and assistant.message times added, 12 sessions of 3 turns), the client delta window divided by the provider byte window, p50/p99: Responses gpt-6.1-sol 0.798/0.923 (n=35), Claude Haiku 5.5 0.967/1.032 (n=36). The provider window starts at the first byte of the Responses stream. The client's first delta follows that first byte by 211 ms p50 on Responses and precedes it by 63 ms on Claude, and the provider's last byte follows the last client delta by 80 and 99 ms. The Responses gap is at the start of the stream (events before the first text delta), not after the last text delta. `npm run build` passes.
 
 - `scripts/measure-cold-evicted.mjs [--sessions 6] [--idle 990] [--split] [--label <name>] [--out output]` measures the cold start of evicted session objects on the public demo (2026-11-14, Georgios: cut the live cold start of an evicted session). It gives each new session one turn, waits `--idle` seconds, then sends each session a cold and a warm turn, two requests per `--gap` window under the 30 per minute limit, and prints the medians of accept, `session_response`, the object's `session` timing, admission, runtime open, the first model request and run, and how many cold turns met a new isolate (`isolate_objects` 1, from nanocode-ts with its object timings). `--split` precedes every second cold turn with `GET /hands` twice and a read of a missing turn. On build-0624213 with `--split` (8 sessions, all evicted): `GET /hands` took 833 ms of `session_response` at the median (702 to 1,297) and 86 ms again, the read 108 ms and the cold turn after them 247 ms, against 829 ms (772 to 1,316) for a cold turn on an untouched object and 133 ms warm. Without `--split` (6 sessions): 1,195 ms cold (921 to 1,352), `session` 69 to 76 ms on five of six, and 155 ms warm. About 700 ms of a cold turn passes before the object's handler runs, on every evicted object, also when the sessions follow each other within seconds. The handler, the runtime open and the admission add about 20 ms to it.
+
+## 2026-11-14: session pool
+
+`worker/index.ts` exports nanocode-ts's `SessionPool` and binds it as `SESSION_POOL` (migration `v9`, `new_sqlite_classes: ["SessionPool"]`), with `SESSION_POOL_SIZE` 4, `SESSION_POOL_KEEPALIVE_MS` 30000 and `SESSION_POOL_CACHED_NAMES` 10000. The routing Worker binds a new session name to an object that the pool already started (nanocode-ts 566c935), so a new session skips the cold object start. The pin stays at build-eade227, which contains 566c935 and d6d0578 (the routing Worker's provider prime and the session object's `server-timing`, with `session_resolve`). `scripts/seal-pool.mjs <worker name>` imports the ids of the existing `AgentSession` objects into the pool through a temporary `<worker name>-seal` Worker, so that the pool never hands out the object of an existing session, then deletes that Worker.
+
+Scratch A/B before the deploy (two scratch Workers, without and with the pool, p50/p99):
+
+| Lane | Without pool | With pool |
+| --- | --- | --- |
+| Claude cold object start | 851/1,160 ms | 298/883 ms |
+| Claude cold headers | 1,163/1,825 ms | 788/1,811 ms |
+| Claude cold first delta | 2,640/3,940 ms | 2,058/2,893 ms |
+| Responses cold headers | 1,189/1,859 ms | 620/995 ms |
+| Responses cold first delta | 3,199/4,906 ms | 2,427/2,628 ms |
+
+Warm turns did not change. `npm run build` passes.
+
