@@ -70,6 +70,8 @@ function score(runs) {
     cloudflare_usd_estimate: Number(cloudflare.toFixed(5)),
     cloudflare_usd_per_10k: n ? Number((cloudflare / n * 10000).toFixed(4)) : null,
     peak_workerd_rss_mb: run.peak_workerd_rss_mb ?? null,
+    workerd_cpu_ms_per_child: n && run.workerd_cpu_s ? Number((run.workerd_cpu_s * 1000 / n).toFixed(2)) : null,
+    parent_wasm_ms_per_child: n && run.runtime_sample?.runtime.timing?.spans?.["wasm.enter"] ? Number((run.runtime_sample.runtime.timing.spans["wasm.enter"].total_ms / n).toFixed(2)) : null,
   };
 }
 
@@ -187,6 +189,17 @@ function workerdRss() {
   }
   return total;
 }
+function workerdCpuSeconds() {
+  let ticks = 0;
+  for (const pid of readdirSync("/proc").filter(entry => /^\d+$/.test(entry))) {
+    try {
+      if (!readFileSync("/proc/" + pid + "/cmdline", "utf8").includes("workerd")) continue;
+      const fields = readFileSync("/proc/" + pid + "/stat", "utf8").split(") ")[1].split(" ");
+      ticks += Number(fields[11]) + Number(fields[12]);
+    } catch {}
+  }
+  return ticks / 100;
+}
 function diskBytes(path) {
   let total = 0;
   const walk = dir => { for (const entry of readdirSync(dir, { withFileTypes: true })) { const full = dir + "/" + entry.name; if (entry.isDirectory()) walk(full); else total += readFileSync(full).length; } };
@@ -228,6 +241,7 @@ const sampler = setInterval(async () => {
   try {
     const m = await metrics();
     parent.peak_wasm_bytes = Math.max(parent.peak_wasm_bytes, m.runtime?.wasm_memory_bytes ?? 0);
+    if (m.runtime) report.runtime_sample = { at_ms: Math.round(performance.now() - started), cpu_s: workerdCpuSeconds(), runtime: m.runtime };
     current = { requests: m.requests ?? 0, child_requests: m.child_requests ?? 0, rows_written: m.sql?.rows_written ?? 0 };
     const now = performance.now();
     if (lastRequests !== null && current.requests >= lastRequests) parent.peak_requests_per_s = Math.max(parent.peak_requests_per_s, Math.round((current.requests - lastRequests) / ((now - lastSample) / 1000)));
@@ -288,6 +302,8 @@ try {
   current = { requests: m.requests ?? 0, child_requests: m.child_requests ?? 0, rows_written: m.sql?.rows_written ?? 0 };
   parent.peak_wasm_bytes = Math.max(parent.peak_wasm_bytes, m.runtime?.wasm_memory_bytes ?? 0);
   report.final_wasm_bytes = m.runtime?.wasm_memory_bytes ?? null;
+  report.workerd_cpu_s = workerdCpuSeconds();
+  report.metrics = m;
   report.completed = final.completed.size;
   report.listed = final.all;
   const repeats = [...children].filter(([id, entry]) => entry.calls > 2 && !inFlightAtKill.has(id)).length;
